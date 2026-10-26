@@ -52,8 +52,11 @@ async function waitForLinks() {
   return tracklistLinks();
 }
 
-/** Most sets setscope will collect from one page (about 15 loads of 20). */
-const MAX_SETS_PER_PAGE = 300;
+/**
+ * Only a safety stop for a page that never ends: a page you open is collected in full
+ * (the biggest DJ pages have a few thousand sets, loaded 10 at a time).
+ */
+const MAX_SETS_PER_PAGE = 10_000;
 
 /**
  * Track and DJ pages show the first ~16 sets and load 20 more each time you scroll to
@@ -137,7 +140,7 @@ async function main() {
   if (reply?.ok) {
     const { queued, alreadyCached, skippedOld } = reply.result;
     const older = skippedOld ? ` · ${skippedOld} older than your window` : "";
-    const more = complete ? "" : " · stopped at 300, gather again for more";
+    const more = complete ? "" : " · stopped early, gather again for more";
     banner(`setscope: ${urls.length} sets on this page · ${alreadyCached} already in setscope · ${queued} new${older}${more}. Closing…`);
   } else {
     banner(`setscope: couldn't reach the app (${reply?.error ?? "unknown error"}). Is npm run web running?`);

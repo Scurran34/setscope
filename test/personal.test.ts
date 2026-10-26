@@ -39,6 +39,20 @@ describe("songsLike", () => {
     ]);
     expect(songsLike(sets, liked, SINCE, { exclude: new Set([key("Kite - Glow")]) }).map((r) => r.name)).not.toContain("Kite - Glow");
   });
+
+  it("ranks songs closely tied to your likes above songs that are simply everywhere", () => {
+    const many = [
+      makeSet("x1", "2026-09-01", ["DJ 1"], ["Mine - Liked", "Niche - Gem", "Big - Hit"]),
+      makeSet("x2", "2026-09-02", ["DJ 2"], ["Mine - Liked", "Niche - Gem", "Big - Hit"]),
+      makeSet("x3", "2026-09-03", ["DJ 3"], ["Mine - Liked", "Big - Hit"]),
+      ...Array.from({ length: 12 }, (_, i) => makeSet(`y${i}`, "2026-09-04", [`DJ y${i}`], ["Big - Hit"])),
+    ];
+    // Big - Hit shares more sets (3) but is in 15; Niche - Gem shares 2 of its only 2.
+    expect(songsLike(many, new Set([key("Mine - Liked")]), SINCE).map((r) => [r.name, r.count])).toEqual([
+      ["Niche - Gem", 2],
+      ["Big - Hit", 3],
+    ]);
+  });
 });
 
 describe("categoryHints", () => {

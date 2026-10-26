@@ -98,10 +98,15 @@ describe.skipIf(!available)("PgUserData", () => {
     expect((await pool.query("select count(*)::int as n from tracks")).rows[0].n).toBe(2); // no per-user copies
   });
 
-  it("unlikes, removes empty categories, and refuses songs it doesn't know", async () => {
+  it("unlikes, keeps an emptied playlist until it's deleted, and refuses songs it doesn't know", async () => {
     await data.setLiked(alice, "Nova - Pulse", false);
     await data.setLabel(alice, "Kite - Glow", "party", false);
-    expect(await data.get(alice)).toEqual({ likes: {}, categories: {} });
+    expect(await data.get(alice)).toEqual({ likes: {}, categories: { party: { name: "Party", songs: {} } } });
+    expect(await data.createPlaylist(alice, "  Warm-up ")).toBe("Warm-up");
+    expect(await data.deletePlaylist(alice, "PARTY")).toBe(true);
+    expect(await data.deletePlaylist(alice, "party")).toBe(false);
+    expect(await data.get(alice)).toEqual({ likes: {}, categories: { "warm-up": { name: "Warm-up", songs: {} } } });
+    await expect(data.createPlaylist(alice, " ")).rejects.toBeInstanceOf(UserDataError);
     await expect(data.setLiked(alice, "Nobody - Nothing", true)).rejects.toBeInstanceOf(UserDataError);
   });
 

@@ -132,7 +132,7 @@ for CHRIS STASSY · Search for “chris stussy” instead".
 **Collecting sets:** on a song or artist page, **Gather more sets** opens 1001Tracklists' own search
 in a popup. The extension opens the matching result (or you click it; if the site asks you to verify
 you're human, you do that yourself), scrolls the page the way you would until every set is listed (the
-page loads 20 at a time, up to 300), sends the links to setscope, and closes the popup. setscope then
+page loads about 10 at a time; there is no cap, so a big DJ can take a few minutes), sends the links to setscope, and closes the popup. setscope then
 fetches **all** of them on its own, newest first, one every 8 seconds. A slim strip under the top bar
 shows progress on every page, and the full queue (up next, with **Show the rest / Hide the rest**) is on
 Account. Home and Trending update as sets arrive; artist, song and category pages offer **Refresh**

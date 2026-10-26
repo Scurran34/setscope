@@ -27,8 +27,11 @@ export function setsForYou(sets: Tracklist[], liked: Set<string>, since: string,
 }
 
 /**
- * Songs played alongside your picks (`seeds`): for each set that has at least one
- * seed, every other song in it gets a point. Seeds and `exclude` are left out.
+ * Songs played alongside your picks (`seeds`): songs that share 2+ sets with them.
+ *
+ * Ranked by how *specific* the link is, not just how often: shared sets divided by the
+ * square root of all the sets the song is in. Otherwise the biggest songs of the moment
+ * would top everyone's list just for being everywhere. Seeds and `exclude` are left out.
  */
 export function songsLike(
   sets: Tracklist[],
@@ -36,16 +39,24 @@ export function songsLike(
   since: string,
   options: { exclude?: Set<string>; limit?: number } = {},
 ): Ranked[] {
-  const counter = new Counter();
+  const shared = new Counter();
+  const everywhere = new Map<string, number>();
   for (const set of filterSince(sets, since)) {
     const keys = songKeys(set);
+    for (const key of keys.keys()) everywhere.set(key, (everywhere.get(key) ?? 0) + 1);
     if (![...keys.keys()].some((k) => seeds.has(k))) continue;
     for (const [key, name] of keys) {
-      if (!seeds.has(key) && !options.exclude?.has(key)) counter.add(key, name);
+      if (!seeds.has(key) && !options.exclude?.has(key)) shared.add(key, name);
     }
   }
+  const keyOf = new Map<string, string>();
+  for (const set of filterSince(sets, since)) for (const [key, name] of songKeys(set)) if (!keyOf.has(name)) keyOf.set(name, key);
+  const lift = (r: Ranked) => r.count / Math.sqrt(everywhere.get(keyOf.get(r.name) ?? "") ?? r.count);
   // One shared set is a coincidence; two or more is a pattern.
-  return counter.top(options.limit ?? 10, 2);
+  return shared
+    .top(Number.POSITIVE_INFINITY, 2)
+    .sort((a, b) => lift(b) - lift(a) || b.count - a.count || a.name.localeCompare(b.name))
+    .slice(0, options.limit ?? 10);
 }
 
 export interface CategoryHint {

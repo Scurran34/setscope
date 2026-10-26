@@ -1,6 +1,6 @@
 import type pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { artistChart, eventOf, listSets, setDetail, songChart, trendOf, windowFor } from "../src/catalog/browse.ts";
+import { artistChart, creditScore, eventOf, isFeatured, listSets, setDetail, songChart, trendOf, windowFor } from "../src/catalog/browse.ts";
 import { PgCatalog } from "../src/catalog/pg-catalog.ts";
 import { normalizeName } from "../src/normalize.ts";
 import { databaseAvailable, freshSchema } from "./helpers/db.ts";
@@ -22,6 +22,21 @@ describe("chart windows and trends", () => {
     expect(trendOf(1, 5, 0, 5)).toBeNull(); // one play isn't "new"
     expect(trendOf(5, 5, 2, 5)).toBeNull(); // too few earlier plays for a percentage
     expect(trendOf(5, 4, 3, 5)).toBeNull(); // too few sets in a window
+  });
+
+  it("knows when an artist is only featured", () => {
+    expect(isFeatured("Dom Dolla ft. Clementine Douglas", "Clementine Douglas")).toBe(true);
+    expect(isFeatured("Dom Dolla ft. Clementine Douglas", "Dom Dolla")).toBe(false);
+    expect(isFeatured("MK & Clementine Douglas", "Clementine Douglas")).toBe(false);
+    expect(isFeatured("MK & Sonny Fodera feat. Clementine Douglas", "clementine douglas")).toBe(true);
+  });
+
+  it("credits breadth over one hit, and features at half", () => {
+    const plays = (sets: [number, boolean][], songs: number[]) => ({ sets: new Map(sets), songs: new Map(songs.map((n, i) => [i, n])) });
+    const tenSets = Array.from({ length: 10 }, (_, i): [number, boolean] => [i, false]);
+    expect(creditScore(plays(tenSets, [10]))).toBe(5); // one song in every set: halved
+    expect(creditScore(plays(tenSets, [2, 2, 2, 2, 2]))).toBe(9); // five songs, 2 sets each
+    expect(creditScore(plays(tenSets.map(([id]) => [id, true]), [2, 2, 2, 2, 2]))).toBe(4.5); // only ever featured
   });
 
   it("reads the event from a set title", () => {
@@ -86,11 +101,16 @@ describe.skipIf(!available)("browsing the catalog", () => {
 
   it("ranks artists by sets that played them, and can keep only those with photos", async () => {
     const week = await artistChart(pool, { period: "week", page: 1, pageSize: 10, today: TODAY });
-    expect(week.items.map((a) => [a.name, a.playedIn, a.ownSets])).toEqual([
-      ["Nova", 5, 0],
-      ["Kite", 3, 0],
-      ["Rook", 2, 0],
+    expect(week.items.map((a) => [a.name, a.playedIn, a.songs, a.score])).toEqual([
+      ["Nova", 5, 1, 2.5],
+      ["Kite", 3, 1, 1.5],
+      ["Rook", 2, 1, 1],
     ]);
+    // Rook's own set full of Rook songs: his own picks don't raise his ranking.
+    await new PgCatalog(pool).save(makeSet("rook", "2026-10-24", ["Rook"], ["Rook - Drift", "Rook - Two", "Rook - Three"]), "");
+    const withOwnSet = await artistChart(pool, { period: "week", page: 1, pageSize: 10, today: TODAY });
+    expect(withOwnSet.items.find((a) => a.name === "Rook")).toMatchObject({ playedIn: 2, songs: 1, score: 1, ownSets: 1 });
+    await pool.query("delete from sets where source_id = 'rook'");
     await pool.query("update artists set image_url = 'https://example.test/kite.jpg' where name_key = 'kite'");
     const photos = await artistChart(pool, { period: "week", page: 1, pageSize: 10, today: TODAY, withPhoto: true });
     expect(photos.items.map((a) => [a.rank, a.name, a.image])).toEqual([[1, "Kite", "https://example.test/kite.jpg"]]);

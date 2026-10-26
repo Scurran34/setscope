@@ -10,8 +10,9 @@
 //   GET  /api/auth/me                    who you are, and whether sign-up is open
 //   POST /api/auth/register|login|logout
 //   GET  /api/song?q=  /api/artist?name=  /api/suggest  /api/trending
-//   GET  /api/me  /api/for-you  /api/category?name=     (your data; needs login)
-//   POST /api/like  /api/label                           (needs login)
+//   GET  /api/me  /api/for-you  /api/playlists  /api/playlist?name=   (your data; needs login)
+//   POST /api/like  /api/label (add/remove a song in a playlist)  /api/playlists  /api/playlists/delete
+//   GET  /api/discover?genre=&page=&seed=   songs you might like (or trending ones), shuffled
 //   GET  /api/song-info?song=            key and BPM (GetSongBPM, cached)
 //   GET  /api/account   POST /api/account/getsongbpm-key (owner)
 //   GET  /api/status    POST /api/background (owner)
@@ -20,6 +21,7 @@
 //   POST /api/refresh-set { url }        re-read a set now (needs login)
 //   GET  /api/charts/songs  /api/charts/artists  ?period=week|month|3months|year|all&genre=&q=&page=
 //   GET  /api/sets?q=&dj=&year=&page=  /api/set?id=  /api/genres  /api/search?q=  /api/vault-preview
+//   GET  /api/play?song=                 something to play for a song: its link, or its best SoundCloud match
 //   GET  /api/song-links?song=           confirmed SoundCloud links for a song
 //   POST /api/song-links  /api/song-links/remove        confirm (or remove) one (needs login)
 //   GET  /api/soundcloud/candidates?song=  /api/soundcloud/remixes?song=  /api/soundcloud/likes?profile=
@@ -50,7 +52,7 @@ import { importLegacySets } from "./db/import-legacy.ts";
 import { migrate } from "./db/migrate.ts";
 import { createPool } from "./db/pool.ts";
 import { normalizeName, parseSongQuery, songKey, splitArtists, trackFromName } from "./normalize.ts";
-import { PgUserData, UserDataError } from "./personal/user-data.ts";
+import { findTrackId, PgUserData, UserDataError } from "./personal/user-data.ts";
 import { BackgroundCollector } from "./source/background.ts";
 import { isFetchAllowed, PoliteFetcher } from "./source/fetcher.ts";
 import { extractTracklistUrls } from "./source/parse.ts";
@@ -59,11 +61,13 @@ import { ScError, ScRateLimited, SoundCloudClient, type ScTrack } from "./soundc
 import { isTrackLink, LinkStore } from "./soundcloud/links.ts";
 import { classify, remixesOf, songCandidates, type Candidate } from "./soundcloud/match.ts";
 import { versionOf } from "./catalog/identity.ts";
-import { artistChart, genres, idStats, listSets, PERIODS, setDetail, songChart, type Period } from "./catalog/browse.ts";
+import { artistChart, genres, idStats, listSets, PERIODS, setCardsByIds, setDetail, songCards, songChart, type Period, type SongCard } from "./catalog/browse.ts";
 
 export const PORT = Number(process.env.SETSCOPE_PORT ?? 7331);
 const WEB_DIR = join(import.meta.dirname, "..", "web");
 const COOKIE = "setscope_session";
+/** A "since" date that holds nothing back: for sets you asked for yourself. */
+const ALL_TIME = "0001-01-01";
 
 export interface App {
   pool: pg.Pool;
@@ -91,6 +95,8 @@ export interface App {
   soundcloudLimit: RateLimiter;
   /** Likes lookups for the whole site: SoundCloud allows the app 500 a day. */
   likesLimit: RateLimiter;
+  /** Tracks SoundCloud had no match for, and until when not to search again. */
+  noMatch: Map<number, number>;
 }
 
 export interface AppDeps {
@@ -144,6 +150,7 @@ export function createApp({ pool, catalog, queue, accounts, userData }: AppDeps,
     soundcloudFile: options.soundcloudFile,
     soundcloudLimit: options.soundcloudLimit ?? new RateLimiter(120, 10 * 60_000),
     likesLimit: options.likesLimit ?? new RateLimiter(400, 24 * 60 * 60_000),
+    noMatch: new Map(),
   };
   return createServer((req, res) => {
     if (req.url?.startsWith("/api/") && req.url !== "/api/status") {
@@ -187,6 +194,7 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
         user: user ? { ...user, owner: await app.accounts.isOwner(user.id) } : null,
         signup: await app.accounts.signupStatus(),
         soundcloud: app.soundcloud.configured(),
+        extensionVersion: extensionVersion(),
       });
     case "POST /api/auth/register": {
       requireOwnHeader(req);
@@ -340,21 +348,108 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
     }
     case "GET /api/for-you": {
       const since = sinceMonths(intParam(params, "months", DEFAULT_MONTHS));
-      if (!user) return sendJson(res, 200, { likes: [], sets: [], songs: [] });
+      if (!user) return sendJson(res, 200, { likes: [], likedSongs: [], sets: [], songs: [] });
       const mine = await app.userData.get(user.id);
       const liked = new Set(Object.keys(mine.likes));
       const sets = await app.catalog.all();
-      return sendJson(res, 200, { likes: Object.values(mine.likes), sets: setsForYou(sets, liked, since, 30), songs: songsLike(sets, liked, since) });
+      const forYou = setsForYou(sets, liked, since, 8);
+      const cards = await setCardsByIds(app.pool, forYou.map((s) => s.id));
+      const likes = Object.values(mine.likes).reverse(); // newest first
+      return sendJson(res, 200, {
+        likes,
+        likedSongs: await cardsFor(app, likes),
+        // Sets that play the most of your liked songs, with photos: the page features one at a time.
+        sets: forYou.map((s) => ({ ...(cards.get(s.id) ?? s), liked: s.liked })),
+        songs: songsLike(sets, liked, since),
+      });
     }
-    case "GET /api/category": {
-      const u = needUser("see your categories");
-      const name = required(params, "name");
-      const category = (await app.userData.get(u.id)).categories[normalizeName(name)];
-      if (!category) return sendJson(res, 404, { error: `No category called "${name}"` });
+    case "GET /api/discover": {
+      // Songs you might like, shuffled so it isn't the same best-known songs every time.
+      // Without likes (or not signed in): what's being played most this month.
       const since = sinceMonths(intParam(params, "months", DEFAULT_MONTHS));
-      const members = new Set(Object.keys(category.songs));
+      const genre = params.get("genre")?.trim() ?? "";
+      const page = intParam(params, "page", 1);
+      const size = Math.min(intParam(params, "size", 24), 60);
+      const seed = intParam(params, "seed", 1);
+      const sets = await app.catalog.all();
+      const mine = user ? await app.userData.get(user.id) : undefined;
+      const liked = new Set(Object.keys(mine?.likes ?? {}));
+      let names: { name: string; reason: string }[] = [];
+      if (liked.size) {
+        names = songsLike(sets, liked, since, { limit: 200 }).map((r) => ({ name: r.name, reason: `Played alongside your likes in ${plural(r.count, "set")}` }));
+      }
+      const personal = names.length >= 12;
+      if (!personal) {
+        const chart = await songChart(app.pool, { period: "month", page: 1, pageSize: 200, today: today() });
+        const have = new Set(names.map((n) => n.name));
+        for (const row of chart.items) {
+          const name = `${row.artist} - ${row.title}`;
+          if (!have.has(name) && !liked.has(songKey(trackFromName(name)))) names.push({ name, reason: `In ${plural(row.sets, "set")} this month` });
+        }
+      }
+      const cards = await songCards(app.pool, names.map((n) => n.name));
+      const pool = names
+        .map((n, rank) => ({ ...n, rank, card: cards.get(n.name) }))
+        .filter((n) => n.card && (!genre || (genre.toLowerCase() === "unknown" ? !n.card.genre : n.card.genre?.toLowerCase() === genre.toLowerCase())));
+      const shuffled = weightedShuffle(pool, seed);
+      const start = (page - 1) * size;
+      return sendJson(res, 200, {
+        mode: personal ? "personal" : "trending",
+        items: shuffled.slice(start, start + size).map((n) => ({ ...n.card!, reason: n.reason })),
+        page,
+        pageSize: size,
+        total: shuffled.length,
+        pages: Math.max(1, Math.ceil(shuffled.length / size)),
+      });
+    }
+    case "GET /api/playlists": {
+      const u = needUser("see your playlists");
+      const { categories } = await app.userData.get(u.id);
+      const saved = await app.links.saved(u.id);
+      const lists = Object.entries(categories).map(([key, c]) => ({ key, name: c.name, songs: Object.values(c.songs), links: saved[key]?.links.length ?? 0 }));
+      const cards = await songCards(app.pool, lists.flatMap((l) => l.songs.slice(0, 12)));
+      return sendJson(res, 200, lists.map((l) => ({
+        name: l.name,
+        count: l.songs.length + l.links,
+        // Up to four different artist photos from its songs, for the cover.
+        cover: [...new Set(l.songs.map((s) => cards.get(s)?.image).filter((i): i is string => Boolean(i)))].slice(0, 4),
+      })));
+    }
+    case "POST /api/playlists": {
+      requireOwnHeader(req);
+      const u = needUser("make playlists");
+      const body = (await readJson(req)) as { name?: unknown };
+      if (typeof body.name !== "string") throw new BadRequest("Expected { name }");
+      let name = "";
+      await userAction(async () => void (name = await app.userData.createPlaylist(u.id, body.name as string)));
+      return sendJson(res, 200, { name });
+    }
+    case "POST /api/playlists/delete": {
+      requireOwnHeader(req);
+      const u = needUser("delete playlists");
+      const body = (await readJson(req)) as { name?: unknown };
+      if (typeof body.name !== "string") throw new BadRequest("Expected { name }");
+      return sendJson(res, 200, { deleted: await app.userData.deletePlaylist(u.id, body.name) });
+    }
+    case "GET /api/category": // the old name for playlists
+    case "GET /api/playlist": {
+      const u = needUser("see your playlists");
+      const name = required(params, "name");
+      const playlist = (await app.userData.get(u.id)).categories[normalizeName(name)];
+      if (!playlist) return sendJson(res, 404, { error: `No playlist called "${name}"` });
+      const since = sinceMonths(intParam(params, "months", DEFAULT_MONTHS));
+      const members = new Set(Object.keys(playlist.songs));
       const links = (await app.links.saved(u.id))[normalizeName(name)]?.links ?? [];
-      return sendJson(res, 200, { name: category.name, songs: Object.values(category.songs), links, suggestions: songsLike(await app.catalog.all(), members, since) });
+      const songs = Object.values(playlist.songs);
+      const suggestions = members.size ? songsLike(await app.catalog.all(), members, since, { limit: 12 }) : [];
+      return sendJson(res, 200, {
+        name: playlist.name,
+        songs,
+        songCards: await cardsFor(app, songs),
+        links,
+        suggestions,
+        suggestionCards: await cardsFor(app, suggestions.map((s) => s.name)),
+      });
     }
     case "GET /api/account": {
       const u = needUser("see your account");
@@ -416,6 +511,36 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       const song = songParam(params);
       const viewer = user ? { id: user.id, owner: await app.accounts.isOwner(user.id) } : undefined;
       return sendJson(res, 200, { links: await app.links.forSong(song, viewer), soundcloud: app.soundcloud.configured() });
+    }
+    case "GET /api/play": {
+      // Play any song: its confirmed link, an earlier automatic match, or (if SoundCloud is
+      // connected) the best "this song" match from a search, which is then remembered.
+      const song = songParam(params);
+      let trackId: number;
+      try {
+        trackId = await findTrackId(app.pool, song);
+      } catch (error) {
+        if (error instanceof UserDataError) throw new BadRequest(error.message);
+        throw error;
+      }
+      const known = await app.links.playable(trackId);
+      if (known) return sendJson(res, 200, known);
+      if (!app.soundcloud.configured()) return sendJson(res, 404, { error: "Connect SoundCloud (Account → SoundCloud app) to play songs that haven't been linked yet." });
+      const missUntil = app.noMatch.get(trackId);
+      if (missUntil && missUntil > Date.now()) return sendJson(res, 404, { error: `Couldn't find “${song}” on SoundCloud.` });
+      if (!app.soundcloudLimit.take(user ? `user:${user.id}` : `addr:${req.socket.remoteAddress ?? "?"}`)) {
+        throw new NotAllowed("That's a lot of SoundCloud searches in a short time. Wait a few minutes and try again.", 429);
+      }
+      const track = trackFromName(song);
+      const page = await app.soundcloud.searchTracks({ q: searchWords(`${track.artist} ${track.title}`), limit: 30 });
+      const usable = songCandidates(track, page.items).filter((c) => c.kind === "this" && c.confidence >= 0.75 && c.track.embeddable && c.track.access !== "blocked");
+      const best = usable.find((c) => c.track.access === "playable") ?? usable[0];
+      if (!best) {
+        app.noMatch.set(trackId, Date.now() + 24 * 60 * 60_000);
+        return sendJson(res, 404, { error: `Couldn't find a playable upload of “${song}” on SoundCloud.` });
+      }
+      await app.links.saveAutoMatch(trackId, { url: best.track.permalink, externalId: best.track.urn, confidence: best.confidence });
+      return sendJson(res, 200, { url: best.track.permalink, auto: true, confidence: best.confidence, preview: best.track.access === "preview" });
     }
     case "POST /api/song-links": {
       requireOwnHeader(req);
@@ -520,14 +645,15 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
         background: await app.background?.status(),
       });
     case "POST /api/capture": {
-      // From the browser extension (which may not carry your login).
+      // From the browser extension (which may not carry your login). It only acts on a
+      // page you opened yourself, so there's no cap and no date window: every set on the
+      // page is queued, newest first.
       requireOwnHeader(req);
-      limitCaptures(app, req, user);
-      const body = (await readJson(req)) as { pageUrl?: unknown; urls?: unknown; complete?: unknown };
+      const body = (await readJson(req, 5_000_000)) as { pageUrl?: unknown; urls?: unknown; complete?: unknown };
       if (!Array.isArray(body.urls)) throw new BadRequest("Expected { urls: string[] }");
-      if (body.urls.length > 400) throw new BadRequest("Too many links in one capture.");
+      if (body.urls.length > 20_000) throw new BadRequest("Too many links in one capture.");
       const urls = [...new Set(body.urls.filter((u): u is string => typeof u === "string" && isFetchAllowed(u)))];
-      const result = await app.queue.enqueue(urls, app.since, { requestedBy: user?.id });
+      const result = await app.queue.enqueue(urls, ALL_TIME, { requestedBy: user?.id });
       // Remember how far gathering got on this DJ/track page, for "last gathered" on artist pages.
       const page = typeof body.pageUrl === "string" && /^https:\/\/(www\.)?1001tracklists\.com\/(artist|dj|track|source)\//.test(body.pageUrl) ? body.pageUrl : undefined;
       const discovery = page ? await recordDiscovery(app.pool, page, { found: urls.length, ...result, complete: body.complete === true }) : undefined;
@@ -535,8 +661,8 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       return sendJson(res, 200, { found: urls.length, ...result, discovery });
     }
     case "POST /api/capture-set": {
+      // A set page you opened yourself: no limit.
       requireOwnHeader(req);
-      limitCaptures(app, req, user);
       const body = (await readJson(req, 10_000_000)) as { pageUrl?: unknown; html?: unknown };
       if (typeof body.pageUrl !== "string" || typeof body.html !== "string") throw new BadRequest("Expected { pageUrl: string, html: string }");
       const pageUrl = body.pageUrl.split("#")[0]!;
@@ -558,7 +684,8 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       if (typeof body.text !== "string") throw new BadRequest("Expected { text: string }");
       const urls = extractTracklistUrls(body.text).filter(isFetchAllowed).slice(0, 400);
       if (urls.length === 0) throw new BadRequest("No 1001Tracklists set links found in that text.");
-      return sendJson(res, 200, { found: urls.length, ...(await app.queue.enqueue(urls, app.since, { requestedBy: u.id })) });
+      // Links you chose yourself: no date window.
+      return sendJson(res, 200, { found: urls.length, ...(await app.queue.enqueue(urls, ALL_TIME, { requestedBy: u.id })) });
     }
     case "POST /api/refresh-set": {
       requireOwnHeader(req);
@@ -606,6 +733,18 @@ async function withUserData(app: App, user: User | undefined, report: SongReport
   };
 }
 
+/**
+ * The extension version in this project's extension/ folder. Chrome keeps running the
+ * copy it loaded until you press reload, so the page compares the two.
+ */
+function extensionVersion(): string | null {
+  try {
+    return (JSON.parse(readFileSync(join(import.meta.dirname, "..", "extension", "manifest.json"), "utf8")) as { version?: string }).version ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function artistImage(pool: pg.Pool, artistText: string): Promise<string | null> {
   const names = splitArtists(artistText).map(normalizeName);
   if (!names.length) return null;
@@ -614,6 +753,40 @@ async function artistImage(pool: pg.Pool, artistText: string): Promise<string | 
     [names],
   );
   return r.rows[0]?.image_url ?? null;
+}
+
+/** Song cards for names, in the same order (a name we can't find gets a bare card). */
+async function cardsFor(app: App, names: string[]): Promise<SongCard[]> {
+  const cards = await songCards(app.pool, names);
+  return names.map((name) => {
+    const card = cards.get(name);
+    if (card) return card;
+    const t = trackFromName(name);
+    return { name, artist: t.artist, title: t.title, genre: null, image: null, soundcloud: null };
+  });
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${n === 1 ? word : `${word}s`}`;
+}
+
+/**
+ * A shuffle that still favors the best matches: each item gets a random key weighted by
+ * its rank (Efraimidis-Spirakis), from a seed so paging through one shuffle is stable.
+ */
+function weightedShuffle<T extends { rank: number }>(items: T[], seed: number): T[] {
+  let state = (seed >>> 0) || 1;
+  const random = () => {
+    // xorshift32: small, fast, and the same sequence for the same seed.
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    return ((state >>> 0) % 1_000_000) / 1_000_000 + 1e-9;
+  };
+  return items
+    .map((item) => ({ item, key: Math.pow(random(), 1 / (1 / Math.sqrt(item.rank + 1))) }))
+    .sort((a, b) => b.key - a.key)
+    .map((x) => x.item);
 }
 
 function chartParams(params: URLSearchParams): { period: Period; genre?: string; q?: string; page: number; today: string } {
@@ -670,7 +843,7 @@ function candidateJson(c: Candidate) {
   return { ...trackJson(c.track), kind: c.kind, confidence: c.confidence, reason: c.reason, versionType: c.read.versionType, versionArtists: c.read.versionArtists ?? null };
 }
 
-/** At most 30 captures / pasted lists / refresh requests per 10 minutes per account (or address). */
+/** At most 30 pasted lists / refresh requests per 10 minutes per account (or address). */
 function limitCaptures(app: App, req: IncomingMessage, user: User | undefined): void {
   const key = user ? `user:${user.id}` : `addr:${req.socket.remoteAddress ?? "?"}`;
   if (!app.captureLimit.take(key)) throw new NotAllowed("That's a lot of requests in a short time. Wait a few minutes and try again.", 429);

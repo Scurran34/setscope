@@ -2,7 +2,9 @@
 //
 //   - Song links: "this tracklist song is this SoundCloud upload", shared by everyone
 //     (external_track_links). Only a reference is kept: the link, SoundCloud's id for it,
-//     how sure the match was, and who confirmed it.
+//     how sure the match was, and who confirmed it. Pressing play on a song with no link
+//     saves its best match automatically (no one confirmed it, so added_by is empty);
+//     anyone signed in can remove a wrong one.
 //   - Saved tracks: a SoundCloud upload someone put in one of their categories
 //     (collection_links): a bookmark with the title and uploader as shown, personal.
 
@@ -14,8 +16,10 @@ export interface SongLink {
   url: string;
   externalId: string | null;
   confidence: number;
-  /** "user": pasted by someone; "search_match": picked from search results; "source_page": from 1001Tracklists. */
+  /** "user": pasted by someone; "search_match": picked from search results (or matched automatically); "source_page": from 1001Tracklists. */
   provenance: "source_page" | "user" | "search_match";
+  /** Matched automatically when someone pressed play; no one has confirmed it. */
+  auto: boolean;
   addedBy: string | null;
   addedAt: string;
   /** Can the person asking remove it (they added it, or they own the site)? */
@@ -58,7 +62,7 @@ export class LinkStore {
       `select l.url, l.external_id, l.confidence, l.provenance, l.added_by, u.display_name, l.created_at
          from external_track_links l left join users u on u.id = l.added_by
         where l.track_id = $1 and l.provider = 'soundcloud'
-        order by l.confidence desc, l.created_at`,
+        order by (l.added_by is null and l.provenance = 'search_match'), l.confidence desc, l.created_at`,
       [trackId],
     );
     return r.rows.map((row) => {
@@ -67,10 +71,11 @@ export class LinkStore {
         externalId: row.external_id,
         confidence: row.confidence,
         provenance: row.provenance,
+        auto: row.provenance === "search_match" && row.added_by === null,
         addedBy: row.display_name,
         addedAt: row.created_at.toISOString(),
       };
-      if (viewer) link.removable = viewer.owner || row.added_by === viewer.id;
+      if (viewer) link.removable = viewer.owner || row.added_by === viewer.id || link.auto;
       return link;
     });
   }
@@ -86,11 +91,34 @@ export class LinkStore {
     );
   }
 
-  /** Remove a link; only whoever added it, or the owner. */
+  /** The link to play for a track: a confirmed one first, then an automatic match. */
+  async playable(trackId: number): Promise<{ url: string; auto: boolean; confidence: number } | undefined> {
+    const r = await this.pool.query<{ url: string; auto: boolean; confidence: number }>(
+      `select url, (added_by is null and provenance = 'search_match') auto, confidence from external_track_links
+        where track_id = $1 and provider = 'soundcloud'
+        order by (added_by is null and provenance = 'search_match'), confidence desc, created_at limit 1`,
+      [trackId],
+    );
+    return r.rows[0];
+  }
+
+  /** Save the best search match for a song nobody has linked yet (no one confirmed it). */
+  async saveAutoMatch(trackId: number, link: { url: string; externalId: string; confidence: number }): Promise<void> {
+    if (!isTrackLink(link.url)) return;
+    await this.pool.query(
+      `insert into external_track_links (track_id, provider, url, external_id, confidence, provenance, added_by)
+       values ($1, 'soundcloud', $2, $3, $4, 'search_match', null)
+       on conflict (track_id, provider, url) do nothing`,
+      [trackId, link.url, link.externalId, link.confidence],
+    );
+  }
+
+  /** Remove a link: whoever added it, the owner, or anyone signed in for an automatic match. */
   async removeSongLink(user: { id: number; owner: boolean }, song: string, url: string): Promise<boolean> {
     const trackId = await findTrackId(this.pool, song);
     const r = await this.pool.query(
-      `delete from external_track_links where track_id = $1 and provider = 'soundcloud' and url = $2 and ($3 or added_by = $4)`,
+      `delete from external_track_links where track_id = $1 and provider = 'soundcloud' and url = $2
+         and ($3 or added_by = $4 or (added_by is null and provenance = 'search_match'))`,
       [trackId, url, user.owner, user.id],
     );
     return (r.rowCount ?? 0) > 0;
@@ -99,7 +127,7 @@ export class LinkStore {
   /** Save (or unsave) a SoundCloud upload in one of your categories. */
   async setSaved(userId: number, category: string, link: { url: string; title: string; artist: string }, on: boolean): Promise<void> {
     const name = category.trim();
-    if (!name || name.length > 40) throw new UserDataError("Category names are 1 to 40 characters.");
+    if (!name || name.length > 40) throw new UserDataError("Playlist names are 1 to 40 characters.");
     if (!isTrackLink(link.url)) throw new UserDataError("That isn't a SoundCloud track link.");
     const key = normalizeName(name);
     if (on) {
@@ -118,12 +146,6 @@ export class LinkStore {
         `delete from collection_links where url = $3
            and collection_id = (select id from collections where user_id = $1 and name_key = $2)`,
         [userId, key, link.url],
-      );
-      await this.pool.query(
-        `delete from collections c where c.user_id = $1 and c.name_key = $2
-           and not exists (select 1 from collection_tracks ct where ct.collection_id = c.id)
-           and not exists (select 1 from collection_links cl where cl.collection_id = c.id)`,
-        [userId, key],
       );
     }
   }

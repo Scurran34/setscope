@@ -62,10 +62,10 @@ export class PgUserData {
     else await this.pool.query("delete from user_likes where user_id = $1 and track_id = $2", [userId, trackId]);
   }
 
-  /** Add or remove a song from a category; a category with no songs left disappears. */
+  /** Add or remove a song from a playlist (adding to one that doesn't exist creates it). Empty playlists stay until deleted. */
   async setLabel(userId: number, song: string, category: string, on: boolean): Promise<void> {
     const name = category.trim();
-    if (!name || name.length > 40) throw new UserDataError("Category names are 1 to 40 characters.");
+    if (!name || name.length > 40) throw new UserDataError("Playlist names are 1 to 40 characters.");
     const trackId = await this.trackId(song);
     const key = normalizeName(name);
     if (on) {
@@ -81,13 +81,25 @@ export class PgUserData {
            and collection_id = (select id from collections where user_id = $1 and name_key = $2)`,
         [userId, key, trackId],
       );
-      await this.pool.query(
-        `delete from collections c where c.user_id = $1 and c.name_key = $2
-           and not exists (select 1 from collection_tracks ct where ct.collection_id = c.id)
-           and not exists (select 1 from collection_links cl where cl.collection_id = c.id)`,
-        [userId, key],
-      );
     }
+  }
+
+  /** A new, empty playlist (or the existing one with that name). */
+  async createPlaylist(userId: number, name: string): Promise<string> {
+    const clean = name.trim();
+    if (!clean || clean.length > 40) throw new UserDataError("Playlist names are 1 to 40 characters.");
+    const r = await this.pool.query<{ name: string }>(
+      `insert into collections (user_id, name, name_key) values ($1, $2, $3)
+       on conflict (user_id, name_key) do update set name = collections.name returning name`,
+      [userId, clean, normalizeName(clean)],
+    );
+    return r.rows[0]!.name;
+  }
+
+  /** Delete a playlist and everything in it (the songs themselves stay in the catalog). */
+  async deletePlaylist(userId: number, name: string): Promise<boolean> {
+    const r = await this.pool.query("delete from collections where user_id = $1 and name_key = $2", [userId, normalizeName(name)]);
+    return (r.rowCount ?? 0) > 0;
   }
 
   /**

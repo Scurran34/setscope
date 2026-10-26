@@ -75,7 +75,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // Give the "sent" banner a moment, then close and return to setscope.
         setTimeout(async () => {
           await chrome.storage.session.set({ captureTabs: state.captureTabs.filter((id) => id !== tab.id) });
-          chrome.tabs.remove(tab.id);
+          // You may have closed it already: nothing to do then.
+          chrome.tabs.remove(tab.id).catch(() => {});
           if (state.appTabId !== null) {
             chrome.tabs.update(state.appTabId, { active: true }).catch(() => {});
             chrome.tabs.get(state.appTabId).then((t) => chrome.windows.update(t.windowId, { focused: true })).catch(() => {});

@@ -18,7 +18,6 @@
 //   #/discover                       A SoundCloud curator's likes
 
 import type { ArtistReport } from "../src/analysis/artist.ts";
-import type { SetForYou } from "../src/analysis/personal.ts";
 import type { ArtistProfile } from "../src/analysis/profile.ts";
 import type { SongReport } from "../src/analysis/song.ts";
 import type { TrendingItem, TrendingReport } from "../src/analysis/trending.ts";
@@ -45,8 +44,8 @@ type Route =
   | { page: "artist"; name: string; exact: boolean }
   | { page: "song"; artist: string; song: string }
   | { page: "search"; query: string; exact: boolean }
-  | { page: "category"; name: string }
-  | { page: "discover"; profile?: string };
+  | { page: "playlist"; name: string }
+  | { page: "discover"; params: URLSearchParams; profile?: string };
 
 interface Status {
   sets: number;
@@ -82,6 +81,8 @@ interface AuthState {
   signup: "open" | "invite" | "closed";
   /** Is the SoundCloud app connected (search, remixes, Explore)? */
   soundcloud?: boolean;
+  /** The extension version in the project folder; Chrome should be running this one. */
+  extensionVersion?: string | null;
 }
 let auth: AuthState = { user: null, signup: "closed" };
 let lastStatus: Status | undefined;
@@ -116,10 +117,6 @@ function artistHash(name: string, exact = false): string {
 /** Song pages live under their (first) artist's page. */
 function songHash(song: string, artist = artistsOf(song)[0] ?? song): string {
   return `#/artist/${enc(artist)}/song/${enc(song)}`;
-}
-
-function categoryHash(name: string): string {
-  return `#/category/${enc(name)}`;
 }
 
 function songLink(song: string, label: string = song): HTMLElement {
@@ -339,8 +336,9 @@ function parseRoute(hash: string): Route {
   if (first === "artist" && second && third === "song" && fourth) return { page: "song", artist: second, song: fourth };
   if (first === "artist" && second) return { page: "artist", name: second, exact: third === "exact" };
   if (first === "song" && second) return { page: "search", query: second, exact: third === "exact" };
-  if (first === "category" && second) return { page: "category", name: second };
-  if (first === "discover") return second ? { page: "discover", profile: second } : { page: "discover" };
+  // Playlists were called categories before; old links still work.
+  if ((first === "playlist" || first === "category") && second) return { page: "playlist", name: second };
+  if (first === "discover") return second ? { page: "discover", params, profile: second } : { page: "discover", params };
   return { page: "home" };
 }
 
@@ -350,7 +348,7 @@ async function showRoute(): Promise<void> {
   route = parseRoute(location.hash);
   const NAV: Partial<Record<Route["page"], string>> = {
     home: "home", songs: "songs", trending: "songs", song: "songs", search: "songs", artists: "artists", artist: "artists",
-    sets: "sets", set: "sets", library: "library", category: "library", account: "account", discover: "discover",
+    sets: "sets", set: "sets", library: "library", playlist: "library", account: "account", discover: "discover",
   };
   const nav = NAV[route.page] ?? "";
   for (const a of document.querySelectorAll<HTMLAnchorElement>("[data-nav]")) a.classList.toggle("active", a.dataset.nav === nav);
@@ -380,8 +378,8 @@ async function render(): Promise<void> {
         return show(await songPage(route.song, route.artist, true));
       case "search":
         return show(await songPage(route.query, undefined, route.exact));
-      case "category":
-        return show(await categoryPage(route.name));
+      case "playlist":
+        return show(await playlistPage(route.name));
       case "library":
         return show(await libraryPage());
       case "songs":
@@ -395,7 +393,7 @@ async function render(): Promise<void> {
       case "find":
         return show(await findPage(route.query));
       case "discover":
-        return show(discoverPage(route.profile));
+        return show(await discoverPage(route.params, route.profile));
     }
   } catch (e) {
     show(el("div", { class: "card" }, el("p", { class: "error" }, (e as Error).message)));
@@ -409,7 +407,6 @@ function show(...nodes: Node[]): void {
   view.style.animation = "none";
   void view.offsetWidth;
   view.style.animation = "";
-  if (route.page === "account") mountQueueCard();
   if (lastStatus) renderStatus(lastStatus);
 }
 
@@ -544,7 +541,7 @@ function songsTable(rows: SongRow[], options: { compact?: boolean } = {}): HTMLE
         el(
           "div",
           { class: "song-cell" },
-          art(r.artist, r.artistImage),
+          songArt(name, r.artistImage, r.soundcloud),
           el("div", {}, el("a", { href: songHash(name) }, r.title), el("div", { class: "who small" }, ...joined(artistsOf(name).map(artistLink), ", "))),
         ),
       ),
@@ -552,7 +549,7 @@ function songsTable(rows: SongRow[], options: { compact?: boolean } = {}): HTMLE
       el("td", { class: "num" }, String(r.sets)),
       options.compact ? "" : el("td", { class: "num hide-sm muted" }, String(r.djs)),
       el("td", { class: "num" }, trendCell(r.trend)),
-      el("td", {}, playRound(r.soundcloud ? { provider: "soundcloud", source: r.soundcloud, title: r.title, subtitle: r.artist, pageUrl: r.soundcloud } : null)),
+      el("td", {}, el("div", { class: "btns", style: "flex-wrap:nowrap" }, addToPlaylistButton(name), songPlayButton(name, r.soundcloud))),
     );
   });
   return el("table", { class: "chart" }, el("thead", {}, head), el("tbody", {}, ...body));
@@ -627,6 +624,292 @@ function loading(card: HTMLElement, title: string): HTMLElement {
 
 function failed(card: HTMLElement, title: string, error: unknown): void {
   card.replaceChildren(el("h2", {}, title), el("p", { class: "error small" }, (error as Error).message));
+}
+
+// ---- playing any song, playlists, tiles (shared by many pages) ----
+
+/** A song as the server describes it for tiles and lists. */
+interface SongCard {
+  name: string;
+  artist: string;
+  title: string;
+  genre: string | null;
+  image: string | null;
+  soundcloud: string | null;
+  reason?: string;
+}
+
+/** Songs whose SoundCloud link we've looked up this visit: name -> link. */
+const songSources = new Map<string, string>();
+
+let toastTimer: ReturnType<typeof setTimeout> | undefined;
+function toast(...content: (Node | string)[]): void {
+  const box = $("toast");
+  box.replaceChildren(...content);
+  box.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (box.hidden = true), 6000);
+}
+
+/** Songs queued by "Play all": the next one starts when one finishes. */
+let playQueue: string[] = [];
+let playQueueAt = -1;
+
+function titleOf(name: string): string {
+  const dash = name.indexOf(" - ");
+  return dash === -1 ? name : name.slice(dash + 3);
+}
+
+/**
+ * Play a song from anywhere: its known link, or ask the server, which finds the best
+ * SoundCloud match (and remembers it) when nobody has linked the song yet.
+ */
+async function playSong(name: string, known?: string | null, fromQueue = false): Promise<boolean> {
+  if (!fromQueue) playQueue = [];
+  let url = known ?? songSources.get(name);
+  let auto = false;
+  if (!url) {
+    for (const b of document.querySelectorAll<HTMLElement>(`[data-song="${CSS.escape(name)}"]`)) b.textContent = "…";
+    try {
+      const r = await getJson<{ url: string; auto: boolean; preview?: boolean }>(`/api/play?song=${enc(name)}`);
+      url = r.url;
+      auto = r.auto;
+    } catch (e) {
+      for (const b of document.querySelectorAll<HTMLElement>(`[data-song="${CSS.escape(name)}"]`)) markPlaying(b);
+      if (!fromQueue) toast((e as Error).message, " ", externalLink(soundcloudSearch(name), "Search SoundCloud ↗", "act-link"));
+      return false;
+    }
+    songSources.set(name, url);
+    for (const b of document.querySelectorAll<HTMLElement>(`[data-song="${CSS.escape(name)}"]`)) b.dataset.source = url;
+  }
+  player.play({ provider: "soundcloud", source: url, title: titleOf(name), subtitle: `${artistsOf(name).join(", ")}${auto ? " · SoundCloud match" : ""}`, pageUrl: url });
+  return true;
+}
+
+/** "Play all": play a list of songs in order, skipping ones with nothing to play. */
+async function playAll(names: string[], known: Map<string, string | null> = new Map()): Promise<void> {
+  playQueue = names;
+  for (playQueueAt = 0; playQueueAt < playQueue.length; playQueueAt++) {
+    if (await playSong(playQueue[playQueueAt]!, known.get(playQueue[playQueueAt]!), true)) return;
+  }
+  toast("Nothing in this list can be played yet.");
+}
+
+player.subscribe((state) => {
+  if (state.status !== "ended" || !playQueue.length || playQueueAt < 0) return;
+  void (async () => {
+    for (playQueueAt++; playQueueAt < playQueue.length; playQueueAt++) {
+      if (await playSong(playQueue[playQueueAt]!, null, true)) return;
+    }
+    playQueue = [];
+  })();
+});
+
+/** Round ▶ for a song; works whether or not the song has a link yet. */
+function songPlayButton(name: string, known: string | null, extraClass = "", round = true): HTMLElement {
+  const source = known ?? songSources.get(name) ?? "";
+  const cls = round ? `play-btn play-round ${extraClass}` : `play-btn primary ${extraClass}`;
+  const b = el("button", { type: "button", class: cls.trim(), "data-song": name, "data-source": source, "aria-label": `Play ${name}` }, round ? "▶" : "▶ Play");
+  b.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void playSong(name, known);
+  });
+  markPlaying(b);
+  return b;
+}
+
+/** Artwork with a ▶ that shows on hover (always on touch screens). */
+function songArt(name: string, image: string | null, known: string | null, cls = ""): HTMLElement {
+  return el("div", { class: cls.includes("small") ? "art-wrap small" : "art-wrap" }, art(artistsOf(name)[0] ?? name, image, cls), songPlayButton(name, known, "art-play"));
+}
+
+let openMenu: HTMLElement | undefined;
+function closeMenu(): void {
+  openMenu?.remove();
+  openMenu = undefined;
+}
+document.addEventListener("click", (event) => {
+  if (openMenu && !openMenu.contains(event.target as Node)) closeMenu();
+});
+
+/** "+": add a song to one of your playlists, or a new one, in one or two clicks. */
+function addToPlaylistButton(song: string, label = "＋"): HTMLElement {
+  const button = el("button", { type: "button", class: label === "＋" ? "icon-btn" : "", title: "Add to playlist", "aria-label": `Add ${song} to a playlist` }, label);
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (!auth.user) {
+      location.hash = "#/account";
+      return;
+    }
+    if (openMenu) return closeMenu();
+    const menu = el("div", { class: "menu", role: "menu" }, el("div", { class: "menu-title" }, "Add to playlist"));
+    const inList = (name: string) => me.categories.find((c) => c.name === name)?.songs.includes(song) ?? false;
+    for (const playlist of me.categories) {
+      const item = el("button", { type: "button", class: "item", role: "menuitemcheckbox", "aria-checked": String(inList(playlist.name)) }, playlist.name, el("span", { class: "muted" }, inList(playlist.name) ? "✓" : ""));
+      item.addEventListener("click", async () => {
+        const on = !inList(playlist.name);
+        await post("/api/label", { song, category: playlist.name, on });
+        await loadMe();
+        closeMenu();
+        toast(on ? `Added to ${playlist.name}` : `Removed from ${playlist.name}`);
+      });
+      menu.append(item);
+    }
+    const input = el("input", { type: "text", placeholder: "New playlist…", "aria-label": "New playlist name" }) as HTMLInputElement;
+    const form = el("form", {}, input);
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const name = input.value.trim();
+      if (!name) return;
+      try {
+        await post("/api/label", { song, category: name, on: true });
+        await loadMe();
+        closeMenu();
+        toast(`Added to ${name}`);
+      } catch (error) {
+        input.value = "";
+        input.placeholder = (error as Error).message;
+      }
+    });
+    menu.append(form);
+    const box = button.getBoundingClientRect();
+    menu.style.top = `${box.bottom + window.scrollY + 6}px`;
+    menu.style.left = `${Math.max(8, Math.min(box.left + window.scrollX, window.scrollX + document.documentElement.clientWidth - 236))}px`;
+    document.body.append(menu);
+    openMenu = menu;
+    if (!me.categories.length) input.focus();
+  });
+  return button;
+}
+
+/** One song as a square tile: artwork with hover ▶, title, artists, and +. */
+function songTile(card: SongCard, extra?: Node): HTMLElement {
+  return el(
+    "div",
+    { class: "tile" },
+    songArt(card.name, card.image, card.soundcloud),
+    el("a", { class: "t", href: songHash(card.name) }, card.title),
+    el("div", { class: "a" }, ...joined(artistsOf(card.name).map((a) => el("a", { href: artistHash(a) }, a)), ", ")),
+    card.reason ? el("div", { class: "why" }, card.reason) : "",
+    el("div", { class: "tile-actions" }, addToPlaylistButton(card.name), extra ?? ""),
+  );
+}
+
+interface FeaturedSet extends SetCard {
+  liked: string[];
+}
+
+/** One recommended set at a time, big, changing every 20 seconds (or with the dots). */
+function featuredSet(sets: FeaturedSet[], compact = false): HTMLElement {
+  const box = el("section", { class: `featured${compact ? " compact" : ""}` });
+  if (!sets.length) return box;
+  const pick = [...sets].sort(() => Math.random() - 0.5);
+  let at = 0;
+  const bg = el("div", { class: "bg" });
+  const body = el("div", { class: "body" });
+  const dots = el("div", { class: "dots" });
+  const draw = () => {
+    const s = pick[at]!;
+    const photo = s.djs.find((d) => d.image)?.image;
+    bg.style.backgroundImage = photo ? `url(${JSON.stringify(photo)})` : "linear-gradient(120deg,#2b2160,#0d0f1a)";
+    const playable: Playable | null = s.soundcloud ? { provider: "soundcloud", source: s.soundcloud, title: s.title, subtitle: `${s.djs.map((d) => d.name).join(" & ")} · ${s.date ?? ""}`, pageUrl: s.url } : null;
+    body.replaceChildren(
+      el("div", { class: "kicker" }, "Recommended set for you"),
+      el("h2", {}, el("a", { href: `#/set/${enc(s.id)}`, style: "text-decoration:none" }, s.event)),
+      el("div", { class: "meta" }, ...joined(s.djs.map((d) => artistLink(d.name)), " & "), ` · ${s.date ?? ""} · ${plural(s.tracks, "track")}`),
+      el("div", { class: "liked" }, `Plays ${s.liked.length} of your liked songs: `, s.liked.slice(0, 3).map(titleOf).join(", "), s.liked.length > 3 ? "…" : ""),
+      el("div", { class: "btns", style: "margin-top:14px" }, playable ? playableButton(playable) : "", el("a", { class: "act-link", href: `#/set/${enc(s.id)}` }, "Open tracklist →")),
+    );
+    dots.replaceChildren(
+      ...pick.map((_, i) => {
+        const d = el("button", { type: "button", class: i === at ? "on" : "", "aria-label": `Recommended set ${i + 1}` });
+        d.addEventListener("click", () => show2(i));
+        return d;
+      }),
+    );
+  };
+  const show2 = (i: number) => {
+    box.classList.add("fading");
+    setTimeout(() => {
+      at = i;
+      draw();
+      box.classList.remove("fading");
+    }, 250);
+  };
+  draw();
+  if (pick.length > 1) {
+    const timer = setInterval(() => {
+      if (!box.isConnected) return clearInterval(timer);
+      if (!box.matches(":hover")) show2((at + 1) % pick.length);
+    }, 20_000);
+  }
+  box.append(bg, body, pick.length > 1 ? dots : "");
+  return box;
+}
+
+/** "Songs you might like": 3 pages of 6 that turn every 10 seconds, with Shuffle and View all. */
+function suggestionCarousel(title = "Songs you might like"): HTMLElement {
+  const card = el("section", { class: "card carousel" }, el("h2", {}, title), el("p", { class: "muted small" }, "Loading…"));
+  const pages = el("div", { class: "pages" });
+  const dots = el("div", { class: "dots" });
+  let items: SongCard[] = [];
+  let at = 0;
+  const per = 6;
+  const draw = () => {
+    const count = Math.max(1, Math.ceil(items.length / per));
+    pages.replaceChildren(el("div", { class: "tiles" }, ...items.slice(at * per, at * per + per).map((c) => songTile(c))));
+    dots.replaceChildren(
+      ...Array.from({ length: count }, (_, i) => {
+        const d = el("button", { type: "button", class: i === at ? "on" : "", "aria-label": `Page ${i + 1}` });
+        d.addEventListener("click", () => turn(i));
+        return d;
+      }),
+    );
+  };
+  const turn = (i: number) => {
+    card.classList.add("fading");
+    setTimeout(() => {
+      at = i;
+      draw();
+      card.classList.remove("fading");
+    }, 300);
+  };
+  const load = async () => {
+    try {
+      const r = await getJson<{ items: SongCard[]; mode: string }>(`/api/discover?size=${per * 3}&seed=${Math.floor(Math.random() * 1e9)}`);
+      items = r.items;
+      at = 0;
+      const shuffle = el("button", { type: "button", class: "act" }, "Shuffle");
+      shuffle.addEventListener("click", () => void load());
+      card.replaceChildren(
+        sectionHead(r.mode === "personal" ? title : "Popular right now", "#/discover", shuffle),
+        items.length ? pages : el("p", { class: "muted small" }, "Like a few songs to get suggestions."),
+        items.length > per ? dots : "",
+      );
+      draw();
+    } catch (e) {
+      failed(card, title, e);
+    }
+  };
+  void load();
+  const timer = setInterval(() => {
+    if (!card.isConnected) return clearInterval(timer);
+    const count = Math.ceil(items.length / per);
+    if (count > 1 && !card.matches(":hover") && !openMenu) turn((at + 1) % count);
+  }, 10_000);
+  return card;
+}
+
+function playlistHash(name: string): string {
+  return `#/playlist/${enc(name)}`;
+}
+
+/** A playlist cover: up to four artist photos, or a plain tile for an empty one. */
+function mosaic(images: string[]): HTMLElement {
+  if (!images.length) return el("div", { class: "mosaic one" }, el("div", { class: "empty-cover", "aria-hidden": "true" }, "♪"));
+  const shown = images.length >= 4 ? images.slice(0, 4) : images.slice(0, 1);
+  return el("div", { class: `mosaic${shown.length === 1 ? " one" : ""}` }, ...shown.map((src) => el("img", { src, alt: "", loading: "lazy", referrerpolicy: "no-referrer" })));
 }
 
 // ---- Home ----
@@ -718,23 +1001,26 @@ async function homePage(): Promise<HTMLElement> {
   );
 }
 
-/** Home's one personal section: a few liked songs and your categories. */
+/** Home's one personal section: a recommended set, a few recent likes, your playlists. */
 function fillYourMusic(card: HTMLElement): void {
   if (!auth.user) {
     card.replaceChildren(
       sectionHead("Your Music"),
-      el("p", { class: "muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to like songs, save SoundCloud finds and sort them into your own categories."),
+      el("p", { class: "muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to like songs, make playlists, and get sets picked for you."),
     );
     return;
   }
-  const likes = me.likes.slice(-6).reverse();
-  card.replaceChildren(
-    sectionHead(`Your Music`, "#/library"),
-    likes.length
-      ? el("ol", { class: "people" }, ...likes.map((song) => el("li", {}, el("a", { href: songHash(song) }, art(song, null), el("span", { class: "who" }, song.slice(song.indexOf(" - ") + 3), el("small", {}, artistsOf(song).join(", ")))))))
-      : el("p", { class: "muted small" }, "Like songs (♡ on a song page) and they'll show up here."),
-    me.categories.length ? el("div", { style: "margin-top:12px" }, chips(me.categories.map((c) => ({ name: `${c.name} (${c.songs.length})`, href: categoryHash(c.name) })))) : "",
-  );
+  card.replaceChildren(sectionHead("Your Music", "#/library"), el("p", { class: "muted small" }, "Loading…"));
+  void getJson<ForYou>(`/api/for-you?months=${months()}`)
+    .then((r) => {
+      card.replaceChildren(
+        sectionHead("Your Music", "#/library"),
+        r.sets.length ? featuredSet(r.sets, true) : el("p", { class: "muted small" }, "Like songs (♡ on a song page) to get sets picked for you."),
+        r.likedSongs.length ? el("div", { class: "tiles", style: "margin-top:16px" }, ...r.likedSongs.slice(0, 4).map((c) => songTile(c))) : "",
+        me.categories.length ? el("div", { style: "margin-top:14px" }, chips(me.categories.map((c) => ({ name: `${c.name} (${c.songs.length})`, href: playlistHash(c.name) })))) : "",
+      );
+    })
+    .catch((e) => failed(card, "Your Music", e));
 }
 
 /** Where the Unreleased Vault will go: following IDs until they're identified or released. */
@@ -914,7 +1200,7 @@ async function setPage(id: string): Promise<HTMLElement> {
         l.isId ? "" : el("div", { class: "who small muted" }, ...joined(artistsOf(l.song!).map(artistLink), ", ")),
       ),
       el("span", { class: "muted small hide-sm" }, l.genre ?? ""),
-      l.soundcloud ? playableButton({ provider: "soundcloud", source: l.soundcloud, title: l.title, subtitle: l.artist, pageUrl: l.soundcloud }, true) : "",
+      l.isId ? "" : el("div", { class: "btns", style: "flex-wrap:nowrap" }, addToPlaylistButton(l.song!), songPlayButton(l.song!, l.soundcloud)),
     ),
   );
   return el(
@@ -971,51 +1257,85 @@ async function findPage(text: string): Promise<HTMLElement> {
 
 // ---- Library ----
 
+interface ForYou {
+  likes: string[];
+  likedSongs: SongCard[];
+  sets: FeaturedSet[];
+  songs: Ranked[];
+}
+
+interface PlaylistSummary {
+  name: string;
+  count: number;
+  cover: string[];
+}
+
+/** New playlist: ask for a name, create it, open it. */
+async function newPlaylist(): Promise<void> {
+  const name = prompt("Name your playlist")?.trim();
+  if (!name) return;
+  try {
+    const r = await post<{ name: string }>("/api/playlists", { name });
+    await loadMe();
+    location.hash = playlistHash(r.name);
+  } catch (e) {
+    toast((e as Error).message);
+  }
+}
+
 async function libraryPage(): Promise<HTMLElement> {
   if (!auth.user) return signInPage();
-  const [a, forYou] = await Promise.all([getJson<Account>("/api/account"), getJson<ForYou>(`/api/for-you?months=${months()}`)]);
-  const likes = el("ol", { class: "ranked" });
-  for (const song of a.likes) {
-    const unlike = el("button", { type: "button", class: "act" }, "Unlike");
-    unlike.addEventListener("click", async () => {
-      await post("/api/like", { song, liked: false });
-      await loadMe();
-      await render();
-    });
-    likes.append(el("li", {}, el("span", { class: "name" }, songLink(song)), unlike));
-  }
+  const [forYou, playlists] = await Promise.all([getJson<ForYou>(`/api/for-you?months=${months()}`), getJson<PlaylistSummary[]>("/api/playlists")]);
+  const SHOWN = 12;
+  const liked = forYou.likedSongs;
+  const likedGrid = el("div", { class: "tiles" }, ...liked.slice(0, SHOWN).map((c) => songTile(c, unlikeButton(c.name))));
+  const allLikes = el("button", { type: "button", class: "act" }, `Show all ${liked.length}`);
+  allLikes.addEventListener("click", () => {
+    likedGrid.replaceChildren(...liked.map((c) => songTile(c, unlikeButton(c.name))));
+    allLikes.remove();
+  });
+  const playAllLikes = el("button", { type: "button", class: "primary" }, "▶ Play all");
+  playAllLikes.addEventListener("click", () => void playAll(liked.map((c) => c.name), new Map(liked.map((c) => [c.name, c.soundcloud]))));
+  const newCard = el("a", { class: "cover-card new-card", href: "#/library" }, el("div", { class: "mosaic one" }, el("div", { class: "empty-cover" }, "＋")), el("div", { class: "t" }, "New playlist"), el("div", { class: "a" }, "Name it, then add songs with ＋"));
+  newCard.addEventListener("click", (event) => {
+    event.preventDefault();
+    void newPlaylist();
+  });
   return el(
     "div",
     { class: "stack" },
-    pageHead("Your Library", `${plural(a.likes.length, "liked song")} · ${a.categories.length} ${a.categories.length === 1 ? "category" : "categories"}`),
+    pageHead("Your Library", `${plural(liked.length, "liked song")} · ${plural(playlists.length, "playlist")}`),
+    forYou.sets.length ? featuredSet(forYou.sets) : "",
     el(
-      "div",
-      { class: "grid" },
-      el("section", { class: "card" }, el("h2", {}, `Liked songs (${a.likes.length})`), a.likes.length ? likes : el("p", { class: "muted small" }, "Nothing liked yet: ♡ a song on its page.")),
+      "section",
+      { class: "card" },
+      sectionHead("Playlists"),
       el(
-        "section",
-        { class: "card" },
-        el("h2", {}, `Your categories (${a.categories.length})`),
-        a.categories.length
-          ? chips(a.categories.map((c) => ({ name: `${c.name} (${c.songs})`, href: categoryHash(c.name) })))
-          : el("p", { class: "muted small" }, "Add a song to a category from its page, or save a SoundCloud find into one."),
+        "div",
+        { class: "covers" },
+        ...playlists.map((p) => el("a", { class: "cover-card", href: playlistHash(p.name) }, mosaic(p.cover), el("div", { class: "t" }, p.name), el("div", { class: "a" }, plural(p.count, "track")))),
+        newCard,
       ),
     ),
-    forYou.likes.length
-      ? el(
-          "div",
-          { class: "grid" },
-          setsCard("Sets with the most of your liked songs", forYou.sets, "No indexed set has your liked songs yet.", 5),
-          rankedCard("Songs you might like", forYou.songs, "shared set", "Like a few more songs, or gather more sets, to get suggestions.", { linkTo: "song" }),
-        )
-      : "",
+    el(
+      "section",
+      { class: "card" },
+      sectionHead(`Liked songs`, undefined, liked.length ? playAllLikes : undefined),
+      liked.length ? likedGrid : el("p", { class: "muted small" }, "Nothing liked yet: ♡ a song on its page."),
+      liked.length > SHOWN ? el("div", { style: "margin-top:14px" }, allLikes) : "",
+    ),
+    suggestionCarousel(),
   );
 }
 
-interface ForYou {
-  likes: string[];
-  sets: SetForYou[];
-  songs: Ranked[];
+function unlikeButton(song: string): HTMLElement {
+  const b = el("button", { type: "button", class: "icon-btn on", title: "Unlike", "aria-label": `Unlike ${song}` }, "♥");
+  b.addEventListener("click", async () => {
+    await post("/api/like", { song, liked: false });
+    await loadMe();
+    b.closest(".tile")?.remove();
+  });
+  return b;
 }
 
 // ---- Trending ----
@@ -1137,21 +1457,8 @@ async function accountPage(): Promise<HTMLElement> {
     await render();
   });
 
-  const linksText = el("textarea", { rows: "3", placeholder: "https://www.1001tracklists.com/tracklist/..." }) as HTMLTextAreaElement;
-  const linksMsg = el("span", { class: "muted small" });
-  const addLinks = el("button", { type: "button", class: "act" }, "Add");
-  addLinks.addEventListener("click", async () => {
-    try {
-      const r = await post<{ found: number; queued: number; alreadyCached: number; skippedOld: number }>("/api/add-links", { text: linksText.value });
-      linksMsg.textContent = `${plural(r.found, "link")}: ${r.queued} new, ${r.alreadyCached} already cached, ${r.skippedOld} older than your window.`;
-      linksText.value = "";
-    } catch (e) {
-      linksMsg.textContent = (e as Error).message;
-    }
-  });
-
-  const bgToggle = el("input", { type: "checkbox", id: "bgToggle" }) as HTMLInputElement;
-  bgToggle.addEventListener("change", () => void post("/api/background", { enabled: bgToggle.checked }));
+  const openQueue = el("button", { type: "button" }, "Open the queue");
+  openQueue.addEventListener("click", () => setQueueOpen(true));
 
   return el(
     "div",
@@ -1160,24 +1467,13 @@ async function accountPage(): Promise<HTMLElement> {
     el(
       "div",
       { class: "card small" },
-      `${plural(a.likes.length, "liked song")} and ${a.categories.length} ${a.categories.length === 1 ? "category" : "categories"} · `,
+      `${plural(a.likes.length, "liked song")} and ${plural(a.categories.length, "playlist")} · `,
       el("a", { class: "link", href: "#/library" }, "Open your Library"),
     ),
-    el("h2", {}, "Collecting sets"),
-    el("div", { id: "queueMount" }, el("div", { class: "card muted small", id: "queueIdle" }, "Nothing queued. Use “Gather more sets” on a song or artist page.")),
-    owner
-      ? el(
-          "div",
-          { class: "card" },
-          el("div", { class: "row" }, el("label", { class: "switch" }, bgToggle, " ", el("b", {}, "Background collecting")), el("span", { id: "bgStatus", class: "small muted" })),
-        )
-      : "",
     el(
-      "details",
+      "div",
       { class: "card" },
-      el("summary", {}, el("b", {}, "Add sets by link"), " ", el("span", { class: "muted small" }, "paste 1001Tracklists set links, or any text containing them")),
-      linksText,
-      el("div", { class: "row" }, linksMsg, addLinks),
+      el("div", { class: "row" }, el("div", {}, el("b", {}, "Collecting sets"), el("div", { class: "small muted" }, "The queue, background collecting, and adding sets by link are under Queue in the top bar, on every page.")), openQueue),
     ),
     owner ? el("h2", {}, "Song data") : "",
     owner
@@ -1206,7 +1502,11 @@ async function accountPage(): Promise<HTMLElement> {
       stat(a.sets, "sets cached"),
       a.oldest ? stat(a.oldest, "oldest set") : "",
       a.newest ? stat(a.newest, "newest set") : "",
-      el("div", { class: "muted small" }, `Chrome extension: ${extensionInstalled() ? "connected" : "not detected in this browser"}`),
+      el(
+        "div",
+        { class: "muted small" },
+        `Chrome extension: ${!extensionInstalled() ? "not detected in this browser" : extensionOutdated() ? `connected, but out of date (${extensionVersion()}; reload it in chrome://extensions)` : `connected (version ${extensionVersion()})`}`,
+      ),
     ),
   );
 }
@@ -1339,7 +1639,7 @@ async function artistPage(name: string, exact: boolean): Promise<HTMLElement> {
 function gatheredLine(d: DiscoveryRecord): string {
   const when = new Date(d.lastSuccessAt).toLocaleDateString([], { month: "short", day: "numeric" });
   const parts = [
-    `Last gathered ${when}: ${plural(d.setsSeen, "set")} on their 1001Tracklists page${d.complete ? " (all of them)" : " (stopped at 300; gather again for more)"}`,
+    `Last gathered ${when}: ${plural(d.setsSeen, "set")} on their 1001Tracklists page${d.complete ? " (all of them)" : " (stopped early; gather again for more)"}`,
     `${d.setsIndexed} were already here`,
     `${d.setsNew} new`,
   ];
@@ -1398,7 +1698,7 @@ function artistSongsCard(p: ArtistProfile): HTMLElement {
         }
       }
     });
-    const item = el("li", {}, row, panel);
+    const item = el("li", {}, el("div", { class: "song-line" }, songPlayButton(song.name, null), row), panel);
     if (i >= SONG_PREVIEW) item.hidden = true;
     list.append(item);
   });
@@ -1451,20 +1751,12 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
   const backdrop = el("div", { class: "backdrop" });
   if (r.image) backdrop.style.backgroundImage = `url(${JSON.stringify(r.image)})`;
   // ▶ Play appears once we know the song has a confirmed SoundCloud link.
-  const playSlot = el("span", {});
-  if (!none) {
-    void getJson<{ links: { url: string }[] }>(`/api/song-links?song=${enc(name)}`)
-      .then((l) => {
-        const link = l.links[0];
-        if (link) playSlot.replaceChildren(playableButton({ provider: "soundcloud", source: link.url, title, subtitle: artists.join(", "), pageUrl: link.url }));
-      })
-      .catch(() => {});
-  }
+  const playSlot = none ? "" : songPlayButton(name, null, "", false);
   const head = el(
     "section",
     { class: "profile-hero" },
     backdrop,
-    art(name, r.image, "lg"),
+    none ? art(name, r.image, "lg") : songArt(name, r.image, null, "lg"),
     el(
       "div",
       { class: "body" },
@@ -1482,6 +1774,7 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
         { class: "btns", style: "margin-top:14px" },
         playSlot,
         none ? "" : likeButton(name, r.liked ?? false, () => void render()),
+        none ? "" : addToPlaylistButton(name, "＋ Playlist"),
         findButton(none ? "Find sets on 1001Tracklists" : "Gather more sets", name, "song", none),
       ),
     ),
@@ -1585,104 +1878,138 @@ function songFacts(song: string, genre: string | undefined): HTMLElement {
   return line;
 }
 
-/** Your categories for this song, an "add to category" box, and "maybe part of" hints. */
+/** Which of your playlists have this song, one-click add, and "fits your playlist" hints. */
 function categoriesCard(song: string, inCategories: string[], hints: { category: string; sets: number; of: number }[]): HTMLElement {
   if (!auth.user) {
-    return el("div", { class: "card muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to like songs and sort them into your own categories.");
+    return el("div", { class: "card muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to like songs and add them to your playlists.");
   }
-  const label = async (category: string, on: boolean) => {
-    await post("/api/label", { song, category, on });
+  const label = async (playlist: string, on: boolean) => {
+    await post("/api/label", { song, category: playlist, on });
     await loadMe();
     await render();
   };
   const current = inCategories.map((c) => {
     const remove = el("button", { type: "button", class: "chip-x", title: `Remove from ${c}` }, "×");
     remove.addEventListener("click", () => void label(c, false));
-    return el("span", { class: "chip" }, el("a", { class: "link", href: categoryHash(c) }, c), remove);
+    return el("span", { class: "chip" }, el("a", { class: "link", href: playlistHash(c) }, c), remove);
   });
-  const input = el("input", { type: "text", placeholder: "Add to a category…", list: "categoryNames", class: "small-input" }) as HTMLInputElement;
-  const add = el("button", { type: "button", class: "act" }, "Add");
-  const submit = () => {
-    const name = input.value.trim();
-    if (name) void label(name, true);
-  };
-  add.addEventListener("click", submit);
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") submit();
-  });
-  const names = el("datalist", { id: "categoryNames" }, ...me.categories.map((c) => el("option", { value: c.name })));
   const hintRows = hints.map((h) => {
     const yes = el("button", { type: "button", class: "act" }, `Add to ${h.category}`);
     yes.addEventListener("click", () => void label(h.category, true));
-    return el("div", { class: "small hint" }, "Maybe part of ", el("a", { class: "link", href: categoryHash(h.category) }, `“${h.category}”`), ` · in ${h.sets} of its ${h.of} sets with ${h.category} songs `, yes);
+    return el("div", { class: "small hint" }, "Fits your playlist ", el("a", { class: "link", href: playlistHash(h.category) }, `“${h.category}”`), ` · in ${h.sets} of its ${h.of} sets with ${h.category} songs `, yes);
   });
   return el(
     "div",
     { class: "card" },
-    el("div", { class: "row" }, el("h2", {}, "Your categories"), el("div", { class: "btns" }, input, add, names)),
-    current.length ? el("div", { class: "chips" }, ...current) : el("div", { class: "muted small" }, "Not in any of your categories yet."),
+    el("div", { class: "row" }, el("h2", {}, "Your playlists"), addToPlaylistButton(song, "＋ Add to playlist")),
+    current.length ? el("div", { class: "chips" }, ...current) : el("div", { class: "muted small" }, "Not in any of your playlists yet."),
     ...hintRows,
   );
 }
 
-// ---- Category ----
+// ---- Playlist ----
 
-interface CategoryData {
+interface PlaylistData {
   name: string;
   songs: string[];
+  songCards: SongCard[];
   links: { url: string; title: string; artist: string }[];
-  suggestions: Ranked[];
+  suggestionCards: SongCard[];
 }
 
-async function categoryPage(name: string): Promise<HTMLElement> {
-  const r = await getJson<CategoryData>(`/api/category?name=${enc(name)}&months=${months()}`);
-  const songs = el("ol", { class: "ranked" });
-  for (const song of r.songs) {
+async function playlistPage(name: string): Promise<HTMLElement> {
+  const r = await getJson<PlaylistData>(`/api/playlist?name=${enc(name)}&months=${months()}`);
+  const known = new Map(r.songCards.map((c) => [c.name, c.soundcloud]));
+  const rows = el("ol", { class: "tracklist" });
+  r.songCards.forEach((c, i) => {
     const remove = el("button", { type: "button", class: "act" }, "Remove");
     remove.addEventListener("click", async () => {
-      await post("/api/label", { song, category: r.name, on: false });
-      if (r.songs.length === 1) location.hash = "#/account";
-      else await render();
+      await post("/api/label", { song: c.name, category: r.name, on: false });
+      await loadMe();
+      await render();
     });
-    songs.append(el("li", {}, el("span", { class: "name" }, songLink(song)), remove));
-  }
-  const saved = el("ol", { class: "ranked" });
-  for (const link of r.links) {
-    const remove = el("button", { type: "button", class: "act" }, "Remove");
-    remove.addEventListener("click", async () => {
-      await post("/api/saved-link", { category: r.name, url: link.url, on: false });
-      if (r.songs.length + r.links.length === 1) location.hash = "#/account";
-      else await render();
-    });
-    saved.append(
+    rows.append(
       el(
         "li",
         {},
-        el("span", { class: "name" }, link.title, el("span", { class: "muted small" }, ` · ${link.artist} on SoundCloud`)),
-        playableButton({ provider: "soundcloud", source: link.url, title: link.title, subtitle: link.artist, pageUrl: link.url }),
-        externalLink(link.url, "Open", "act-link"),
+        el("span", { class: "pos" }, String(i + 1)),
+        songArt(c.name, c.image, c.soundcloud, "small"),
+        el("span", { class: "t" }, el("a", { href: songHash(c.name) }, c.title), el("div", { class: "who small muted" }, ...joined(artistsOf(c.name).map(artistLink), ", "))),
+        el("span", { class: "muted small hide-sm" }, c.genre ?? ""),
         remove,
       ),
     );
-  }
-  const counts = [r.songs.length ? plural(r.songs.length, "song") : "", r.links.length ? plural(r.links.length, "SoundCloud track") : ""].filter(Boolean).join(" · ");
+  });
+  r.links.forEach((link, i) => {
+    const remove = el("button", { type: "button", class: "act" }, "Remove");
+    remove.addEventListener("click", async () => {
+      await post("/api/saved-link", { category: r.name, url: link.url, on: false });
+      await render();
+    });
+    rows.append(
+      el(
+        "li",
+        {},
+        el("span", { class: "pos" }, String(r.songCards.length + i + 1)),
+        el("div", { class: "art-wrap small" }, art(link.artist, null, "small"), playableButton({ provider: "soundcloud", source: link.url, title: link.title, subtitle: link.artist, pageUrl: link.url }, true)),
+        el("span", { class: "t" }, externalLink(link.url, link.title), el("div", { class: "who small muted" }, `${link.artist} · saved from SoundCloud`)),
+        remove,
+      ),
+    );
+  });
+  const playAllBtn = el("button", { type: "button", class: "primary" }, "▶ Play all");
+  playAllBtn.addEventListener("click", () => void playAll(r.songs, known));
+  const del = el("button", { type: "button" }, "Delete playlist");
+  del.addEventListener("click", async () => {
+    if (!confirm(`Delete “${r.name}”? The songs stay in setscope.`)) return;
+    await post("/api/playlists/delete", { name: r.name });
+    await loadMe();
+    location.hash = "#/library";
+  });
+  const covers = [...new Set(r.songCards.map((c) => c.image).filter((i): i is string => Boolean(i)))];
+  const total = r.songCards.length + r.links.length;
   return el(
     "div",
     { class: "stack" },
-    pageHead(r.name, `Your category · ${counts || "empty"}`, [homeCrumb(), " › ", el("a", { href: "#/account" }, "Account"), " › Category"]),
-    r.songs.length ? el("div", { class: "card" }, songs) : "",
-    r.links.length ? el("div", { class: "card" }, el("h2", {}, "Saved from SoundCloud"), saved) : "",
-    rankedCard(`Might fit “${r.name}”`, r.suggestions, "shared set", "Add a few more songs, or gather more sets, to get suggestions.", {
-      linkTo: "song",
-      action: (item) => {
-        const add = el("button", { type: "button", class: "act" }, "Add");
-        add.addEventListener("click", async () => {
-          await post("/api/label", { song: item.name, category: r.name, on: true });
-          await render();
-        });
-        return add;
-      },
-    }),
+    el(
+      "section",
+      { class: "profile-hero" },
+      el("div", { style: "width:168px;flex:none" }, mosaic(covers)),
+      el(
+        "div",
+        { class: "body" },
+        el("div", { class: "crumbs" }, homeCrumb(), " › ", el("a", { href: "#/library" }, "Library"), " › Playlist"),
+        el("div", { class: "kicker" }, "Playlist"),
+        el("h1", {}, r.name),
+        el("div", { class: "meta" }, plural(total, "track")),
+        el("div", { class: "btns", style: "margin-top:14px" }, total ? playAllBtn : "", del),
+      ),
+    ),
+    el(
+      "section",
+      { class: "card" },
+      total ? rows : el("p", { class: "empty" }, "Empty for now. Add songs with ＋ anywhere you see them, or from the suggestions below."),
+    ),
+    r.suggestionCards.length
+      ? el(
+          "section",
+          { class: "card" },
+          sectionHead(`Might fit “${r.name}”`),
+          el(
+            "div",
+            { class: "tiles" },
+            ...r.suggestionCards.map((c) => {
+              const add = el("button", { type: "button", class: "act" }, "Add");
+              add.addEventListener("click", async () => {
+                await post("/api/label", { song: c.name, category: r.name, on: true });
+                await loadMe();
+                await render();
+              });
+              return songTile(c, add);
+            }),
+          ),
+        )
+      : "",
   );
 }
 
@@ -1719,6 +2046,7 @@ interface SongLinkJson {
   externalId: string | null;
   confidence: number;
   provenance: "source_page" | "user" | "search_match";
+  auto?: boolean;
   addedBy: string | null;
   removable?: boolean;
 }
@@ -1759,12 +2087,12 @@ function scTrackRow(t: ScTrackJson, ...extra: (Node | string)[]): HTMLElement {
   );
 }
 
-/** "Save…" → pick or type one of your categories. */
+/** "Save…" → pick or type one of your playlists. */
 function saveToCategory(url: string): HTMLElement {
   const wrap = el("span", { class: "btns" });
   const open = el("button", { type: "button", class: "act" }, "Save…");
   open.addEventListener("click", () => {
-    const input = el("input", { type: "text", placeholder: "Category", list: "scCategoryNames", class: "small-input" }) as HTMLInputElement;
+    const input = el("input", { type: "text", placeholder: "Playlist", list: "scCategoryNames", class: "small-input" }) as HTMLInputElement;
     const save = el("button", { type: "button", class: "act" }, "Save");
     const names = el("datalist", { id: "scCategoryNames" }, ...me.categories.map((c) => el("option", { value: c.name })));
     const submit = async () => {
@@ -1774,7 +2102,7 @@ function saveToCategory(url: string): HTMLElement {
       try {
         await post("/api/saved-link", { category, url, on: true });
         await loadMe();
-        wrap.replaceChildren(el("span", { class: "small muted" }, "Saved to "), el("a", { class: "link small", href: categoryHash(category) }, category));
+        wrap.replaceChildren(el("span", { class: "small muted" }, "Saved to "), el("a", { class: "link small", href: playlistHash(category) }, category));
       } catch (e) {
         wrap.replaceChildren(el("span", { class: "small error" }, (e as Error).message));
       }
@@ -1803,7 +2131,9 @@ function soundcloudCard(song: string): HTMLElement {
     }
     const linked = el("ol", { class: "ranked" });
     for (const link of data.links) {
-      const how = link.provenance === "user" ? "pasted" : link.provenance === "search_match" ? `picked from search (${Math.round(link.confidence * 100)}% match)` : "from 1001Tracklists";
+      const how = link.auto
+        ? `matched automatically when someone pressed play (${Math.round(link.confidence * 100)}% match). Wrong? Remove it`
+        : link.provenance === "user" ? "pasted" : link.provenance === "search_match" ? `picked from search (${Math.round(link.confidence * 100)}% match)` : "from 1001Tracklists";
       const remove = el("button", { type: "button", class: "act" }, "Remove");
       remove.addEventListener("click", async () => {
         await post("/api/song-links/remove", { song, url: link.url });
@@ -1961,10 +2291,51 @@ function remixSearch(song: string): HTMLElement {
   );
 }
 
-/** Discover: the public likes of a SoundCloud curator (a DJ, a label, a friend). */
-function discoverPage(profile: string | undefined): HTMLElement {
+/**
+ * Discover: songs you might like (or, without likes, what's popular), shuffled each visit,
+ * with a reserved spot for promoted releases and a SoundCloud curator browser below.
+ */
+async function discoverPage(params: URLSearchParams, profile: string | undefined): Promise<HTMLElement> {
+  const genre = params.get("genre") ?? "";
+  const page = Number(params.get("page") ?? 1) || 1;
+  let seed = params.get("seed");
+  if (!seed) {
+    // A fresh shuffle each visit; it goes in the address so paging keeps the same order.
+    seed = String(Math.floor(Math.random() * 1e9));
+    history.replaceState(null, "", listHash("discover", params, { seed }));
+  }
+  const r = await getJson<{ mode: string; items: SongCard[]; page: number; pages: number; total: number }>(
+    `/api/discover?genre=${enc(genre)}&page=${page}&seed=${seed}&months=${months()}`,
+  );
+  const here = new URLSearchParams(location.hash.split("?")[1] ?? "");
+  const to = (changes: Record<string, string | null>) => (location.hash = listHash("discover", here, changes));
+  const shuffle = el("button", { type: "button" }, "⤨ Shuffle");
+  shuffle.addEventListener("click", () => to({ seed: String(Math.floor(Math.random() * 1e9)) }));
+  const personal = r.mode === "personal";
+  return el(
+    "div",
+    { class: "stack" },
+    pageHead(
+      personal ? "Songs you might like" : "Discover",
+      personal ? "Played in the same sets as your likes, with lesser-known songs mixed in. Shuffled every visit." : "Popular in DJ sets this month. Like songs to make this yours.",
+    ),
+    el("div", { class: "filters" }, await genreSelect(genre, (g) => to({ genre: g })), shuffle),
+    el(
+      "section",
+      { class: "card promo" },
+      el("div", { class: "label" }, "Promoted"),
+      el("p", { class: "small muted", style: "margin:6px 0 0" }, "Reserved for artists and labels to feature new releases later. Nothing is promoted yet, and nothing here is paid."),
+    ),
+    r.items.length ? el("div", { class: "tiles" }, ...r.items.map((c) => songTile(c))) : el("div", { class: "card empty" }, "Nothing here for that genre yet."),
+    pager(r, (n) => listHash("discover", here, { page: String(n) })),
+    curatorBrowser(profile),
+  );
+}
+
+/** A SoundCloud curator's public likes (a DJ, a label, a friend). */
+function curatorBrowser(profile: string | undefined): HTMLElement {
   const input = el("input", { type: "text", placeholder: "SoundCloud profile name or link", value: profile ?? "", style: "flex:1; min-width:200px" }) as HTMLInputElement;
-  const go = el("button", { type: "button", class: "primary" }, "Show likes");
+  const go = el("button", { type: "button" }, "Show likes");
   const body = el("div", {});
   const submit = () => {
     const name = input.value.trim().replace(/^https?:\/\/(www\.)?soundcloud\.com\//, "").replace(/\/.*$/, "");
@@ -1974,48 +2345,47 @@ function discoverPage(profile: string | undefined): HTMLElement {
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter") submit();
   });
-  const page = el(
-    "div",
-    { class: "stack" },
-    pageHead("Discover", "What a SoundCloud curator has liked lately, live from SoundCloud", [homeCrumb(), " › Discover"]),
-    el("div", { class: "card" }, el("div", { class: "row" }, input, go), el("div", { class: "muted small", style: "margin-top:6px" }, "Only public likes. Nothing here is stored unless you save it to a category.")),
+  const section = el(
+    "details",
+    { class: "card", ...(profile ? { open: "" } : {}) },
+    el("summary", {}, el("b", {}, "From SoundCloud curators"), " ", el("span", { class: "muted small" }, "what a DJ, label or friend has liked lately")),
+    el("div", { class: "row", style: "margin-top:10px" }, input, go),
+    el("div", { class: "muted small", style: "margin-top:6px" }, "Only public likes, live from SoundCloud. Nothing is stored unless you save it to a playlist."),
     body,
   );
+  if (!profile) return section;
   if (!auth.user) {
-    body.replaceChildren(el("div", { class: "card muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to browse SoundCloud likes."));
-    return page;
+    body.replaceChildren(el("p", { class: "muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to browse SoundCloud likes."));
+    return section;
   }
-  if (!profile) return page;
-
   const list = el("ol", { class: "ranked sc-list" });
   const more = el("button", { type: "button", class: "act" }, "Load more");
-  const card = el("div", { class: "card" }, el("p", { class: "muted small" }, "Loading…"));
-  body.replaceChildren(card);
   let next: string | null = null;
   const load = async (cursor?: string) => {
     more.textContent = "Loading…";
     try {
-      const r = await getJson<{ user: { username: string; permalink: string; avatar?: string }; tracks: ScTrackJson[]; next: string | null }>(
+      const r = await getJson<{ user: { username: string; permalink: string }; tracks: ScTrackJson[]; next: string | null }>(
         `/api/soundcloud/likes?profile=${enc(profile)}${cursor ? `&cursor=${enc(cursor)}` : ""}`,
       );
       list.append(...r.tracks.map((t) => scTrackRow(t)));
       next = r.next;
       more.hidden = !next;
-      card.replaceChildren(
-        el("div", { class: "row" }, el("h2", {}, "Liked by ", externalLink(r.user.permalink, r.user.username)), el("span", { class: "muted small" }, `${plural(list.children.length, "track")} loaded`)),
+      body.replaceChildren(
+        el("h3", {}, "Liked by ", externalLink(r.user.permalink, r.user.username)),
         list.children.length ? list : el("p", { class: "muted small" }, "No public likes."),
         more,
       );
     } catch (e) {
-      card.replaceChildren(el("p", { class: "error small" }, (e as Error).message));
+      body.replaceChildren(el("p", { class: "error small" }, (e as Error).message));
     }
     more.textContent = "Load more";
   };
   more.addEventListener("click", () => {
     if (next) void load(next);
   });
+  body.replaceChildren(el("p", { class: "muted small" }, "Loading…"));
   void load();
-  return page;
+  return section;
 }
 
 // ---- opening 1001Tracklists ----
@@ -2060,12 +2430,39 @@ function armExtension(query: string, kind: Mode | "set"): boolean {
     $("setup").hidden = false;
     return false;
   }
+  // Still collects, but an old copy may stop early: say so where it's seen.
+  if (extensionOutdated()) {
+    showExtensionNotices();
+    window.scrollTo({ top: 0 });
+  }
   window.postMessage({ source: "setscope-app", type: "arm", query, kind }, location.origin);
   return true;
 }
 
 function extensionInstalled(): boolean {
   return document.documentElement.dataset.setscopeExtension === "1";
+}
+
+/** The version Chrome is running ("old" for copies from before versions were reported). */
+function extensionVersion(): string {
+  return document.documentElement.dataset.setscopeExtensionVersion ?? "old";
+}
+
+/** Installed, but not the copy in the project folder: Chrome needs a reload of it. */
+function extensionOutdated(): boolean {
+  return extensionInstalled() && Boolean(auth.extensionVersion) && extensionVersion() !== auth.extensionVersion;
+}
+
+function showExtensionNotices(): void {
+  $("setup").hidden = extensionInstalled();
+  const outdated = extensionOutdated();
+  $("extUpdate").hidden = !outdated;
+  if (outdated) {
+    const have = extensionVersion();
+    $("extHave").textContent = have === "old" ? "an old version" : `version ${have}`;
+    $("extWant").textContent = `version ${auth.extensionVersion}`;
+    $("extWant2").textContent = `version ${auth.extensionVersion}`;
+  }
 }
 
 // ---- collecting status: the strip on every page, the full card on Account ----
@@ -2110,7 +2507,8 @@ function renderStrip(q: QueueStatus): void {
   const paused = q.state === "blocked";
   const active = q.state === "running" || paused || q.waiting.length > 0 || q.older > 0;
   $("stripRefresh").hidden = !refreshWaiting;
-  strip.hidden = (!active && !refreshWaiting) || route.page === "account";
+  strip.hidden = (!active && !refreshWaiting) || !$("queueDrawer").hidden;
+  renderQueueBadge(q);
   if (strip.hidden) return;
   if (!active) {
     strip.classList.remove("paused");
@@ -2136,7 +2534,7 @@ let listOpen = false;
 /** Last list drawn, so polling doesn't redraw (and flicker) when nothing changed. */
 let listShown = "";
 
-/** Put the queue card on the Account page and wire its buttons. */
+/** Put the queue card in the queue drawer and wire its buttons (once, at startup). */
 function mountQueueCard(): void {
   const mount = maybe("queueMount");
   if (!mount || maybe("queueCard")) return;
@@ -2217,6 +2615,24 @@ function renderWaiting(urls: string[], paused: boolean, blockedBySite: boolean):
     parts.push(toggle);
   }
   $("qList").replaceChildren(...parts);
+}
+
+/** The Queue button's badge: sets waiting (amber while paused), hidden when nothing is. */
+function renderQueueBadge(q: QueueStatus): void {
+  const badge = $("queueBadge");
+  const waiting = q.waiting.length + (q.state === "running" ? 1 : 0);
+  badge.hidden = waiting === 0;
+  badge.textContent = waiting > 99 ? "99+" : String(waiting);
+  badge.classList.toggle("paused", q.state === "blocked");
+  $("queueBtn").title = waiting ? `Collecting sets: ${plural(waiting, "set")} to go${q.state === "blocked" ? " (paused)" : ""}` : "Collecting sets";
+}
+
+function setQueueOpen(open: boolean): void {
+  $("queueDrawer").hidden = !open;
+  $("drawerShade").hidden = !open;
+  $("queueBtn").setAttribute("aria-expanded", String(open));
+  $("bgCard").hidden = !auth.user?.owner;
+  if (lastStatus) renderStatus(lastStatus);
 }
 
 function renderBackground(b: BackgroundStatus): void {
@@ -2372,13 +2788,40 @@ $("query").addEventListener("keydown", (event) => {
 });
 $("query").addEventListener("blur", hideSuggest);
 
-window.addEventListener("hashchange", () => void showRoute());
+window.addEventListener("hashchange", () => {
+  setQueueOpen(false);
+  closeMenu();
+  void showRoute();
+});
 $("stripRefresh").addEventListener("click", () => void render());
 
-// Give the extension a moment to mark the page before deciding to show setup steps.
-setTimeout(() => {
-  $("setup").hidden = extensionInstalled();
-}, 800);
+// The queue drawer: from the top bar's Queue button, or "Open queue" in the strip.
+mountQueueCard();
+$("queueBtn").addEventListener("click", () => setQueueOpen($("queueDrawer").hidden === true));
+$("stripDetails").addEventListener("click", () => setQueueOpen(true));
+$("queueClose").addEventListener("click", () => setQueueOpen(false));
+$("drawerShade").addEventListener("click", () => setQueueOpen(false));
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    setQueueOpen(false);
+    closeMenu();
+  }
+});
+$("bgToggle").addEventListener("change", () => void post("/api/background", { enabled: $<HTMLInputElement>("bgToggle").checked }));
+$("addLinksBtn").addEventListener("click", async () => {
+  const text = $<HTMLTextAreaElement>("addLinksText");
+  const msg = $("addLinksMsg");
+  try {
+    const r = await post<{ found: number; queued: number; alreadyCached: number }>("/api/add-links", { text: text.value });
+    msg.textContent = `${plural(r.found, "link")}: ${r.queued} new, ${r.alreadyCached} already in setscope.`;
+    text.value = "";
+  } catch (e) {
+    msg.textContent = (e as Error).message;
+  }
+});
+
+// Give the extension a moment to mark the page before deciding to show setup or update steps.
+setTimeout(showExtensionNotices, 800);
 
 void poll().then(() => showRoute());
 setInterval(() => void poll(), 1500);

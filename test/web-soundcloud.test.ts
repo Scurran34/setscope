@@ -140,6 +140,40 @@ describe.skipIf(!available)("SoundCloud endpoints", () => {
     expect((await post(owner, "/api/song-links", { song: "Nova - Pulse", url: "https://soundcloud.com/test/missing", from: "pasted" })).status).toBe(400);
   });
 
+  it("plays any song: its link, or its best SoundCloud match, remembered as automatic", async () => {
+    const owner = await signUp("owner@example.com");
+    expect(await (await get(undefined, `/api/play?song=${song}`)).json()).toEqual({ error: expect.stringMatching(/Connect SoundCloud/) });
+    await connect(owner);
+    const searches = () => sc.requests.filter((p) => p === "/tracks").length;
+    expect(await (await get(undefined, `/api/play?song=${song}`)).json()).toEqual({ url: "https://soundcloud.com/test/track-1", auto: true, confidence: 0.9, preview: false });
+    expect(await (await get(undefined, `/api/play?song=${song}`)).json()).toMatchObject({ url: "https://soundcloud.com/test/track-1", auto: true });
+    expect(searches()).toBe(1); // the match is remembered, not searched again
+    const { links } = await (await get(owner, `/api/song-links?song=${song}`)).json();
+    expect(links).toEqual([expect.objectContaining({ url: "https://soundcloud.com/test/track-1", auto: true, addedBy: null, removable: true })]);
+
+    // A confirmed link wins over the automatic match.
+    await post(owner, "/api/song-links", { song: "Nova - Pulse", url: "https://soundcloud.com/test/track-2", from: "pasted" });
+    expect(await (await get(undefined, `/api/play?song=${song}`)).json()).toMatchObject({ url: "https://soundcloud.com/test/track-2", auto: false });
+
+    // Anyone signed in can throw out a wrong automatic match.
+    const friend = await signUp("friend@example.com", "invite");
+    expect((await post(friend, "/api/song-links/remove", { song: "Nova - Pulse", url: "https://soundcloud.com/test/track-1" })).status).toBe(200);
+    expect((await post(friend, "/api/song-links/remove", { song: "Nova - Pulse", url: "https://soundcloud.com/test/track-2" })).status).toBe(403);
+  });
+
+  it("says when there's nothing to play, and doesn't keep searching for it", async () => {
+    const owner = await signUp("owner@example.com");
+    await connect(owner);
+    const other = encodeURIComponent("Roland Clark & Amy Alexander - Feel It");
+    const first = await get(undefined, `/api/play?song=${other}`);
+    expect(first.status).toBe(404);
+    expect((await first.json()).error).toMatch(/Couldn't find a playable upload/);
+    const before = sc.requests.length;
+    expect((await get(undefined, `/api/play?song=${other}`)).status).toBe(404);
+    expect(sc.requests.length).toBe(before);
+    expect((await get(undefined, "/api/play?song=Nobody%20-%20Nothing")).status).toBe(400);
+  });
+
   it("lets only whoever added a link, or the owner, remove it", async () => {
     const owner = await signUp("owner@example.com");
     const friend = await signUp("friend@example.com", "invite");
@@ -183,6 +217,6 @@ describe.skipIf(!available)("SoundCloud endpoints", () => {
     const party = await (await get(owner, "/api/category?name=party")).json();
     expect(party.links).toEqual([expect.objectContaining({ url: "https://soundcloud.com/test/track-2", title: "Nova - Pulse (Reed Remix)", artist: "Reed" })]);
     expect((await post(owner, "/api/saved-link", { category: "Party", url: "https://soundcloud.com/test/track-2", on: false })).status).toBe(200);
-    expect(await (await get(owner, "/api/me")).json()).toMatchObject({ categories: [] });
+    expect((await (await get(owner, "/api/playlist?name=party")).json()).links).toEqual([]);
   });
 });

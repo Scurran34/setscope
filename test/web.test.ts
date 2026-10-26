@@ -131,7 +131,7 @@ describe.skipIf(!available)("server", () => {
   it("signs up the owner (importing old likes), keeps them signed in, and signs out", async () => {
     await capture([url("c1")]);
     await queue.settled();
-    expect(await (await fetch(`${base}/api/auth/me`)).json()).toEqual({ user: null, signup: "open", soundcloud: false });
+    expect(await (await fetch(`${base}/api/auth/me`)).json()).toEqual({ user: null, signup: "open", soundcloud: false, extensionVersion: expect.stringMatching(/^\d+\.\d+\.\d+$/) });
     const res = await postJson("/api/auth/register", { email: "Owner@Example.com", password: "a long password", displayName: "Owner" });
     expect(await res.json()).toMatchObject({ user: { email: "owner@example.com" }, imported: { imported: 1, skipped: 0 } });
     const setCookie = res.headers.get("set-cookie")!;
@@ -305,21 +305,24 @@ describe.skipIf(!available)("server", () => {
         complete: true,
       }),
     });
+    // A page you opened yourself: older sets are queued too, not set aside.
     expect(await res.json()).toMatchObject({
       found: 3,
-      queued: 1,
+      queued: 2,
       alreadyCached: 1,
-      skippedOld: 1,
-      discovery: { pageUrl: "https://www.1001tracklists.com/artist/dj-alpha/tracklists.html", setsSeen: 3, setsIndexed: 1, setsNew: 1, setsOlder: 1, complete: true },
+      skippedOld: 0,
+      discovery: { pageUrl: "https://www.1001tracklists.com/artist/dj-alpha/tracklists.html", setsSeen: 3, setsIndexed: 1, setsNew: 2, setsOlder: 0, complete: true },
     });
     await queue.settled();
     const artist = await (await fetch(`${base}/api/artist?name=dj%20alpha&months=24`)).json();
     expect(artist.discovery).toMatchObject({ setsSeen: 3, complete: true });
   });
 
-  it("slows down floods of captures with a 429 and a plain message", async () => {
-    for (let i = 0; i < 12; i++) expect((await capture([])).status).toBe(200);
-    const res = await capture([]);
+  it("never limits pages you open yourself, but slows down floods of pasted links", async () => {
+    for (let i = 0; i < 20; i++) expect((await capture([])).status).toBe(200);
+    const owner = await signUp();
+    for (let i = 0; i < 12; i++) expect((await postAs(owner, "/api/add-links", { text: url(`f${i}`) })).status).toBe(200);
+    const res = await postAs(owner, "/api/add-links", { text: url("f99") });
     expect(res.status).toBe(429);
     expect((await res.json()).error).toMatch(/Wait a few minutes/);
   });
