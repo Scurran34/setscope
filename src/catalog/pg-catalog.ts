@@ -33,9 +33,11 @@ export class PgCatalog implements Catalog {
     return r.rows[0]!.n;
   }
 
-  async save(set: Tracklist, html: string): Promise<void> {
-    await transaction(this.pool, (client) => saveSet(client, set, html));
+  /** Returns how many tracklist lines changed (0 for a new or unchanged set). */
+  async save(set: Tracklist, html: string): Promise<number> {
+    const changed = await transaction(this.pool, (client) => saveSet(client, set, html));
     this.cache = undefined;
+    return changed;
   }
 
   async all(): Promise<Tracklist[]> {
@@ -74,7 +76,7 @@ export class PgCatalog implements Catalog {
 
 // ---------- saving ----------
 
-async function saveSet(db: Db, set: Tracklist, html: string): Promise<void> {
+async function saveSet(db: Db, set: Tracklist, html: string): Promise<number> {
   const setId = await upsertSet(db, set);
 
   // DJs: their card on the page (country, picture, links) improves the artist row.
@@ -95,6 +97,7 @@ async function saveSet(db: Db, set: Tracklist, html: string): Promise<void> {
     ).rows.map((r) => [r.position, r]),
   );
   await db.query("delete from set_tracks where set_id = $1", [setId]);
+  let changed = 0;
   for (const [position, track] of set.tracks.entries()) {
     const previous = before.get(position);
     const unchangedPlaceholder =
@@ -105,6 +108,7 @@ async function saveSet(db: Db, set: Tracklist, html: string): Promise<void> {
       [setId, position, trackId, track.artist, track.title, track.genre ?? null],
     );
     if (previous && (previous.raw_artist !== track.artist || previous.raw_title !== track.title)) {
+      changed++;
       await db.query(
         `insert into track_metadata_history (set_id, position, old_track_id, new_track_id, old_text, new_text)
          values ($1, $2, $3, $4, $5, $6)`,
@@ -128,6 +132,7 @@ async function saveSet(db: Db, set: Tracklist, html: string): Promise<void> {
           or o.id in (select track_id from set_tracks where set_id = $1))`,
     [setId],
   );
+  return changed;
 }
 
 async function upsertSet(db: Db, set: Tracklist): Promise<number> {

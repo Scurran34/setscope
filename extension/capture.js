@@ -62,6 +62,7 @@ const MAX_SETS_PER_PAGE = 300;
  */
 async function loadAllSets() {
   let urls = await waitForLinks();
+  let complete = false;
   let stalls = 0;
   while (urls.length < MAX_SETS_PER_PAGE && stalls < 2) {
     banner(`setscope: loading more sets… ${urls.length} so far`);
@@ -79,8 +80,10 @@ async function loadAllSets() {
     }
     urls = tracklistLinks();
   }
+  // Stopped because nothing new appeared (the page's end), not because of the cap.
+  complete = stalls >= 2;
   window.scrollTo(0, 0);
-  return urls.slice(0, MAX_SETS_PER_PAGE);
+  return { urls: urls.slice(0, MAX_SETS_PER_PAGE), complete };
 }
 
 function normalize(s) {
@@ -125,16 +128,17 @@ async function main() {
   }
 
   banner("setscope: collecting sets…");
-  const urls = await loadAllSets();
+  const { urls, complete } = await loadAllSets();
   if (urls.length === 0) {
     banner("setscope: no sets on this page");
     return;
   }
-  const reply = await chrome.runtime.sendMessage({ type: "capture", pageUrl: location.href, urls });
+  const reply = await chrome.runtime.sendMessage({ type: "capture", pageUrl: location.href, urls, complete });
   if (reply?.ok) {
     const { queued, alreadyCached, skippedOld } = reply.result;
-    const older = skippedOld ? `, ${skippedOld} older than your window` : "";
-    banner(`setscope: sent ${urls.length} sets (${queued} new, ${alreadyCached} already cached${older}). Closing…`);
+    const older = skippedOld ? ` · ${skippedOld} older than your window` : "";
+    const more = complete ? "" : " · stopped at 300, gather again for more";
+    banner(`setscope: ${urls.length} sets on this page · ${alreadyCached} already in setscope · ${queued} new${older}${more}. Closing…`);
   } else {
     banner(`setscope: couldn't reach the app (${reply?.error ?? "unknown error"}). Is npm run web running?`);
   }

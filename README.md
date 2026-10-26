@@ -138,6 +138,35 @@ human check. The extension reads the page *you* opened in your own browser (the 
 and passes the set links to the local app. It only acts in tabs setscope opened, never in your normal
 browsing, and it never fills in or skips the human check.
 
+### How collecting works
+
+Every set to fetch is a job in the database (`collection_jobs`), shared by everyone and kept across
+restarts:
+
+- **One live job per set.** Asking for the same set twice (two people, or the same DJ page gathered
+  again) never fetches it twice, and sets already in the catalog are never fetched again.
+- **Newest first.** Sets older than your window are *held* rather than dropped; "Include them" puts them in line.
+- **Retries:** a passing problem (a dropped connection, a server error) is retried after 30 s, 2 min and
+  8 min, then the job is marked failed with its error, and Account offers "Retry them".
+- **"Slow down" pauses everything.** A 401/403/429/503 or a challenge page pauses all collecting (the
+  reason is stored, so it survives restarts) and is never treated as "no more sets". If the site says how
+  long to wait (`Retry-After`), the page tells you. Nothing is retried until someone presses Try again.
+- **Restarts:** a job that was mid-fetch goes back in line, and the queue comes back paused.
+- **Several workers can run safely:** each claims a job with `for update skip locked`.
+- **Discovery progress.** Each DJ/track page you gather from records how many sets it listed, how many
+  were already here, how many were new or older, and whether the extension reached the end of the page.
+  Artist pages show it as "Last gathered…". Gathering again picks up anything new, and cached sets never
+  count against what's fetched.
+- **Refreshes.** With background collecting on, every 6 hours up to 5 recent sets that still contain
+  unidentified IDs are re-read (counting toward the 100-a-day limit). What changed is recorded in
+  `track_metadata_history`, and each attempt in `source_refresh_history` (unchanged / updated / failed /
+  blocked). A failed refresh keeps the stored set. Signed-in users can also ask for a refresh of a set.
+- **Limits:** at most 30 captures, pasted lists or refresh requests per 10 minutes per account (or per
+  address for the extension).
+
+Finding an artist's or a song's sets still happens in your browser through the extension, because
+1001Tracklists' DJ and track pages put scripts through a human check. setscope doesn't try to get around that.
+
 ### Background collecting
 
 A switch on the home page. When it's on, setscope slowly caches the sets on the 1001Tracklists front
@@ -269,12 +298,15 @@ src/
     import-legacy.ts  copies the old file cache into the catalog
   auth/accounts.ts    sign-up (owner first, then invite-only), passwords, sessions
   personal/user-data.ts   one account's likes and categories
+  collect/            the collection system
+    jobs.ts           the job queue in Postgres: dedupe, newest first, retries, pause, recovery, refreshes
+    discovery.ts      what each DJ/track page gathering found ("Last gathered")
+  auth/rate-limit.ts  per-account limits on captures and refresh requests
   source/             data access: everything that touches the network or disk
     parse.ts          1001Tracklists HTML -> Tracklist
     fetcher.ts        polite HTTP fetcher (HtmlSource interface)
     store.ts          the old file cache in data/ (tests, and the import source)
     ingest.ts         URLs -> fetch -> parse -> cache
-    queue.ts          background fetching for the web app (found list, batches, older sets, pause on block)
     background.ts     background collecting of front-page sets (switch, slow, daily cap)
     songinfo.ts       key/BPM from GetSongBPM, looked up once per song and cached
   format.ts           report -> terminal text

@@ -18,7 +18,8 @@ import type { SongReport } from "../src/analysis/song.ts";
 import type { TrendingItem, TrendingReport } from "../src/analysis/trending.ts";
 import type { Ranked, SetSummary } from "../src/model.ts";
 import type { BackgroundStatus } from "../src/source/background.ts";
-import type { QueueStatus } from "../src/source/queue.ts";
+import type { DiscoveryRecord } from "../src/collect/discovery.ts";
+import type { QueueStatus } from "../src/collect/jobs.ts";
 import type { SongInfoResult } from "../src/source/songinfo.ts";
 
 type Mode = "song" | "artist";
@@ -45,7 +46,7 @@ interface Me {
   categories: { name: string; songs: string[] }[];
 }
 
-type ArtistPage = ArtistReport & { profile: ArtistProfile };
+type ArtistPage = ArtistReport & { profile: ArtistProfile; discovery?: DiscoveryRecord };
 
 /** Waiting sets listed before "Show the rest". */
 const LIST_PREVIEW = 3;
@@ -677,6 +678,7 @@ async function artistPage(name: string, exact: boolean): Promise<HTMLElement> {
         el("div", { class: "crumbs" }, homeCrumb(), " › Artist"),
         el("h1", {}, p.name),
         el("div", { class: "muted small" }, [p.country, p.lastSeen && `last seen ${p.lastSeen}`].filter(Boolean).join(" · ") || "No profile on the cached set pages yet"),
+        r.discovery ? el("div", { class: "small gathered" }, gatheredLine(r.discovery)) : "",
         correctionNotice("artist", p.name, r.correctedFrom),
         el("div", {}, stat(p.ownSets.length, "of their sets cached"), stat(p.playedBy, "sets by others play them"), stat(p.songs.length, "of their songs played")),
         p.genres.length ? el("div", { class: "small" }, el("b", {}, "Genres: "), p.genres.map((g) => g.name).join(", ")) : "",
@@ -700,6 +702,18 @@ async function artistPage(name: string, exact: boolean): Promise<HTMLElement> {
     ),
   );
   return page;
+}
+
+/** "Last gathered Oct 26: 46 sets on their 1001Tracklists page (all of them) · 40 were already here · 6 new" */
+function gatheredLine(d: DiscoveryRecord): string {
+  const when = new Date(d.lastSuccessAt).toLocaleDateString([], { month: "short", day: "numeric" });
+  const parts = [
+    `Last gathered ${when}: ${plural(d.setsSeen, "set")} on their 1001Tracklists page${d.complete ? " (all of them)" : " (stopped at 300; gather again for more)"}`,
+    `${d.setsIndexed} were already here`,
+    `${d.setsNew} new`,
+  ];
+  if (d.setsOlder) parts.push(`${d.setsOlder} older than your window`);
+  return parts.join(" · ");
 }
 
 function artistTrendCard(r: ArtistReport): HTMLElement {
@@ -1056,8 +1070,12 @@ function setLabel(url: string): string {
 /** Plain-words explanation for each kind of pause. */
 function pauseMessage(q: QueueStatus): string {
   switch (q.pauseReason) {
-    case "site":
-      return "1001Tracklists asked setscope to slow down, so it stopped. Next: wait 15–30 minutes, then press Try again.";
+    case "site": {
+      // When the site says how long to wait (Retry-After), pass that on.
+      const seconds = Number(q.blocked?.match(/Retry-After: (\d+)/)?.[1]);
+      const wait = seconds >= 60 ? `about ${seconds >= 5400 ? `${Math.round(seconds / 3600)} hours` : seconds >= 3000 ? "an hour" : `${Math.round(seconds / 60)} minutes`}` : "15–30 minutes";
+      return `1001Tracklists asked setscope to slow down, so it stopped. Next: wait ${wait}, then press Try again.`;
+    }
     case "failure":
       return "A request failed (connection or page problem). Check your internet, then press Try again.";
     case "restart":
@@ -1117,6 +1135,7 @@ function mountQueueCard(): void {
   $("resumeBtn").addEventListener("click", () => void post("/api/resume"));
   $("clearBtn").addEventListener("click", () => void post("/api/clear-queue"));
   $("olderBtn").addEventListener("click", () => void post("/api/include-older"));
+  $("retryBtn").addEventListener("click", () => void post("/api/retry-failed"));
   // Batches are gone: everything found is fetched on its own. These stay hidden.
   $("moreBtn").hidden = true;
   $("allBtn").hidden = true;
@@ -1126,7 +1145,7 @@ function renderQueueCard(q: QueueStatus): void {
   const card = maybe("queueCard");
   if (!card) return;
   const paused = q.state === "blocked";
-  const empty = q.state === "idle" && q.waiting.length === 0 && q.older === 0 && q.done === 0;
+  const empty = q.state === "idle" && q.waiting.length === 0 && q.older === 0 && q.done === 0 && q.failed === 0;
   card.hidden = empty;
   const idle = maybe("queueIdle");
   if (idle) idle.hidden = !empty;
@@ -1145,6 +1164,8 @@ function renderQueueCard(q: QueueStatus): void {
   $("qDetailsText").textContent = q.blocked ?? "";
   $("resumeBtn").hidden = !paused;
   $("clearBtn").hidden = q.waiting.length === 0 && q.older === 0;
+  $("failedBox").hidden = q.failed === 0;
+  $("failedMsg").textContent = `${plural(q.failed, "set")} couldn't be fetched after a few tries (connection or page problems).`;
   $("olderBox").hidden = q.older === 0;
   $("olderMsg").textContent = `${plural(q.older, "set")} older than your window were set aside. Include them, then pick a longer window to see them in reports.`;
   renderWaiting(q.waiting, paused, q.pauseReason === "site");

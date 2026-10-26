@@ -36,7 +36,7 @@ async function sendToServer(server, message) {
   const [path, payload] =
     message.type === "captureSet"
       ? ["/api/capture-set", { pageUrl: message.pageUrl, html: message.html }]
-      : ["/api/capture", { pageUrl: message.pageUrl, urls: message.urls }];
+      : ["/api/capture", { pageUrl: message.pageUrl, urls: message.urls, complete: message.complete === true }];
   const response = await fetch(`${server}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Setscope": "1" },

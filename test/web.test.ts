@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BlockedError, type HtmlSource } from "../src/source/fetcher.ts";
-import { FetchQueue } from "../src/source/queue.ts";
-import { TracklistStore } from "../src/source/store.ts";
+import { RateLimiter } from "../src/auth/rate-limit.ts";
+import { PgJobQueue } from "../src/collect/jobs.ts";
 import type pg from "pg";
 import { Accounts } from "../src/auth/accounts.ts";
 import { PgCatalog } from "../src/catalog/pg-catalog.ts";
@@ -46,213 +46,12 @@ function fakeSource() {
   };
 }
 
-let dir: string;
-let store: TracklistStore;
-beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "setscope-web-"));
-  store = new TracklistStore(dir);
-});
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
-
-describe("FetchQueue", () => {
-  it("fetches in the background, skipping cached, old and duplicate URLs", async () => {
-    const fake = fakeSource();
-    const queue = new FetchQueue(store, fake.source);
-    const first = await queue.enqueue([url("a1"), url("a1"), url("old", "2019-01-01")], "2025-01-01");
-    expect(first).toEqual({ queued: 1, fetchingNow: 1, alreadyCached: 0, skippedOld: 1 });
-    await queue.settled();
-    expect(queue.status()).toMatchObject({ state: "idle", done: 1, total: 1 });
-
-    const second = await queue.enqueue([url("a1"), url("a2")], "2025-01-01");
-    expect(second).toEqual({ queued: 1, fetchingNow: 1, alreadyCached: 1, skippedOld: 0 });
-    await queue.settled();
-    expect(fake.requested).toEqual([url("a1"), url("a2")]);
-  });
-
-  it("accepts new URLs while running and reports progress", async () => {
-    const fake = fakeSource();
-    fake.hold();
-    const queue = new FetchQueue(store, fake.source, { delayMs: 8_000 });
-    await queue.enqueue([url("a1"), url("a2")], "2025-01-01");
-    await queue.enqueue([url("a2"), url("a3")], "2025-01-01"); // a2 already waiting
-    expect(queue.status()).toMatchObject({ state: "running", done: 0, total: 3, etaSeconds: 24 });
-    fake.letGo();
-    await queue.settled();
-    expect(queue.status()).toMatchObject({ state: "idle", done: 3, total: 3 });
-  });
-
-  it("pauses on a block, keeps the URL, and finishes on resume", async () => {
-    const fake = fakeSource();
-    fake.blockOnce();
-    const queue = new FetchQueue(store, fake.source);
-    await queue.enqueue([url("a1"), url("a2")], "2025-01-01");
-    await queue.settled();
-    expect(queue.status()).toMatchObject({ state: "blocked", done: 0, total: 2, blocked: "bot check" });
-
-    queue.resume();
-    await queue.settled();
-    expect(queue.status()).toMatchObject({ state: "idle", done: 2 });
-    expect(fake.requested).toEqual([url("a1"), url("a1"), url("a2")]);
-  });
-});
-
-describe("FetchQueue batches", () => {
-  it("fetches only the newest N, keeps the rest as found, and fetches more on request", async () => {
-    const fake = fakeSource();
-    const queue = new FetchQueue(store, fake.source);
-    const urls = [url("b1", "2026-01-01"), url("b2", "2026-03-01"), url("b3", "2026-02-01")];
-    expect(await queue.enqueue(urls, "2025-01-01", 2)).toMatchObject({ queued: 3, fetchingNow: 2 });
-    await queue.settled();
-    expect(fake.requested).toEqual([url("b2", "2026-03-01"), url("b3", "2026-02-01")]);
-    expect(queue.status()).toMatchObject({ state: "idle", found: [url("b1", "2026-01-01")] });
-
-    expect(queue.more(5)).toBe(1);
-    await queue.settled();
-    expect(queue.status()).toMatchObject({ found: [], done: 1 });
-  });
-
-  it("clears found sets without touching ones already fetching", async () => {
-    const fake = fakeSource();
-    fake.hold();
-    const queue = new FetchQueue(store, fake.source);
-    await queue.enqueue([url("c1", "2026-03-01"), url("c2", "2026-02-01"), url("c3", "2026-01-01")], "2025-01-01", 1);
-    expect(queue.clearFound()).toBe(2);
-    fake.letGo();
-    await queue.settled();
-    expect(queue.status()).toMatchObject({ found: [], done: 1 });
-    expect(fake.requested).toEqual([url("c1", "2026-03-01")]);
-  });
-
-  it("does not re-add sets that are already found or fetching", async () => {
-    const fake = fakeSource();
-    fake.hold();
-    const queue = new FetchQueue(store, fake.source);
-    await queue.enqueue([url("d1", "2026-03-01"), url("d2", "2026-02-01")], "2025-01-01", 1);
-    expect(await queue.enqueue([url("d1", "2026-03-01"), url("d2", "2026-02-01")], "2025-01-01", 1)).toMatchObject({ queued: 0 });
-    fake.letGo();
-  });
-});
-
-describe("FetchQueue clearing and pause reasons", () => {
-  it("says why it paused, and clearing the queue unpauses it", async () => {
-    const fake = fakeSource();
-    fake.blockOnce();
-    const queue = new FetchQueue(store, fake.source);
-    await queue.enqueue([url("q1", "2026-03-01"), url("q2", "2026-02-01"), url("q3", "2026-01-01")], "2025-01-01", 2);
-    await queue.settled();
-    expect(queue.status()).toMatchObject({ state: "blocked", pauseReason: "site", found: [url("q3", "2026-01-01")] });
-
-    expect(queue.clearQueue()).toEqual({ waiting: 2, found: 1 });
-    expect(queue.status()).toMatchObject({ state: "idle", waiting: [], found: [] });
-    expect(queue.status().pauseReason).toBeUndefined();
-  });
-});
-
-describe("FetchQueue older sets", () => {
-  it("sets aside sets older than the cutoff, then includes them on request", async () => {
-    const saveFile = join(dir, "queue.json");
-    const fake = fakeSource();
-    const queue = new FetchQueue(store, fake.source, { saveFile });
-    const result = await queue.enqueue([url("n1", "2026-05-01"), url("o1", "2023-01-01"), url("o2", "2022-01-01")], "2025-01-01", 0);
-    expect(result).toMatchObject({ queued: 1, skippedOld: 2, fetchingNow: 0 });
-    expect(queue.status()).toMatchObject({ older: 2, found: [url("n1", "2026-05-01")] });
-    expect(new FetchQueue(store, fake.source, { saveFile }).status().older).toBe(2); // saved
-
-    expect(queue.includeOlder()).toBe(2);
-    expect(queue.status()).toMatchObject({ older: 0, found: [url("n1", "2026-05-01"), url("o1", "2023-01-01"), url("o2", "2022-01-01")] });
-    queue.more(Number.POSITIVE_INFINITY);
-    await queue.settled();
-    expect(fake.requested).toHaveLength(3); // older sets fetch fine once included
-  });
-});
-
-describe("FetchQueue failures", () => {
-  it("pauses on an ordinary failure and keeps the set, then retries it on resume", async () => {
-    let failNext = true;
-    const requested: string[] = [];
-    const source: HtmlSource = {
-      async fetchHtml(u) {
-        requested.push(u);
-        if (failNext) {
-          failNext = false;
-          throw new Error("socket hang up");
-        }
-        return pageHtml;
-      },
-    };
-    const queue = new FetchQueue(store, source);
-    await queue.enqueue([url("f1"), url("f2")], "2025-01-01");
-    await queue.settled();
-    expect(queue.status()).toMatchObject({ state: "blocked", pauseReason: "failure", failed: 1, pendingFailures: 1, waiting: [url("f1"), url("f2")] });
-    expect(queue.status().blocked).toMatch(/not a site block.*socket hang up/);
-
-    queue.resume();
-    await queue.settled();
-    expect(queue.status()).toMatchObject({ state: "idle", done: 2, pendingFailures: 0 });
-    expect(requested).toEqual([url("f1"), url("f1"), url("f2")]);
-  });
-
-  it("rejects a corrupt saved queue and drops entries that aren't tracklist URLs", () => {
-    const saveFile = join(dir, "queue.json");
-    writeFileSync(saveFile, JSON.stringify({ not: "a list" }));
-    expect(() => new FetchQueue(store, fakeSource().source, { saveFile })).toThrow(/Invalid saved queue/);
-
-    // Older saves were a plain list; they come back waiting (newest first), paused until you say so.
-    writeFileSync(saveFile, JSON.stringify([url("ok1", "2026-01-01"), url("ok1", "2026-01-01"), 42, "https://evil.example/tracklist/x/y.html", url("ok2", "2026-05-05")]));
-    const status = new FetchQueue(store, fakeSource().source, { saveFile }).status();
-    expect(status).toMatchObject({ state: "blocked", pauseReason: "restart", waiting: [url("ok2", "2026-05-05"), url("ok1", "2026-01-01")], found: [] });
-  });
-});
-
-describe("FetchQueue persistence", () => {
-  it("restores waiting sets after a restart, paused until you resume", async () => {
-    const saveFile = join(dir, "queue.json");
-    const fake = fakeSource();
-    fake.blockOnce();
-    const first = new FetchQueue(store, fake.source, { saveFile });
-    await first.enqueue([url("p1"), url("p2")], "2025-01-01");
-    await first.settled(); // blocked on p1
-
-    const restarted = new FetchQueue(store, fake.source, { saveFile });
-    expect(restarted.status()).toMatchObject({ state: "blocked", pauseReason: "restart", waiting: [url("p1"), url("p2")] });
-    expect(fake.requested).toHaveLength(1); // the restart itself sent nothing
-
-    restarted.resume();
-    await restarted.settled();
-    expect(restarted.status()).toMatchObject({ state: "idle", waiting: [] });
-    expect(new FetchQueue(store, fake.source, { saveFile }).status().state).toBe("idle");
-  });
-});
-
-describe("FetchQueue.importPage", () => {
-  it("takes a set you opened yourself off the waiting list, and unblocks when the list empties", async () => {
-    const fake = fakeSource();
-    fake.blockOnce();
-    const queue = new FetchQueue(store, fake.source);
-    // The fixture page's own URL (og:url) has id zz9fix1.
-    await queue.enqueue([url("zz9fix1")], "2025-01-01");
-    await queue.settled();
-    expect(queue.status()).toMatchObject({ state: "blocked", waiting: [url("zz9fix1")] });
-
-    const set = await queue.importPage(pageHtml, "https://www.1001tracklists.com/tracklist/zz9fix1/x.html");
-    expect(set.tracks).toHaveLength(6);
-    expect(await store.has("zz9fix1")).toBe(true);
-    expect(queue.status()).toMatchObject({ state: "idle", done: 1, waiting: [] });
-  });
-
-  it("rejects a page with no tracks", async () => {
-    const queue = new FetchQueue(store, fakeSource().source);
-    const empty = '<meta property="og:url" content="https://www.1001tracklists.com/tracklist/e1/x-2026-01-01.html"><h1 id="pageTitle">x 2026-01-01</h1>';
-    await expect(queue.importPage(empty, "https://www.1001tracklists.com/tracklist/e1/x.html")).rejects.toThrow(/No tracks/);
-  });
-});
-
 const available = await databaseAvailable();
 
 describe.skipIf(!available)("server", () => {
   let server: Server;
   let base: string;
-  let queue: FetchQueue;
+  let queue: PgJobQueue;
   let pool: pg.Pool;
   let store: PgCatalog;
   let filesDir: string;
@@ -260,10 +59,11 @@ describe.skipIf(!available)("server", () => {
   beforeEach(async () => {
     pool = await freshSchema("web_server");
     store = new PgCatalog(pool);
-    queue = new FetchQueue(store, fakeSource().source);
+    queue = new PgJobQueue(pool, store, fakeSource().source, { schedule: () => {} });
     filesDir = mkdtempSync(join(tmpdir(), "setscope-server-"));
     writeFileSync(join(filesDir, "user.json"), JSON.stringify({ likes: { "nova - pulse": "Nova - Pulse" }, categories: {} }));
-    server = createApp(store, queue, new Accounts(pool, "invite"), new PgUserData(pool), {
+    server = createApp({ pool, catalog: store, queue, accounts: new Accounts(pool, "invite"), userData: new PgUserData(pool) }, {
+      captureLimit: new RateLimiter(12, 60_000),
       keyFile: join(filesDir, "key"),
       legacyUserFile: join(filesDir, "user.json"),
     });
@@ -272,6 +72,7 @@ describe.skipIf(!available)("server", () => {
   });
   afterEach(async () => {
     await new Promise((resolve) => server.close(resolve));
+    await queue.settled();
     await pool.end();
     rmSync(filesDir, { recursive: true, force: true });
   });
@@ -323,7 +124,7 @@ describe.skipIf(!available)("server", () => {
 
   it("queues captured links from the extension, ignoring anything that isn't a tracklist", async () => {
     const res = await capture([url("c1"), "https://evil.example/tracklist/x/y.html", "/dj/x/index.html", 42]);
-    expect(await res.json()).toEqual({ found: 1, queued: 1, fetchingNow: 1, alreadyCached: 0, skippedOld: 0 });
+    expect(await res.json()).toMatchObject({ found: 1, queued: 1, fetchingNow: 1, alreadyCached: 0, skippedOld: 0, discovery: { setsSeen: 1 } });
     await queue.settled();
     expect(await store.has("c1")).toBe(true);
   });
@@ -362,7 +163,7 @@ describe.skipIf(!available)("server", () => {
     const res = await capture(urls);
     expect(await res.json()).toMatchObject({ found: 7, queued: 7, fetchingNow: 7 });
     await queue.settled();
-    expect(queue.status()).toMatchObject({ state: "idle", done: 7, found: [], waiting: [] });
+    expect(await queue.status()).toMatchObject({ state: "idle", done: 7, found: [], waiting: [] });
   });
 
   it("adds pasted links for signed-in users only", async () => {
@@ -371,7 +172,7 @@ describe.skipIf(!available)("server", () => {
     const pasted = await postAs(cookie, "/api/add-links", { text: `see ${url("p1")} and junk /dj/x/index.html` });
     expect(await pasted.json()).toMatchObject({ found: 1, queued: 1, fetchingNow: 1 });
     expect((await postAs(cookie, "/api/add-links", { text: "no links here" })).status).toBe(400);
-    expect((await postJson("/api/more", { count: 1 }, { cookie })).status).toBe(400); // missing header
+    expect((await postJson("/api/clear-queue", {}, { cookie })).status).toBe(400); // missing header
   });
 
   it("suggests cached songs and artists for the search dropdown", async () => {
@@ -407,7 +208,7 @@ describe.skipIf(!available)("server", () => {
     const cleared = await (await postAs(cookie, "/api/clear-queue", {})).json();
     expect(cleared).toEqual({ waiting: expect.any(Number), found: 0 });
     await queue.settled();
-    expect(queue.status()).toMatchObject({ waiting: [], found: [] });
+    expect(await queue.status()).toMatchObject({ waiting: [], found: [] });
   });
 
   it("keeps likes and categories per account: on song pages, in for-you, and on category pages", async () => {
@@ -464,6 +265,45 @@ describe.skipIf(!available)("server", () => {
     expect(await (await postAs(owner, "/api/account/getsongbpm-key", { key: "abc123def456" })).json()).toEqual({ getSongBpmKey: true });
     expect(await (await getAs(friend, "/api/account")).json()).toMatchObject({ getSongBpmKey: true, user: { owner: false } });
     expect(readFileSync(join(filesDir, "key"), "utf8")).toBe("abc123def456\n");
+  });
+
+  it("remembers how far gathering got on a DJ page, and shows it on the artist", async () => {
+    await capture([url("c1")]); // DJ Alpha's set, so the artist and their page exist
+    await queue.settled();
+    const res = await fetch(`${base}/api/capture`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Setscope": "1" },
+      body: JSON.stringify({
+        pageUrl: "https://www.1001tracklists.com/artist/dj-alpha/tracklists.html#more",
+        urls: [url("c1"), url("c2", "2026-09-20"), url("c3", "2023-01-01")],
+        complete: true,
+      }),
+    });
+    expect(await res.json()).toMatchObject({
+      found: 3,
+      queued: 1,
+      alreadyCached: 1,
+      skippedOld: 1,
+      discovery: { pageUrl: "https://www.1001tracklists.com/artist/dj-alpha/tracklists.html", setsSeen: 3, setsIndexed: 1, setsNew: 1, setsOlder: 1, complete: true },
+    });
+    await queue.settled();
+    const artist = await (await fetch(`${base}/api/artist?name=dj%20alpha&months=24`)).json();
+    expect(artist.discovery).toMatchObject({ setsSeen: 3, complete: true });
+  });
+
+  it("slows down floods of captures with a 429 and a plain message", async () => {
+    for (let i = 0; i < 12; i++) expect((await capture([])).status).toBe(200);
+    const res = await capture([]);
+    expect(res.status).toBe(429);
+    expect((await res.json()).error).toMatch(/Wait a few minutes/);
+  });
+
+  it("retries failed sets and refreshes a set on request", async () => {
+    const owner = await signUp();
+    expect(await (await postAs(owner, "/api/retry-failed", {})).json()).toEqual({ retried: 0 });
+    expect((await postAs(owner, "/api/refresh-set", { url: "https://evil.example/x" })).status).toBe(400);
+    expect(await (await postAs(owner, "/api/refresh-set", { url: url("c1") })).json()).toEqual({ queued: 1 });
+    expect((await postJson("/api/refresh-set", { url: url("c1") })).status).toBe(401);
   });
 
   it("reports cache size and queue progress", async () => {

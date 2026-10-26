@@ -26,9 +26,11 @@ export class TracklistStore implements Catalog {
     return existsSync(this.setPath(id));
   }
 
-  async save(set: Tracklist, html: string): Promise<void> {
+  /** The file cache doesn't track line changes, so this always reports 0. */
+  async save(set: Tracklist, html: string): Promise<number> {
     writeFileSync(join(this.htmlDir, `${set.id}.html`), html);
     writeFileSync(this.setPath(set.id), JSON.stringify(set, null, 2));
+    return 0;
   }
 
   async all(): Promise<Tracklist[]> {

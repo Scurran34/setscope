@@ -150,6 +150,7 @@
     .hint { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
     .facts { margin-top: 6px; }
     .credit { font-size: 12px; }
+    .gathered { margin-top: 4px; color: var(--muted); }
     .stack-form { display: flex; flex-direction: column; gap: 10px; align-items: stretch; }
     .stack-form button { align-self: flex-start; }
     .field { display: flex; flex-direction: column; gap: 4px; }
@@ -221,6 +222,10 @@
         <button id="moreBtn" type="button" class="primary">Fetch 5 more</button>
         <button id="allBtn" type="button">Fetch all</button>
         <button id="clearBtn" type="button">Clear queue</button>
+      </div>
+      <div id="failedBox" class="row older" hidden>
+        <span id="failedMsg" class="small muted"></span>
+        <button id="retryBtn" type="button" class="act">Retry them</button>
       </div>
       <div id="olderBox" class="row older" hidden>
         <span id="olderMsg" class="small muted"></span>

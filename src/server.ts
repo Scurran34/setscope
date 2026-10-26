@@ -16,9 +16,11 @@
 //   GET  /api/account   POST /api/account/getsongbpm-key (owner)
 //   GET  /api/status    POST /api/background (owner)
 //   POST /api/capture  /api/capture-set   from the browser extension
-//   POST /api/add-links /api/resume /api/clear-queue /api/include-older /api/more /api/clear-found (needs login)
+//   POST /api/add-links /api/resume /api/clear-queue /api/include-older /api/retry-failed (needs login)
+//   POST /api/refresh-set { url }        re-read a set now (needs login)
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import type pg from "pg";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { stripTypeScriptTypes } from "node:module";
 import { join } from "node:path";
@@ -30,6 +32,9 @@ import { artistProfile } from "./analysis/profile.ts";
 import { analyzeSong, type SongReport } from "./analysis/song.ts";
 import { trending } from "./analysis/trending.ts";
 import { AccountError, Accounts, SESSION_DAYS, type User } from "./auth/accounts.ts";
+import { RateLimiter } from "./auth/rate-limit.ts";
+import { canonicalPage, discoveryForArtist, recordDiscovery } from "./collect/discovery.ts";
+import { PgJobQueue } from "./collect/jobs.ts";
 import type { Catalog } from "./catalog/catalog.ts";
 import { PgCatalog } from "./catalog/pg-catalog.ts";
 import { DEFAULT_MONTHS, dataDir, sinceMonths } from "./config.ts";
@@ -41,7 +46,6 @@ import { PgUserData, UserDataError } from "./personal/user-data.ts";
 import { BackgroundCollector } from "./source/background.ts";
 import { isFetchAllowed, PoliteFetcher } from "./source/fetcher.ts";
 import { extractTracklistUrls } from "./source/parse.ts";
-import { FetchQueue } from "./source/queue.ts";
 import { SongInfoService, SongInfoStore } from "./source/songinfo.ts";
 
 export const PORT = Number(process.env.SETSCOPE_PORT ?? 7331);
@@ -49,8 +53,9 @@ const WEB_DIR = join(import.meta.dirname, "..", "web");
 const COOKIE = "setscope_session";
 
 export interface App {
+  pool: pg.Pool;
   catalog: Catalog;
-  queue: FetchQueue;
+  queue: PgJobQueue;
   accounts: Accounts;
   userData: PgUserData;
   songInfo: SongInfoService;
@@ -63,9 +68,20 @@ export interface App {
   secureCookies: boolean;
   /** Cutoff from the most recent report, applied to links the extension sends. */
   since: string;
+  /** Slows down floods of captures / pasted links (per account, or per address without one). */
+  captureLimit: RateLimiter;
+}
+
+export interface AppDeps {
+  pool: pg.Pool;
+  catalog: Catalog;
+  queue: PgJobQueue;
+  accounts: Accounts;
+  userData: PgUserData;
 }
 
 export interface AppOptions {
+  captureLimit?: RateLimiter;
   songInfo?: SongInfoService;
   background?: BackgroundCollector;
   keyFile?: string;
@@ -84,12 +100,14 @@ class NotAllowed extends Error {
   }
 }
 
-export function createApp(catalog: Catalog, queue: FetchQueue, accounts: Accounts, userData: PgUserData, options: AppOptions = {}) {
+export function createApp({ pool, catalog, queue, accounts, userData }: AppDeps, options: AppOptions = {}) {
   const app: App = {
+    pool,
     catalog,
     queue,
     accounts,
     userData,
+    captureLimit: options.captureLimit ?? new RateLimiter(30, 10 * 60_000),
     songInfo: options.songInfo ?? new SongInfoService(new SongInfoStore()),
     background: options.background,
     keyFile: options.keyFile,
@@ -207,7 +225,9 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
         if (fix) report = { ...analyzeArtist(sets, fix, options), correctedFrom: name };
         else report.suggestions = searchArtists(sets, name, app.since, 5);
       }
-      return sendJson(res, 200, { ...report, profile: artistProfile(sets, report.artist, app.since) });
+      const profile = artistProfile(sets, report.artist, app.since);
+      const discovery = await discoveryForArtist(app.pool, profile.name, profile.page);
+      return sendJson(res, 200, { ...report, profile, discovery });
     }
     case "GET /api/suggest": {
       const q = params.get("q")?.trim() ?? "";
@@ -305,24 +325,35 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       if (typeof body.enabled !== "boolean") throw new BadRequest("Expected { enabled: boolean }");
       if (!app.background) throw new BadRequest("Background collecting isn't available here.");
       app.background.setEnabled(body.enabled);
-      return sendJson(res, 200, app.background.status());
+      return sendJson(res, 200, await app.background.status());
     }
 
     // ---- collecting ----
     case "GET /api/status":
-      return sendJson(res, 200, { sets: await app.catalog.count(), since: app.since, queue: app.queue.status(), background: app.background?.status() });
+      return sendJson(res, 200, {
+        sets: await app.catalog.count(),
+        since: app.since,
+        queue: await app.queue.status(),
+        background: await app.background?.status(),
+      });
     case "POST /api/capture": {
       // From the browser extension (which may not carry your login).
       requireOwnHeader(req);
-      const body = (await readJson(req)) as { pageUrl?: unknown; urls?: unknown };
+      limitCaptures(app, req, user);
+      const body = (await readJson(req)) as { pageUrl?: unknown; urls?: unknown; complete?: unknown };
       if (!Array.isArray(body.urls)) throw new BadRequest("Expected { urls: string[] }");
-      const urls = body.urls.filter((u): u is string => typeof u === "string" && isFetchAllowed(u));
-      const result = await app.queue.enqueue(urls, app.since);
-      console.log(`Captured ${urls.length} sets from ${String(body.pageUrl)}: ${result.queued} new to fetch.`);
-      return sendJson(res, 200, { found: urls.length, ...result });
+      if (body.urls.length > 400) throw new BadRequest("Too many links in one capture.");
+      const urls = [...new Set(body.urls.filter((u): u is string => typeof u === "string" && isFetchAllowed(u)))];
+      const result = await app.queue.enqueue(urls, app.since, { requestedBy: user?.id });
+      // Remember how far gathering got on this DJ/track page, for "last gathered" on artist pages.
+      const page = typeof body.pageUrl === "string" && /^https:\/\/(www\.)?1001tracklists\.com\/(artist|dj|track|source)\//.test(body.pageUrl) ? body.pageUrl : undefined;
+      const discovery = page ? await recordDiscovery(app.pool, page, { found: urls.length, ...result, complete: body.complete === true }) : undefined;
+      console.log(`Captured ${urls.length} sets from ${page ? canonicalPage(page) : "a page"}: ${result.queued} new, ${result.alreadyCached} already in setscope.`);
+      return sendJson(res, 200, { found: urls.length, ...result, discovery });
     }
     case "POST /api/capture-set": {
       requireOwnHeader(req);
+      limitCaptures(app, req, user);
       const body = (await readJson(req, 10_000_000)) as { pageUrl?: unknown; html?: unknown };
       if (typeof body.pageUrl !== "string" || typeof body.html !== "string") throw new BadRequest("Expected { pageUrl: string, html: string }");
       const pageUrl = body.pageUrl.split("#")[0]!;
@@ -338,41 +369,40 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
     }
     case "POST /api/add-links": {
       requireOwnHeader(req);
-      needUser("add sets");
+      const u = needUser("add sets");
+      limitCaptures(app, req, u);
       const body = (await readJson(req)) as { text?: unknown };
       if (typeof body.text !== "string") throw new BadRequest("Expected { text: string }");
-      const urls = extractTracklistUrls(body.text).filter(isFetchAllowed);
+      const urls = extractTracklistUrls(body.text).filter(isFetchAllowed).slice(0, 400);
       if (urls.length === 0) throw new BadRequest("No 1001Tracklists set links found in that text.");
-      return sendJson(res, 200, { found: urls.length, ...(await app.queue.enqueue(urls, app.since)) });
+      return sendJson(res, 200, { found: urls.length, ...(await app.queue.enqueue(urls, app.since, { requestedBy: u.id })) });
     }
-    case "POST /api/more": {
+    case "POST /api/refresh-set": {
+      requireOwnHeader(req);
+      const u = needUser("refresh sets");
+      limitCaptures(app, req, u);
+      const body = (await readJson(req)) as { url?: unknown };
+      if (typeof body.url !== "string" || !isFetchAllowed(body.url)) throw new BadRequest("Expected { url } of a 1001Tracklists set");
+      // Someone asked: ahead of scheduled refreshes, behind new sets.
+      return sendJson(res, 200, { queued: await app.queue.enqueueRefresh([body.url], { requestedBy: u.id, priority: -1 }) });
+    }
+    case "POST /api/include-older":
       requireOwnHeader(req);
       needUser("control the queue");
-      const body = (await readJson(req)) as { count?: unknown };
-      const count = body.count === "all" ? Number.POSITIVE_INFINITY : Number(body.count ?? Number.POSITIVE_INFINITY);
-      if (!(count > 0)) throw new BadRequest('"count" must be a positive number or "all"');
-      return sendJson(res, 200, { moved: app.queue.more(count) });
-    }
-    case "POST /api/clear-found":
+      return sendJson(res, 200, { moved: await app.queue.includeOlder() });
+    case "POST /api/retry-failed":
       requireOwnHeader(req);
       needUser("control the queue");
-      return sendJson(res, 200, { cleared: app.queue.clearFound() });
-    case "POST /api/include-older": {
-      requireOwnHeader(req);
-      needUser("control the queue");
-      const moved = app.queue.includeOlder();
-      app.queue.more(); // straight into fetching, like everything else
-      return sendJson(res, 200, { moved });
-    }
+      return sendJson(res, 200, { retried: await app.queue.retryFailed() });
     case "POST /api/clear-queue":
       requireOwnHeader(req);
       needUser("control the queue");
-      return sendJson(res, 200, app.queue.clearQueue());
+      return sendJson(res, 200, await app.queue.clearQueue());
     case "POST /api/resume":
       requireOwnHeader(req);
       needUser("control the queue");
-      app.queue.resume();
-      return sendJson(res, 200, app.queue.status());
+      await app.queue.resume();
+      return sendJson(res, 200, await app.queue.status());
     default:
       return sendJson(res, 404, { error: `No route for ${route}` });
   }
@@ -391,6 +421,12 @@ async function withUserData(app: App, user: User | undefined, report: SongReport
     categories: all.filter((c) => key in c.songs).map((c) => c.name),
     hints: categoryHints(sets, key, all, report.since),
   };
+}
+
+/** At most 30 captures / pasted lists / refresh requests per 10 minutes per account (or address). */
+function limitCaptures(app: App, req: IncomingMessage, user: User | undefined): void {
+  const key = user ? `user:${user.id}` : `addr:${req.socket.remoteAddress ?? "?"}`;
+  if (!app.captureLimit.take(key)) throw new NotAllowed("That's a lot of requests in a short time. Wait a few minutes and try again.", 429);
 }
 
 /** A change to your data; its validation errors become 400s. */
@@ -487,7 +523,18 @@ if (import.meta.main) {
   if (reparsed) console.log(`Re-read ${reparsed} sets with the newer parser.`);
 
   const fetcher = new PoliteFetcher({ stateFile: join(dir, "last-request") });
-  const queue = new FetchQueue(catalog, fetcher, { saveFile: join(dir, "queue.json") });
+  const queue = new PgJobQueue(pool, catalog, fetcher);
+  // The old file queue (data/queue.json), if any, joins the database queue once.
+  const legacyQueue = join(dir, "queue.json");
+  if (existsSync(legacyQueue)) {
+    const saved = JSON.parse(readFileSync(legacyQueue, "utf8")) as string[] | { waiting?: string[]; found?: string[]; older?: string[] };
+    const lists = Array.isArray(saved) ? { waiting: saved } : saved;
+    // Not started: recover() below pauses the queue, so nothing is fetched until someone says so.
+    const result = await queue.enqueue([...(lists.waiting ?? []), ...(lists.found ?? []), ...(lists.older ?? [])], sinceMonths(), { start: false });
+    renameSync(legacyQueue, `${legacyQueue}.imported`);
+    console.log(`Moved the old file queue into the database: ${result.queued} waiting, ${result.skippedOld} older.`);
+  }
+  await queue.recover();
   // GetSongBPM key: SETSCOPE_GETSONGBPM_KEY, or the file data/getsongbpm-key (kept out of git with data/).
   const keyFile = join(dir, "getsongbpm-key");
   const apiKey = process.env.SETSCOPE_GETSONGBPM_KEY ?? (existsSync(keyFile) ? readFileSync(keyFile, "utf8").trim() : undefined);
@@ -495,7 +542,7 @@ if (import.meta.main) {
   const background = new BackgroundCollector(catalog, queue, fetcher, { saveFile: join(dir, "background.json"), since: () => sinceMonths() });
   setInterval(() => void background.tick(), 15_000);
 
-  const app = createApp(catalog, queue, new Accounts(pool), new PgUserData(pool), {
+  const app = createApp({ pool, catalog, queue, accounts: new Accounts(pool), userData: new PgUserData(pool) }, {
     songInfo,
     background,
     keyFile,
