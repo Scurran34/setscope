@@ -1,0 +1,99 @@
+// Song mode: given a song, look at the recent sets that contain it.
+
+import type { Ranked, Track, Tracklist } from "../model.ts";
+import {
+  displayName,
+  isId,
+  matchesSong,
+  normalizeName,
+  songKey,
+  type SongQuery,
+} from "../normalize.ts";
+import { Counter, filterSince } from "./common.ts";
+
+export interface SongReport {
+  song: string;
+  since: string;
+  /** Sets in the cache on or after `since`. */
+  setsConsidered: number;
+  /** Of those, sets that contain the song. */
+  setsWithSong: number;
+  /** DJs credited on the most sets containing the song. */
+  topDjs: Ranked[];
+  /** Unreleased IDs that show up in at least two of those sets. */
+  recurringIds: Ranked[];
+  /** Other released songs that show up most in those sets. */
+  coPlayed: Ranked[];
+}
+
+export interface SongOptions {
+  since: string;
+  top?: number;
+}
+
+export function analyzeSong(sets: Tracklist[], query: SongQuery, options: SongOptions): SongReport {
+  const top = options.top ?? 10;
+  const recent = filterSince(sets, options.since);
+  const withSong = recent.filter((set) => set.tracks.some((t) => matchesSong(t, query)));
+
+  const djs = new Counter();
+  const ids = new Counter();
+  const others = new Counter();
+
+  for (const set of withSong) {
+    for (const dj of set.djs) djs.add(normalizeName(dj), dj);
+
+    // Count each song or ID once per set, even if the DJ played it twice.
+    const seenIds = new Map<string, string>();
+    const seenOthers = new Map<string, string>();
+    set.tracks.forEach((track, index) => {
+      if (matchesSong(track, query)) return;
+      if (isId(track)) {
+        const id = idIdentity(set.tracks, index);
+        if (id) seenIds.set(id.key, id.label);
+      } else {
+        seenOthers.set(songKey(track), displayName(track));
+      }
+    });
+    for (const [key, label] of seenIds) ids.add(key, label);
+    for (const [key, label] of seenOthers) others.add(key, label);
+  }
+
+  return {
+    song: query.label,
+    since: options.since,
+    setsConsidered: recent.length,
+    setsWithSong: withSong.length,
+    topDjs: djs.top(top),
+    recurringIds: ids.top(top, 2),
+    coPlayed: others.top(top),
+  };
+}
+
+/**
+ * Decide which ID rows are "the same ID" across sets.
+ *  1. 1001Tracklists linked the row to a track page: trust its trackId.
+ *  2. Partially known ("Fisher - ID"): use the name.
+ *  3. Fully unknown ("ID - ID"): the only clue is context, so key on the nearest
+ *     known track played before it. The same ID often follows the same song in
+ *     sets by DJs who share promos. This is a heuristic, and the label says so.
+ */
+function idIdentity(tracks: Track[], index: number): { key: string; label: string } | undefined {
+  const track = tracks[index]!;
+  if (track.trackId) {
+    return { key: `tid:${track.trackId}`, label: `${displayName(track)} [1001TL ${track.trackId}]` };
+  }
+  if (normalizeName(track.artist) !== "id" || normalizeName(track.title) !== "id") {
+    return { key: `name:${songKey(track)}`, label: displayName(track) };
+  }
+  for (let i = index - 1; i >= 0; i--) {
+    const previous = tracks[i]!;
+    if (!isId(previous)) {
+      return {
+        key: `after:${songKey(previous)}`,
+        label: `ID - ID (played after ${displayName(previous)})`,
+      };
+    }
+  }
+  return undefined;
+}
