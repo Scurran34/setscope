@@ -12,6 +12,17 @@ import type { UserData } from "../user.ts";
 /** Thrown for things the person can fix (a song we don't know, a bad category name). */
 export class UserDataError extends Error {}
 
+/** The shared track a song name refers to ("Artist - Title"), if we have it. */
+export async function findTrackId(pool: pg.Pool, song: string): Promise<number> {
+  if (!song.includes(" - ")) throw new UserDataError(`Song must look like "Artist - Title" (got "${song}")`);
+  const track = trackFromName(song);
+  const key = `${normalizeName(track.artist)} - ${baseTitle(track.title)}`;
+  const r = await pool.query<{ id: number }>("select id from tracks where identity_key = $1", [key]);
+  const id = r.rows[0]?.id;
+  if (id === undefined) throw new UserDataError(`"${song}" isn't in the catalog yet.`);
+  return id;
+}
+
 export class PgUserData {
   private readonly pool: pg.Pool;
 
@@ -19,15 +30,8 @@ export class PgUserData {
     this.pool = pool;
   }
 
-  /** The shared track a song name refers to ("Artist - Title"), if we have it. */
-  private async trackId(song: string): Promise<number> {
-    if (!song.includes(" - ")) throw new UserDataError(`Song must look like "Artist - Title" (got "${song}")`);
-    const track = trackFromName(song);
-    const key = `${normalizeName(track.artist)} - ${baseTitle(track.title)}`;
-    const r = await this.pool.query<{ id: number }>("select id from tracks where identity_key = $1", [key]);
-    const id = r.rows[0]?.id;
-    if (id === undefined) throw new UserDataError(`"${song}" isn't in the catalog yet.`);
-    return id;
+  private trackId(song: string): Promise<number> {
+    return findTrackId(this.pool, song);
   }
 
   async get(userId: number): Promise<UserData> {
@@ -79,7 +83,8 @@ export class PgUserData {
       );
       await this.pool.query(
         `delete from collections c where c.user_id = $1 and c.name_key = $2
-           and not exists (select 1 from collection_tracks ct where ct.collection_id = c.id)`,
+           and not exists (select 1 from collection_tracks ct where ct.collection_id = c.id)
+           and not exists (select 1 from collection_links cl where cl.collection_id = c.id)`,
         [userId, key],
       );
     }

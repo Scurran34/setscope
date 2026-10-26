@@ -10,6 +10,7 @@
 //   #/artist/<name>/song/<song>      Song page, under its artist
 //   #/song/<text>                    A song search; moves to the song's page once found
 //   #/category/<name>                One of your categories
+//   #/discover                       A SoundCloud curator's likes
 
 import type { ArtistReport } from "../src/analysis/artist.ts";
 import type { SetForYou } from "../src/analysis/personal.ts";
@@ -21,7 +22,7 @@ import type { BackgroundStatus } from "../src/source/background.ts";
 import type { DiscoveryRecord } from "../src/collect/discovery.ts";
 import type { QueueStatus } from "../src/collect/jobs.ts";
 import type { SongInfoResult } from "../src/source/songinfo.ts";
-import { mountPlayerBar, PlayerCore, SoundCloudProvider } from "./player.ts";
+import { mountPlayerBar, PlayerCore, SoundCloudProvider, type Playable } from "./player.ts";
 
 type Mode = "song" | "artist";
 
@@ -32,7 +33,8 @@ type Route =
   | { page: "artist"; name: string; exact: boolean }
   | { page: "song"; artist: string; song: string }
   | { page: "search"; query: string; exact: boolean }
-  | { page: "category"; name: string };
+  | { page: "category"; name: string }
+  | { page: "discover"; profile?: string };
 
 interface Status {
   sets: number;
@@ -195,16 +197,19 @@ mountPlayerBar(player, $("player"), $<HTMLIFrameElement>("scFrame"));
 
 /** ▶ Play for a set with a recording; shows ❚❚ while it's the one playing. */
 function playButton(set: SetSummary): HTMLElement {
-  const button = el("button", { type: "button", class: "play-btn", "data-source": set.soundcloud! }, "▶ Play");
-  button.addEventListener("click", () =>
-    player.play({
-      provider: "soundcloud",
-      source: set.soundcloud!,
-      title: set.title,
-      subtitle: `${set.djs.join(" & ")} · ${set.date}`,
-      pageUrl: set.url,
-    }),
-  );
+  return playableButton({
+    provider: "soundcloud",
+    source: set.soundcloud!,
+    title: set.title,
+    subtitle: `${set.djs.join(" & ")} · ${set.date}`,
+    pageUrl: set.url,
+  });
+}
+
+/** ▶ Play for anything the player can play (a set, a SoundCloud upload). */
+function playableButton(item: Playable): HTMLElement {
+  const button = el("button", { type: "button", class: "play-btn", "data-source": item.source }, "▶ Play");
+  button.addEventListener("click", () => player.play(item));
   markPlaying(button);
   return button;
 }
@@ -306,6 +311,7 @@ function parseRoute(hash: string): Route {
   if (first === "artist" && second) return { page: "artist", name: second, exact: third === "exact" };
   if (first === "song" && second) return { page: "search", query: second, exact: third === "exact" };
   if (first === "category" && second) return { page: "category", name: second };
+  if (first === "discover") return second ? { page: "discover", profile: second } : { page: "discover" };
   return { page: "home" };
 }
 
@@ -313,7 +319,7 @@ function parseRoute(hash: string): Route {
 async function showRoute(): Promise<void> {
   hideSuggest();
   route = parseRoute(location.hash);
-  const nav = route.page === "trending" || route.page === "account" ? route.page : route.page === "home" ? "home" : "";
+  const nav = route.page === "trending" || route.page === "account" || route.page === "discover" ? route.page : route.page === "home" ? "home" : "";
   for (const a of document.querySelectorAll<HTMLAnchorElement>(".nav a")) a.classList.toggle("active", a.dataset.nav === nav);
   if (route.page === "artist") setMode("artist");
   if (route.page === "song" || route.page === "search") setMode("song");
@@ -343,6 +349,8 @@ async function render(): Promise<void> {
         return show(await songPage(route.query, undefined, route.exact));
       case "category":
         return show(await categoryPage(route.name));
+      case "discover":
+        return show(discoverPage(route.profile));
     }
   } catch (e) {
     show(el("div", { class: "card" }, el("p", { class: "error" }, (e as Error).message)));
@@ -506,6 +514,7 @@ interface Account {
   likes: string[];
   categories: { name: string; songs: number }[];
   getSongBpmKey: boolean;
+  soundcloud: boolean;
 }
 
 async function accountPage(): Promise<HTMLElement> {
@@ -544,6 +553,26 @@ async function accountPage(): Promise<HTMLElement> {
   const clearKey = el("button", { type: "button", class: "act" }, "Remove");
   clearKey.addEventListener("click", async () => {
     await post("/api/account/getsongbpm-key", { key: "" });
+    await render();
+  });
+
+  const scId = el("input", { type: "text", placeholder: a.soundcloud ? "•••••••• (saved)" : "Client ID", class: "small-input", autocomplete: "off", spellcheck: "false" }) as HTMLInputElement;
+  const scSecret = el("input", { type: "password", placeholder: a.soundcloud ? "•••••••• (saved)" : "Client secret", class: "small-input", autocomplete: "off" }) as HTMLInputElement;
+  const scMsg = el("span", { class: "small muted" }, a.soundcloud
+    ? "Connected: song pages can find SoundCloud links and remixes."
+    : "Not connected: song links, remix search and Discover are off.");
+  const saveSc = el("button", { type: "button", class: "act" }, "Save");
+  saveSc.addEventListener("click", async () => {
+    try {
+      await post("/api/account/soundcloud", { clientId: scId.value, clientSecret: scSecret.value });
+      await render();
+    } catch (e) {
+      scMsg.textContent = (e as Error).message;
+    }
+  });
+  const clearSc = el("button", { type: "button", class: "act" }, "Disconnect");
+  clearSc.addEventListener("click", async () => {
+    await post("/api/account/soundcloud", { clientId: "", clientSecret: "" });
     await render();
   });
 
@@ -604,6 +633,16 @@ async function accountPage(): Promise<HTMLElement> {
           el("div", { class: "row" }, el("b", {}, "Key & BPM from GetSongBPM"), externalLink("https://getsongbpm.com/api", "Get a free key", "act-link")),
           el("div", { class: "btns", style: "margin-top:8px" }, keyInput, saveKey, a.getSongBpmKey ? clearKey : ""),
           el("div", { style: "margin-top:6px" }, keyMsg),
+        )
+      : "",
+    owner
+      ? el(
+          "div",
+          { class: "card" },
+          el("div", { class: "row" }, el("b", {}, "SoundCloud app"), externalLink("https://soundcloud.com/you/apps", "Your SoundCloud apps", "act-link")),
+          el("div", { class: "muted small" }, "The secret stays on this computer (in data/) and is never shown again or sent to the page."),
+          el("div", { class: "btns", style: "margin-top:8px" }, scId, scSecret, saveSc, a.soundcloud ? clearSc : ""),
+          el("div", { style: "margin-top:6px" }, scMsg),
         )
       : "",
     el(
@@ -875,6 +914,7 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
   }
   page.append(
     categoriesCard(name, r.categories ?? [], r.hints ?? []),
+    soundcloudCard(name),
     el(
       "div",
       { class: "grid" },
@@ -934,7 +974,7 @@ function likeButton(song: string, liked: boolean, after: () => void): HTMLElemen
 /** "Tech House · F#m (4m) · 126 BPM · Find on SoundCloud", with key/BPM filled in when they arrive. */
 function songFacts(song: string, genre: string | undefined): HTMLElement {
   const info = el("span", { class: "muted" }, "looking up key & BPM…");
-  const line = el("div", { class: "small facts" }, genre ? el("b", {}, genre) : "", genre ? " · " : "", info, " · ", externalLink(soundcloudSearch(song), "Find on SoundCloud"));
+  const line = el("div", { class: "small facts" }, genre ? el("b", {}, genre) : "", genre ? " · " : "", info, " · ", externalLink(soundcloudSearch(song), "SoundCloud search ↗"));
   void (async () => {
     let r: SongInfoResult;
     try {
@@ -1002,6 +1042,7 @@ function categoriesCard(song: string, inCategories: string[], hints: { category:
 interface CategoryData {
   name: string;
   songs: string[];
+  links: { url: string; title: string; artist: string }[];
   suggestions: Ranked[];
 }
 
@@ -1017,11 +1058,32 @@ async function categoryPage(name: string): Promise<HTMLElement> {
     });
     songs.append(el("li", {}, el("span", { class: "name" }, songLink(song)), remove));
   }
+  const saved = el("ol", { class: "ranked" });
+  for (const link of r.links) {
+    const remove = el("button", { type: "button", class: "act" }, "Remove");
+    remove.addEventListener("click", async () => {
+      await post("/api/saved-link", { category: r.name, url: link.url, on: false });
+      if (r.songs.length + r.links.length === 1) location.hash = "#/account";
+      else await render();
+    });
+    saved.append(
+      el(
+        "li",
+        {},
+        el("span", { class: "name" }, link.title, el("span", { class: "muted small" }, ` · ${link.artist} on SoundCloud`)),
+        playableButton({ provider: "soundcloud", source: link.url, title: link.title, subtitle: link.artist, pageUrl: link.url }),
+        externalLink(link.url, "Open", "act-link"),
+        remove,
+      ),
+    );
+  }
+  const counts = [r.songs.length ? plural(r.songs.length, "song") : "", r.links.length ? plural(r.links.length, "SoundCloud track") : ""].filter(Boolean).join(" · ");
   return el(
     "div",
     { class: "stack" },
-    pageHead(r.name, `Your category · ${plural(r.songs.length, "song")}`, [homeCrumb(), " › ", el("a", { href: "#/account" }, "Account"), " › Category"]),
-    el("div", { class: "card" }, songs),
+    pageHead(r.name, `Your category · ${counts || "empty"}`, [homeCrumb(), " › ", el("a", { href: "#/account" }, "Account"), " › Category"]),
+    r.songs.length ? el("div", { class: "card" }, songs) : "",
+    r.links.length ? el("div", { class: "card" }, el("h2", {}, "Saved from SoundCloud"), saved) : "",
     rankedCard(`Might fit “${r.name}”`, r.suggestions, "shared set", "Add a few more songs, or gather more sets, to get suggestions.", {
       linkTo: "song",
       action: (item) => {
@@ -1034,6 +1096,338 @@ async function categoryPage(name: string): Promise<HTMLElement> {
       },
     }),
   );
+}
+
+// ---- SoundCloud ----
+// Results come live from SoundCloud and aren't stored, except what you confirm (a song's
+// link) or save (into a category). SoundCloud plays/likes are SoundCloud's numbers, kept
+// apart from setscope's own counts of DJ-set plays.
+
+interface ScTrackJson {
+  urn: string;
+  title: string;
+  uploader: string;
+  uploaderUrl?: string;
+  url: string;
+  genre: string | null;
+  durationMs: number;
+  plays: number | null;
+  likes: number | null;
+  access: "playable" | "preview" | "blocked";
+  embeddable: boolean;
+  artwork: string | null;
+}
+
+interface ScCandidate extends ScTrackJson {
+  kind: "this" | "version" | "related";
+  confidence: number;
+  reason: string;
+  versionType: string;
+  versionArtists: string | null;
+}
+
+interface SongLinkJson {
+  url: string;
+  externalId: string | null;
+  confidence: number;
+  provenance: "source_page" | "user" | "search_match";
+  addedBy: string | null;
+  removable?: boolean;
+}
+
+const KIND_LABEL: Record<ScCandidate["kind"], string> = { this: "This song", version: "Another version", related: "Related upload" };
+
+function compact(n: number): string {
+  return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(n);
+}
+
+function duration(ms: number): string {
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/** One SoundCloud upload: title, uploader, SoundCloud's numbers, and Play / Open / Save. */
+function scTrackRow(t: ScTrackJson, ...extra: (Node | string)[]): HTMLElement {
+  const playable = t.access !== "blocked" && t.embeddable;
+  const facts = [
+    t.genre ?? "no genre tag",
+    t.durationMs ? duration(t.durationMs) : "",
+    t.access === "preview" ? "preview only" : t.access === "blocked" ? "not streamable here" : "",
+    t.plays !== null ? `${compact(t.plays)} SoundCloud plays` : "",
+  ].filter(Boolean);
+  return el(
+    "li",
+    {},
+    el(
+      "span",
+      { class: "name" },
+      t.title,
+      el("div", { class: "muted small" }, "by ", t.uploaderUrl ? externalLink(t.uploaderUrl, t.uploader) : t.uploader, ` · ${facts.join(" · ")}`),
+    ),
+    ...extra,
+    playable ? playableButton({ provider: "soundcloud", source: t.url, title: t.title, subtitle: t.uploader, pageUrl: t.url }) : "",
+    externalLink(t.url, "Open on SoundCloud", "act-link"),
+    auth.user ? saveToCategory(t.url) : "",
+  );
+}
+
+/** "Save…" → pick or type one of your categories. */
+function saveToCategory(url: string): HTMLElement {
+  const wrap = el("span", { class: "btns" });
+  const open = el("button", { type: "button", class: "act" }, "Save…");
+  open.addEventListener("click", () => {
+    const input = el("input", { type: "text", placeholder: "Category", list: "scCategoryNames", class: "small-input" }) as HTMLInputElement;
+    const save = el("button", { type: "button", class: "act" }, "Save");
+    const names = el("datalist", { id: "scCategoryNames" }, ...me.categories.map((c) => el("option", { value: c.name })));
+    const submit = async () => {
+      const category = input.value.trim();
+      if (!category) return;
+      save.textContent = "Saving…";
+      try {
+        await post("/api/saved-link", { category, url, on: true });
+        await loadMe();
+        wrap.replaceChildren(el("span", { class: "small muted" }, "Saved to "), el("a", { class: "link small", href: categoryHash(category) }, category));
+      } catch (e) {
+        wrap.replaceChildren(el("span", { class: "small error" }, (e as Error).message));
+      }
+    };
+    save.addEventListener("click", () => void submit());
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") void submit();
+    });
+    wrap.replaceChildren(input, names, save);
+    input.focus();
+  });
+  wrap.append(open);
+  return wrap;
+}
+
+/** The song's SoundCloud links, finding and confirming one, and remix search. */
+function soundcloudCard(song: string): HTMLElement {
+  const card = el("div", { class: "card" }, el("h2", {}, "On SoundCloud"), el("p", { class: "muted small" }, "Loading…"));
+  void (async () => {
+    let data: { links: SongLinkJson[]; soundcloud: boolean };
+    try {
+      data = await getJson(`/api/song-links?song=${enc(song)}`);
+    } catch (e) {
+      card.replaceChildren(el("h2", {}, "On SoundCloud"), el("p", { class: "error small" }, (e as Error).message));
+      return;
+    }
+    const linked = el("ol", { class: "ranked" });
+    for (const link of data.links) {
+      const how = link.provenance === "user" ? "pasted" : link.provenance === "search_match" ? `picked from search (${Math.round(link.confidence * 100)}% match)` : "from 1001Tracklists";
+      const remove = el("button", { type: "button", class: "act" }, "Remove");
+      remove.addEventListener("click", async () => {
+        await post("/api/song-links/remove", { song, url: link.url });
+        await render();
+      });
+      linked.append(
+        el(
+          "li",
+          {},
+          el("span", { class: "name" }, externalLink(link.url, link.url.replace("https://soundcloud.com/", "")), el("div", { class: "muted small" }, `${how}${link.addedBy ? ` by ${link.addedBy}` : ""}`)),
+          playableButton({ provider: "soundcloud", source: link.url, title: song, subtitle: "SoundCloud", pageUrl: link.url }),
+          link.removable ? remove : "",
+        ),
+      );
+    }
+    const parts: (Node | string)[] = [el("h2", {}, "On SoundCloud")];
+    parts.push(data.links.length ? linked : el("p", { class: "muted small" }, "No SoundCloud link confirmed for this song yet."));
+    if (!data.soundcloud) {
+      parts.push(
+        el(
+          "p",
+          { class: "muted small" },
+          "SoundCloud search isn't connected",
+          ...(auth.user?.owner ? [" (", el("a", { class: "link", href: "#/account" }, "connect it on Account"), ")"] : []),
+          ". You can still ",
+          externalLink(soundcloudSearch(song), "search SoundCloud yourself"),
+          ".",
+        ),
+      );
+    } else if (!auth.user) {
+      parts.push(el("p", { class: "muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to find this song and its remixes on SoundCloud."));
+    } else {
+      parts.push(findCandidates(song), remixSearch(song));
+    }
+    card.replaceChildren(...parts);
+  })();
+  return card;
+}
+
+/** "Find on SoundCloud": candidates sorted into this song / another version / related. */
+function findCandidates(song: string): HTMLElement {
+  const box = el("div", { class: "sc-find" });
+  const find = el("button", { type: "button", class: "act" }, "Find on SoundCloud");
+  const paste = el("input", { type: "text", placeholder: "…or paste a soundcloud.com track link", class: "small-input", style: "width:280px" }) as HTMLInputElement;
+  const pasteBtn = el("button", { type: "button", class: "act" }, "Link it");
+  const msg = el("span", { class: "small muted" });
+  const results = el("div", {});
+
+  const confirm = async (url: string, from: "search" | "pasted", button: HTMLElement) => {
+    button.textContent = "Linking…";
+    try {
+      await post("/api/song-links", { song, url, from });
+      await render();
+    } catch (e) {
+      msg.textContent = (e as Error).message;
+      msg.className = "small error";
+      button.textContent = from === "pasted" ? "Link it" : "Use as this song's link";
+    }
+  };
+  pasteBtn.addEventListener("click", () => {
+    if (paste.value.trim()) void confirm(paste.value.trim(), "pasted", pasteBtn);
+  });
+
+  find.addEventListener("click", async () => {
+    find.textContent = "Searching…";
+    try {
+      const { candidates } = await getJson<{ candidates: ScCandidate[] }>(`/api/soundcloud/candidates?song=${enc(song)}`);
+      results.replaceChildren();
+      if (!candidates.length) results.append(el("p", { class: "muted small" }, "Nothing on SoundCloud looks like this song. Paste a link if you know one."));
+      for (const kind of ["this", "version", "related"] as const) {
+        const group = candidates.filter((c) => c.kind === kind);
+        if (!group.length) continue;
+        const list = el("ol", { class: "ranked sc-list" });
+        for (const c of group) {
+          const use = el("button", { type: "button", class: kind === "this" ? "act primary" : "act" }, "Use as this song's link");
+          use.addEventListener("click", () => void confirm(c.url, "search", use));
+          list.append(scTrackRow(c, el("span", { class: "small muted", title: c.reason }, `${Math.round(c.confidence * 100)}%`), use));
+        }
+        results.append(el("h3", {}, KIND_LABEL[kind], el("span", { class: "muted small" }, ` · ${group.length}`)), list);
+      }
+      find.textContent = "Search again";
+    } catch (e) {
+      find.textContent = "Find on SoundCloud";
+      msg.textContent = (e as Error).message;
+      msg.className = "small error";
+    }
+  });
+  box.append(
+    el("div", { class: "btns", style: "margin-top:8px" }, find, paste, pasteBtn, msg),
+    el("div", { class: "muted small" }, "Matches are guesses from titles and uploaders: nothing is linked until you pick one."),
+    results,
+  );
+  return box;
+}
+
+/** Remixes, edits and bootlegs of the song on SoundCloud, with filters and Load more. */
+function remixSearch(song: string): HTMLElement {
+  const genres = el("input", { type: "text", placeholder: "Genres, e.g. House, Techno, Unknown", class: "small-input", style: "width:240px" }) as HTMLInputElement;
+  const remixer = el("input", { type: "text", placeholder: "Remixer", class: "small-input", style: "width:140px" }) as HTMLInputElement;
+  const sort = el("select", {}, el("option", { value: "relevance" }, "Sort: SoundCloud relevance"), el("option", { value: "plays" }, "Sort: SoundCloud plays")) as HTMLSelectElement;
+  const go = el("button", { type: "button", class: "act" }, "Search remixes");
+  const more = el("button", { type: "button", class: "act" }, "Load more");
+  more.hidden = true;
+  const msg = el("div", { class: "small muted" });
+  const list = el("ol", { class: "ranked sc-list" });
+  let found: ScCandidate[] = [];
+  let next: string | null = null;
+  let scanned = 0;
+
+  const draw = () => {
+    const shown = sort.value === "plays" ? [...found].sort((a, b) => (b.plays ?? -1) - (a.plays ?? -1)) : found;
+    list.replaceChildren(...shown.map((c) => scTrackRow(c, el("span", { class: "small muted", title: c.reason }, c.versionArtists ? `${c.versionType} by ${c.versionArtists}` : c.versionType))));
+    more.hidden = !next;
+    msg.textContent = found.length
+      ? `${plural(found.length, "version")} found in ${scanned} SoundCloud results${sort.value === "plays" ? " (sorted by SoundCloud plays, among those loaded)" : ""}.`
+      : `No remixes found in ${scanned} SoundCloud results${next ? ". Try Load more." : "."}`;
+  };
+  const load = async (fresh: boolean) => {
+    const button = fresh ? go : more;
+    const label = button.textContent;
+    button.textContent = "Searching…";
+    try {
+      const params = new URLSearchParams({ song });
+      if (genres.value.trim()) params.set("genres", genres.value);
+      if (remixer.value.trim()) params.set("remixer", remixer.value.trim());
+      if (!fresh && next) params.set("cursor", next);
+      const r = await getJson<{ remixes: ScCandidate[]; next: string | null; scanned: number }>(`/api/soundcloud/remixes?${params}`);
+      if (fresh) {
+        found = [];
+        scanned = 0;
+      }
+      const seen = new Set(found.map((c) => c.urn));
+      found.push(...r.remixes.filter((c) => !seen.has(c.urn)));
+      scanned += r.scanned;
+      next = r.next;
+      draw();
+    } catch (e) {
+      msg.textContent = (e as Error).message;
+      msg.className = "small error";
+    }
+    button.textContent = label;
+  };
+  go.addEventListener("click", () => void load(true));
+  more.addEventListener("click", () => void load(false));
+  sort.addEventListener("change", draw);
+  return el(
+    "details",
+    { class: "sc-remixes" },
+    el("summary", {}, el("b", {}, "Remixes & edits on SoundCloud")),
+    el("div", { class: "btns", style: "margin-top:8px" }, genres, remixer, sort, go),
+    el("div", { class: "muted small" }, "Genres are the uploader's own tags; “Unknown” finds uploads without one."),
+    msg,
+    list,
+    more,
+  );
+}
+
+/** Discover: the public likes of a SoundCloud curator (a DJ, a label, a friend). */
+function discoverPage(profile: string | undefined): HTMLElement {
+  const input = el("input", { type: "text", placeholder: "SoundCloud profile name or link", value: profile ?? "", style: "flex:1; min-width:200px" }) as HTMLInputElement;
+  const go = el("button", { type: "button", class: "primary" }, "Show likes");
+  const body = el("div", {});
+  const submit = () => {
+    const name = input.value.trim().replace(/^https?:\/\/(www\.)?soundcloud\.com\//, "").replace(/\/.*$/, "");
+    if (name) location.hash = `#/discover/${enc(name)}`;
+  };
+  go.addEventListener("click", submit);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submit();
+  });
+  const page = el(
+    "div",
+    { class: "stack" },
+    pageHead("Discover", "What a SoundCloud curator has liked lately, live from SoundCloud", [homeCrumb(), " › Discover"]),
+    el("div", { class: "card" }, el("div", { class: "row" }, input, go), el("div", { class: "muted small", style: "margin-top:6px" }, "Only public likes. Nothing here is stored unless you save it to a category.")),
+    body,
+  );
+  if (!auth.user) {
+    body.replaceChildren(el("div", { class: "card muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to browse SoundCloud likes."));
+    return page;
+  }
+  if (!profile) return page;
+
+  const list = el("ol", { class: "ranked sc-list" });
+  const more = el("button", { type: "button", class: "act" }, "Load more");
+  const card = el("div", { class: "card" }, el("p", { class: "muted small" }, "Loading…"));
+  body.replaceChildren(card);
+  let next: string | null = null;
+  const load = async (cursor?: string) => {
+    more.textContent = "Loading…";
+    try {
+      const r = await getJson<{ user: { username: string; permalink: string; avatar?: string }; tracks: ScTrackJson[]; next: string | null }>(
+        `/api/soundcloud/likes?profile=${enc(profile)}${cursor ? `&cursor=${enc(cursor)}` : ""}`,
+      );
+      list.append(...r.tracks.map((t) => scTrackRow(t)));
+      next = r.next;
+      more.hidden = !next;
+      card.replaceChildren(
+        el("div", { class: "row" }, el("h2", {}, "Liked by ", externalLink(r.user.permalink, r.user.username)), el("span", { class: "muted small" }, `${plural(list.children.length, "track")} loaded`)),
+        list.children.length ? list : el("p", { class: "muted small" }, "No public likes."),
+        more,
+      );
+    } catch (e) {
+      card.replaceChildren(el("p", { class: "error small" }, (e as Error).message));
+    }
+    more.textContent = "Load more";
+  };
+  more.addEventListener("click", () => {
+    if (next) void load(next);
+  });
+  void load();
+  return page;
 }
 
 // ---- opening 1001Tracklists ----

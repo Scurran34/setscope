@@ -18,6 +18,12 @@
 //   POST /api/capture  /api/capture-set   from the browser extension
 //   POST /api/add-links /api/resume /api/clear-queue /api/include-older /api/retry-failed (needs login)
 //   POST /api/refresh-set { url }        re-read a set now (needs login)
+//   GET  /api/song-links?song=           confirmed SoundCloud links for a song
+//   POST /api/song-links  /api/song-links/remove        confirm (or remove) one (needs login)
+//   GET  /api/soundcloud/candidates?song=  /api/soundcloud/remixes?song=  /api/soundcloud/likes?profile=
+//                                        live SoundCloud searches, not stored (needs login)
+//   POST /api/saved-link                 save a SoundCloud upload in a category (needs login)
+//   POST /api/account/soundcloud         the SoundCloud app's credentials (owner)
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import type pg from "pg";
@@ -47,6 +53,10 @@ import { BackgroundCollector } from "./source/background.ts";
 import { isFetchAllowed, PoliteFetcher } from "./source/fetcher.ts";
 import { extractTracklistUrls } from "./source/parse.ts";
 import { SongInfoService, SongInfoStore } from "./source/songinfo.ts";
+import { ScError, ScRateLimited, SoundCloudClient, type ScTrack } from "./soundcloud/client.ts";
+import { isTrackLink, LinkStore } from "./soundcloud/links.ts";
+import { classify, remixesOf, songCandidates, type Candidate } from "./soundcloud/match.ts";
+import { versionOf } from "./catalog/identity.ts";
 
 export const PORT = Number(process.env.SETSCOPE_PORT ?? 7331);
 const WEB_DIR = join(import.meta.dirname, "..", "web");
@@ -70,6 +80,14 @@ export interface App {
   since: string;
   /** Slows down floods of captures / pasted links (per account, or per address without one). */
   captureLimit: RateLimiter;
+  soundcloud: SoundCloudClient;
+  links: LinkStore;
+  /** Where the SoundCloud app's credentials are saved when the owner sets them. */
+  soundcloudFile: string | undefined;
+  /** SoundCloud searches per account, so one person can't use up the app's hourly allowance. */
+  soundcloudLimit: RateLimiter;
+  /** Likes lookups for the whole site: SoundCloud allows the app 500 a day. */
+  likesLimit: RateLimiter;
 }
 
 export interface AppDeps {
@@ -87,6 +105,10 @@ export interface AppOptions {
   keyFile?: string;
   legacyUserFile?: string;
   secureCookies?: boolean;
+  soundcloud?: SoundCloudClient;
+  soundcloudFile?: string;
+  soundcloudLimit?: RateLimiter;
+  likesLimit?: RateLimiter;
 }
 
 /** Thrown for bad input; becomes a 400 with the message shown in the page. */
@@ -114,13 +136,18 @@ export function createApp({ pool, catalog, queue, accounts, userData }: AppDeps,
     legacyUserFile: options.legacyUserFile,
     secureCookies: options.secureCookies ?? false,
     since: sinceMonths(),
+    soundcloud: options.soundcloud ?? new SoundCloudClient(),
+    links: new LinkStore(pool),
+    soundcloudFile: options.soundcloudFile,
+    soundcloudLimit: options.soundcloudLimit ?? new RateLimiter(120, 10 * 60_000),
+    likesLimit: options.likesLimit ?? new RateLimiter(400, 24 * 60 * 60_000),
   };
   return createServer((req, res) => {
     if (req.url?.startsWith("/api/") && req.url !== "/api/status") {
       res.on("finish", () => console.log(`${req.method} ${req.url} -> ${res.statusCode}`));
     }
     handle(app, req, res).catch((error: unknown) => {
-      const status = error instanceof NotAllowed ? error.status : error instanceof BadRequest ? 400 : 500;
+      const status = error instanceof NotAllowed ? error.status : error instanceof ScRateLimited ? 429 : error instanceof BadRequest || error instanceof ScError ? 400 : 500;
       if (status === 500) console.error(error);
       sendJson(res, status, { error: error instanceof Error ? error.message : String(error) });
     });
@@ -286,7 +313,8 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       if (!category) return sendJson(res, 404, { error: `No category called "${name}"` });
       const since = sinceMonths(intParam(params, "months", DEFAULT_MONTHS));
       const members = new Set(Object.keys(category.songs));
-      return sendJson(res, 200, { name: category.name, songs: Object.values(category.songs), suggestions: songsLike(await app.catalog.all(), members, since) });
+      const links = (await app.links.saved(u.id))[normalizeName(name)]?.links ?? [];
+      return sendJson(res, 200, { name: category.name, songs: Object.values(category.songs), links, suggestions: songsLike(await app.catalog.all(), members, since) });
     }
     case "GET /api/account": {
       const u = needUser("see your account");
@@ -301,6 +329,7 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
         likes: Object.values(likes),
         categories: Object.values(categories).map((c) => ({ name: c.name, songs: Object.values(c.songs).length })),
         getSongBpmKey: app.songInfo.hasKey(),
+        soundcloud: app.soundcloud.configured(),
       });
     }
 
@@ -316,6 +345,22 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       if (app.keyFile) writeFileSync(app.keyFile, key ? `${key}\n` : "");
       return sendJson(res, 200, { getSongBpmKey: Boolean(key) });
     }
+    case "POST /api/account/soundcloud": {
+      requireOwnHeader(req);
+      await needOwner("connect SoundCloud");
+      const body = (await readJson(req)) as { clientId?: unknown; clientSecret?: unknown };
+      if (typeof body.clientId !== "string" || typeof body.clientSecret !== "string") throw new BadRequest("Expected { clientId, clientSecret }");
+      const clientId = body.clientId.trim();
+      const clientSecret = body.clientSecret.trim();
+      if (Boolean(clientId) !== Boolean(clientSecret)) throw new BadRequest("Enter both the client ID and the client secret (or neither, to disconnect).");
+      if (clientId && (!/^[A-Za-z0-9_-]{8,128}$/.test(clientId) || !/^[A-Za-z0-9_-]{8,128}$/.test(clientSecret))) {
+        throw new BadRequest("Those don't look like SoundCloud app credentials.");
+      }
+      app.soundcloud.setCredentials(clientId || undefined, clientSecret || undefined);
+      // The secret stays on this machine (data/, readable only by you) and is never sent back to the page.
+      if (app.soundcloudFile) writeFileSync(app.soundcloudFile, clientId ? JSON.stringify({ clientId, clientSecret }) : "{}", { mode: 0o600 });
+      return sendJson(res, 200, { soundcloud: app.soundcloud.configured() });
+    }
     case "POST /api/background": {
       requireOwnHeader(req);
       await needOwner("turn background collecting on or off");
@@ -324,6 +369,106 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       if (!app.background) throw new BadRequest("Background collecting isn't available here.");
       app.background.setEnabled(body.enabled);
       return sendJson(res, 200, await app.background.status());
+    }
+
+    // ---- SoundCloud ----
+    case "GET /api/song-links": {
+      const song = songParam(params);
+      const viewer = user ? { id: user.id, owner: await app.accounts.isOwner(user.id) } : undefined;
+      return sendJson(res, 200, { links: await app.links.forSong(song, viewer), soundcloud: app.soundcloud.configured() });
+    }
+    case "POST /api/song-links": {
+      requireOwnHeader(req);
+      const u = needUser("link songs to SoundCloud");
+      const body = (await readJson(req)) as { song?: unknown; url?: unknown; from?: unknown };
+      if (typeof body.song !== "string" || typeof body.url !== "string" || (body.from !== "search" && body.from !== "pasted")) {
+        throw new BadRequest('Expected { song, url, from: "search" | "pasted" }');
+      }
+      if (!isTrackLink(body.url)) throw new BadRequest("That isn't a SoundCloud track link (https://soundcloud.com/artist/track).");
+      limitSoundCloud(app, u);
+      // Look the link up so we store SoundCloud's own id and a real link, never something made up.
+      const found = await app.soundcloud.resolve(body.url);
+      if (found.kind !== "track") throw new BadRequest("That link is a profile, not a track.");
+      const song = body.song;
+      const match = classify(trackFromName(song), found.track);
+      await userAction(() =>
+        app.links.addSongLink(u.id, song, {
+          url: found.track.permalink || body.url as string,
+          externalId: found.track.urn,
+          confidence: body.from === "pasted" ? 1 : (match?.confidence ?? 0.2),
+          provenance: body.from === "pasted" ? "user" : "search_match",
+        }),
+      );
+      return sendJson(res, 200, { links: await app.links.forSong(song, { id: u.id, owner: await app.accounts.isOwner(u.id) }), track: found.track, match: match?.kind ?? null });
+    }
+    case "POST /api/song-links/remove": {
+      requireOwnHeader(req);
+      const u = needUser("remove song links");
+      const body = (await readJson(req)) as { song?: unknown; url?: unknown };
+      if (typeof body.song !== "string" || typeof body.url !== "string") throw new BadRequest("Expected { song, url }");
+      const viewer = { id: u.id, owner: await app.accounts.isOwner(u.id) };
+      const song = body.song;
+      const url = body.url;
+      let removed = false;
+      await userAction(async () => void (removed = await app.links.removeSongLink(viewer, song, url)));
+      if (!removed) throw new NotAllowed("Only whoever added a link (or the site owner) can remove it.", 403);
+      return sendJson(res, 200, { links: await app.links.forSong(song, viewer) });
+    }
+    case "GET /api/soundcloud/candidates": {
+      const u = needUser("search SoundCloud");
+      const song = songParam(params);
+      limitSoundCloud(app, u);
+      const track = trackFromName(song);
+      const page = await app.soundcloud.searchTracks({ q: searchWords(`${track.artist} ${track.title}`), limit: 50 });
+      return sendJson(res, 200, { candidates: songCandidates(track, page.items).slice(0, 20).map(candidateJson) });
+    }
+    case "GET /api/soundcloud/remixes": {
+      const u = needUser("search SoundCloud");
+      const song = songParam(params);
+      limitSoundCloud(app, u);
+      const track = trackFromName(song);
+      const genres = (params.get("genres") ?? "").split(",").map((g) => g.trim()).filter(Boolean).slice(0, 10);
+      // "Unknown" (no genre tag) can't be asked of SoundCloud, so then we filter here instead.
+      const askGenres = genres.length && !genres.some((g) => g.toLowerCase() === "unknown") ? genres : undefined;
+      const searchOptions: { q: string; limit: number; genres?: string[]; cursor?: string } = { q: searchWords(`${track.artist} ${versionOf(track.title).base}`), limit: 100 };
+      if (askGenres) searchOptions.genres = askGenres;
+      const cursor = params.get("cursor");
+      if (cursor) searchOptions.cursor = cursor;
+      const page = await app.soundcloud.searchTracks(searchOptions);
+      const filters: { remixer?: string; genres?: string[] } = {};
+      const remixer = params.get("remixer")?.trim();
+      if (remixer) filters.remixer = remixer;
+      if (genres.length) filters.genres = genres;
+      return sendJson(res, 200, { remixes: remixesOf(track, page.items, filters).map(candidateJson), next: page.next ?? null, scanned: page.items.length });
+    }
+    case "GET /api/soundcloud/likes": {
+      const u = needUser("browse SoundCloud likes");
+      const profile = required(params, "profile");
+      limitSoundCloud(app, u);
+      if (!app.likesLimit.take("site")) throw new NotAllowed("SoundCloud only allows a limited number of likes lookups a day, and today's are used up. Try again tomorrow.", 429);
+      const curator = await app.soundcloud.user(profile);
+      const page = await app.soundcloud.userLikes(curator.urn, params.get("cursor") ?? undefined);
+      return sendJson(res, 200, { user: curator, tracks: page.items.map(trackJson), next: page.next ?? null });
+    }
+    case "POST /api/saved-link": {
+      requireOwnHeader(req);
+      const u = needUser("save SoundCloud tracks");
+      const body = (await readJson(req)) as { category?: unknown; url?: unknown; on?: unknown };
+      if (typeof body.category !== "string" || typeof body.url !== "string" || typeof body.on !== "boolean") {
+        throw new BadRequest("Expected { category, url, on }");
+      }
+      if (!isTrackLink(body.url)) throw new BadRequest("That isn't a SoundCloud track link.");
+      const { category, url, on } = body as { category: string; url: string; on: boolean };
+      let saved = { url, title: "", artist: "" };
+      if (on) {
+        // Title and uploader as SoundCloud shows them, looked up rather than taken from the page.
+        limitSoundCloud(app, u);
+        const found = await app.soundcloud.resolve(url);
+        if (found.kind !== "track") throw new BadRequest("That link is a profile, not a track.");
+        saved = { url: found.track.permalink || url, title: found.track.title, artist: found.track.uploader };
+      }
+      await userAction(() => app.links.setSaved(u.id, category, saved, on));
+      return sendJson(res, 200, { ok: true });
     }
 
     // ---- collecting ----
@@ -419,6 +564,45 @@ async function withUserData(app: App, user: User | undefined, report: SongReport
     categories: all.filter((c) => key in c.songs).map((c) => c.name),
     hints: categoryHints(sets, key, all, report.since),
   };
+}
+
+/** "Artist - Title" from ?song=. */
+function songParam(params: URLSearchParams): string {
+  const song = required(params, "song");
+  if (!song.includes(" - ")) throw new BadRequest('Expected "Artist - Title"');
+  return song;
+}
+
+/** Search words from a song name: brackets and punctuation SoundCloud's search doesn't need. */
+function searchWords(text: string): string {
+  return text.replace(/[()[\]]/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+}
+
+function limitSoundCloud(app: App, user: User): void {
+  if (!app.soundcloudLimit.take(`user:${user.id}`)) throw new NotAllowed("That's a lot of SoundCloud searches in a short time. Wait a few minutes and try again.", 429);
+}
+
+/** What the page needs about an upload (SoundCloud's own fields, as SoundCloud gave them). */
+function trackJson(t: ScTrack) {
+  return {
+    urn: t.urn,
+    title: t.title,
+    uploader: t.uploader,
+    uploaderUrl: t.uploaderUrl,
+    url: t.permalink,
+    genre: t.genre ?? null,
+    durationMs: t.durationMs,
+    plays: t.plays ?? null,
+    likes: t.likes ?? null,
+    access: t.access,
+    embeddable: t.embeddable,
+    artwork: t.artwork ?? null,
+    createdAt: t.createdAt ?? null,
+  };
+}
+
+function candidateJson(c: Candidate) {
+  return { ...trackJson(c.track), kind: c.kind, confidence: c.confidence, reason: c.reason, versionType: c.read.versionType, versionArtists: c.read.versionArtists ?? null };
 }
 
 /** At most 30 captures / pasted lists / refresh requests per 10 minutes per account (or address). */
@@ -544,6 +728,15 @@ if (import.meta.main) {
   const keyFile = join(dir, "getsongbpm-key");
   const apiKey = process.env.SETSCOPE_GETSONGBPM_KEY ?? (existsSync(keyFile) ? readFileSync(keyFile, "utf8").trim() : undefined);
   const songInfo = new SongInfoService(new SongInfoStore(join(dir, "songinfo.json")), { apiKey: apiKey || undefined, baseUrl: process.env.SETSCOPE_GETSONGBPM_URL });
+  // SoundCloud app credentials: SOUNDCLOUD_CLIENT_ID / SOUNDCLOUD_CLIENT_SECRET, or data/soundcloud.json
+  // (set from the Account page; kept out of git with data/).
+  const soundcloudFile = join(dir, "soundcloud.json");
+  const savedSc = existsSync(soundcloudFile) ? (JSON.parse(readFileSync(soundcloudFile, "utf8") || "{}") as { clientId?: string; clientSecret?: string }) : {};
+  const soundcloud = new SoundCloudClient({
+    clientId: process.env.SOUNDCLOUD_CLIENT_ID ?? savedSc.clientId,
+    clientSecret: process.env.SOUNDCLOUD_CLIENT_SECRET ?? savedSc.clientSecret,
+    tokenFile: join(dir, "soundcloud-token.json"),
+  });
   const background = new BackgroundCollector(catalog, queue, fetcher, { saveFile: join(dir, "background.json"), since: () => sinceMonths() });
   setInterval(() => void background.tick(), 15_000);
 
@@ -552,10 +745,13 @@ if (import.meta.main) {
     background,
     keyFile,
     legacyUserFile: join(dir, "user.json"),
+    soundcloud,
+    soundcloudFile,
     secureCookies: process.env.SETSCOPE_SECURE_COOKIES === "1",
   });
   app.listen(PORT, "127.0.0.1", () => {
     console.log(`setscope is running at http://127.0.0.1:${PORT}  (Ctrl+C to stop)`);
     if (!apiKey) console.log("No GetSongBPM key yet: song pages won't show key/BPM. See README.");
+    if (!soundcloud.configured()) console.log("SoundCloud isn't connected yet: song links and remix search are off. See README.");
   });
 }

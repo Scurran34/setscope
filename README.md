@@ -56,7 +56,7 @@ deleted by the import, so rolling back to the file version is just checking out 
 |---|---|
 | `artists`: name, 1001Tracklists page, country, picture, links | `users`, `sessions` |
 | `tracks`: one row per recording, see identity rules below | `user_likes` |
-| `track_artists`: main artists and remixers | `collections`, `collection_tracks` (your categories) |
+| `track_artists`: main artists and remixers | `collections`, `collection_tracks`, `collection_links` (your categories, and SoundCloud uploads saved in them) |
 | `sets`, `set_djs`, `set_tracks` (ordered, exactly as the source wrote each line, with its genre tag) | `followed_artists`, `vault_entries` (used in later stages) |
 | `set_pages`: the page each set was read from, for re-parsing | |
 | `track_metadata_history`: what changed when a set was re-read | |
@@ -151,8 +151,8 @@ setscope only sends it play/pause/seek/volume commands, and never downloads or p
 strip stays visible under the bar, and the bar credits the uploader and SoundCloud with links to the
 track, as SoundCloud's terms ask for custom players. If a recording can't be embedded (private, removed,
 or the uploader disallows it), the bar says so and links to the set page. If playback stalls at 0:00 for
-12 seconds, it offers to open the track on SoundCloud. Songs (as opposed to sets) don't have SoundCloud
-links yet; that comes with the SoundCloud integration in the next stage.
+12 seconds, it offers to open the track on SoundCloud. Songs play the same way once they have a
+SoundCloud link (next section).
 
 The player has three layers in `web/player.ts`: `PlayerCore` (state, no page code, unit tested), a
 `PlaybackProvider` per service (`SoundCloudProvider` today), and the bar. Adding another service means
@@ -199,6 +199,44 @@ page (new and featured sets), so reports and trending have more to work with, wi
 - any sign of a block pauses it for 24 hours. It never retries early or works around it.
 
 Its state (on/off, today's count, the sets still to fetch) is saved in `data/background.json`.
+
+### SoundCloud: song links, remixes, Discover
+
+With a SoundCloud app connected (below), signed-in people get:
+
+- **Song links.** A song page's "On SoundCloud" card has **Find on SoundCloud**, which searches
+  SoundCloud and sorts what comes back into **This song**, **Another version** (a remix, edit,
+  bootleg...) and **Related upload** (same title, someone else), each with a match percentage and the
+  reason ("same title, artist and version"). Matches are guesses from titles and uploaders, so nothing
+  is linked until someone picks **Use as this song's link** or pastes a soundcloud.com link. Links
+  are shared: everyone sees them, with who confirmed them; only that person (or the owner) can remove
+  one. setscope looks every link up on SoundCloud before saving it and stores only the link,
+  SoundCloud's id for it, how it was matched, and who confirmed it.
+- **Remix search.** "Remixes & edits on SoundCloud" lists versions of the song (of its original, if the
+  song is itself a remix), with filters for genre (the uploader's own tag; "Unknown" means none) and
+  remixer, sorting by SoundCloud's relevance or by SoundCloud plays, and **Load more**.
+- **Discover.** Type a SoundCloud profile (a DJ, a label, a friend) to see their public likes.
+- **Save.** Any SoundCloud upload can be saved into one of your categories; the category page lists
+  and plays it.
+
+Search results and likes come live from SoundCloud and are not stored (SoundCloud's terms allow
+keeping references, not their catalog). SoundCloud plays and likes are always labelled as SoundCloud's
+numbers, separate from setscope's counts of DJ-set plays. Uploads that are preview-only say so; ones
+that can't be streamed here only get an "Open on SoundCloud" link.
+
+**Connecting it** (owner): create an app at [soundcloud.com/you/apps](https://soundcloud.com/you/apps)
+(needs an Artist Pro plan), then paste its client ID and secret into **Account → SoundCloud app**. They're
+saved in `data/soundcloud.json` (readable only by you, never committed, and the secret is never sent
+back to the page). Or set `SOUNDCLOUD_CLIENT_ID` and `SOUNDCLOUD_CLIENT_SECRET` before `npm run web`.
+
+Staying inside SoundCloud's limits (`src/soundcloud/client.ts`):
+
+- One access token is reused until it expires, then refreshed, and kept in `data/soundcloud-token.json`
+  so restarts don't ask for another (SoundCloud allows an app 50 new tokens per 12 hours).
+- Answers are kept in memory for 10 minutes, so reopening a page doesn't search again.
+- Each account can make 120 SoundCloud requests per 10 minutes, and the whole site 400 likes lookups a
+  day (SoundCloud allows 500). When SoundCloud says to slow down (HTTP 429), the page says how long.
+- "Load more" only follows paging links that point at `api.soundcloud.com`.
 
 ### Key and BPM (GetSongBPM)
 
@@ -318,6 +356,10 @@ src/
     import-legacy.ts  copies the old file cache into the catalog
   auth/accounts.ts    sign-up (owner first, then invite-only), passwords, sessions
   personal/user-data.ts   one account's likes and categories
+  soundcloud/
+    client.ts         SoundCloud API: token reuse/refresh, search, resolve, likes, 429s
+    match.ts          is an upload this song, another version, or just related?
+    links.ts          confirmed song links and uploads saved into categories
   collect/            the collection system
     jobs.ts           the job queue in Postgres: dedupe, newest first, retries, pause, recovery, refreshes
     discovery.ts      what each DJ/track page gathering found ("Last gathered")
