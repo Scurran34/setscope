@@ -13,6 +13,7 @@ export function normalizeName(s: string): string {
     .toLowerCase()
     .replace(/\bfeat\.?\s/g, "ft. ")
     .replace(/\bft\s/g, "ft. ")
+    .replace(/['’`´.]/g, "") // "L.P. Rhythm" -> "lp rhythm", "Feelin'" -> "feelin"
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -78,14 +79,30 @@ export function creditsArtist(track: Track, artist: string): boolean {
   return creditedArtists(track).some((a) => normalizeName(a) === target);
 }
 
+// "(Extended Mix)", "(Original Mix)", "(Radio Edit)" are the same song for our purposes.
+// Remixes by someone else, like "(Fisher Remix)", are not, so they're left alone.
+const VERSION_SUFFIX = /\s*\((?:extended|original|radio|club|dub)(?: mix| edit| version)?\)\s*$/i;
+
+/** Normalized title without version tags: "Friction (Extended Mix)" -> "friction". */
+export function baseTitle(title: string): string {
+  return normalizeName(title.replace(VERSION_SUFFIX, ""));
+}
+
+/** One way of reading "X - Y": who the user named, and the title. */
+interface SongGuess {
+  artists: string[];
+  title: string;
+}
+
 /**
- * Parse what the user typed for song mode. Accepts "Artist - Title" or a
+ * What the user typed for song mode: "Artist - Title", "Title - Artist", or a
  * 1001Tracklists track URL (/track/<id>/...).
  */
 export interface SongQuery {
-  key?: string;
-  trackId?: string;
   label: string;
+  trackId?: string;
+  /** Both readings of "X - Y", since people type the two halves in either order. */
+  guesses?: SongGuess[];
 }
 
 export function parseSongQuery(input: string): SongQuery {
@@ -97,11 +114,26 @@ export function parseSongQuery(input: string): SongQuery {
   if (dash === -1) {
     throw new Error(`Song must look like "Artist - Title" (got "${input}")`);
   }
-  const track = { artist: input.slice(0, dash), title: input.slice(dash + 3) };
-  return { key: songKey(track), label: displayName(track) };
+  const left = input.slice(0, dash).trim();
+  const right = input.slice(dash + 3).trim();
+  const guess = (artist: string, title: string): SongGuess => ({
+    artists: splitArtists(artist).map(normalizeName),
+    title: baseTitle(title),
+  });
+  return { label: `${left} - ${right}`, guesses: [guess(left, right), guess(right, left)] };
 }
 
+/**
+ * A track matches if the titles agree (ignoring version tags) and every artist the
+ * user typed is one of the track's main artists. So "Riordan - Friction" matches
+ * "Riordan & Locky - Friction (Extended Mix)", but not "X - Friction (Riordan Remix)".
+ */
 export function matchesSong(track: Track, query: SongQuery): boolean {
   if (query.trackId !== undefined && track.trackId === query.trackId) return true;
-  return query.key !== undefined && songKey(track) === query.key;
+  if (!query.guesses || isId(track)) return false;
+  const title = baseTitle(track.title);
+  const mainArtists = new Set(splitArtists(track.artist).map(normalizeName));
+  return query.guesses.some(
+    (g) => g.title === title && g.artists.length > 0 && g.artists.every((a) => mainArtists.has(a)),
+  );
 }

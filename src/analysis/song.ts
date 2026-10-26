@@ -9,6 +9,7 @@ import {
   songKey,
   type SongQuery,
 } from "../normalize.ts";
+import { searchSongs } from "./catalog.ts";
 import { Counter, filterSince } from "./common.ts";
 
 export interface SongReport {
@@ -18,6 +19,10 @@ export interface SongReport {
   setsConsidered: number;
   /** Of those, sets that contain the song. */
   setsWithSong: number;
+  /** How the matched song is actually written in the sets, so you can see what was counted. */
+  matchedAs: Ranked[];
+  /** When nothing matched: cached songs that look like what was typed. */
+  suggestions: Ranked[];
   /** DJs credited on the most sets containing the song. */
   topDjs: Ranked[];
   /** Unreleased IDs that show up in at least two of those sets. */
@@ -36,12 +41,15 @@ export function analyzeSong(sets: Tracklist[], query: SongQuery, options: SongOp
   const recent = filterSince(sets, options.since);
   const withSong = recent.filter((set) => set.tracks.some((t) => matchesSong(t, query)));
 
+  const matched = new Counter();
   const djs = new Counter();
   const ids = new Counter();
   const others = new Counter();
 
   for (const set of withSong) {
-    for (const dj of set.djs) djs.add(normalizeName(dj), dj);
+    for (const dj of set.djs) djs.add(normalizeName(dj), dj, set.djPages?.[dj]);
+    const spellings = new Set(set.tracks.filter((t) => matchesSong(t, query)).map(displayName));
+    for (const name of spellings) matched.add(name);
 
     // Count each song or ID once per set, even if the DJ played it twice.
     const seenIds = new Map<string, string>();
@@ -59,11 +67,14 @@ export function analyzeSong(sets: Tracklist[], query: SongQuery, options: SongOp
     for (const [key, label] of seenOthers) others.add(key, label);
   }
 
+
   return {
     song: query.label,
     since: options.since,
     setsConsidered: recent.length,
     setsWithSong: withSong.length,
+    matchedAs: matched.top(5),
+    suggestions: withSong.length === 0 && query.guesses ? searchSongs(sets, query.label, options.since, 5) : [],
     topDjs: djs.top(top),
     recurringIds: ids.top(top, 2),
     coPlayed: others.top(top),

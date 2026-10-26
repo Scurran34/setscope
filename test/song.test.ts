@@ -46,6 +46,20 @@ describe("analyzeSong", () => {
     expect(small.topDjs).toEqual([{ name: "DJ Alpha", count: 3 }]);
   });
 
+  it("reports how the matched song is written in the sets", () => {
+    expect(report.matchedAs).toEqual([
+      { name: "Nova - Pulse", count: 3 },
+      { name: "nova - pulse", count: 1 },
+    ]);
+    expect(report.suggestions).toEqual([]);
+  });
+
+  it("suggests same-title songs when the artist doesn't match", () => {
+    const miss = analyzeSong(songSets, parseSongQuery("Somebody Else - Pulse"), { since: SINCE });
+    expect(miss.setsWithSong).toBe(0);
+    expect(miss.suggestions).toEqual([{ name: "Nova - Pulse", count: 4 }]);
+  });
+
   it("returns empty lists when nobody played the song", () => {
     const none = analyzeSong(songSets, parseSongQuery("Nobody - Nothing"), { since: SINCE });
     expect(none.setsWithSong).toBe(0);

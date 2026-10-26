@@ -5,17 +5,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { analyzeArtist } from "./analysis/artist.ts";
-import { monthsBefore, today } from "./analysis/common.ts";
+import { today } from "./analysis/common.ts";
 import { analyzeSong } from "./analysis/song.ts";
+import { DEFAULT_MONTHS, dataDir as defaultDataDir, sinceMonths } from "./config.ts";
 import { formatArtistReport, formatSongReport } from "./format.ts";
 import { parseSongQuery } from "./normalize.ts";
 import { PoliteFetcher } from "./source/fetcher.ts";
 import { importSavedTracklist, ingestUrls } from "./source/ingest.ts";
 import { extractTracklistUrls, isChallengePage, isTracklistPage, tracklistId } from "./source/parse.ts";
 import { TracklistStore } from "./source/store.ts";
-
-/** Default freshness cutoff: sets older than this many months are ignored. */
-export const DEFAULT_MONTHS = 18;
 
 const USAGE = `setscope: analyze DJ sets from 1001Tracklists
 
@@ -62,10 +60,10 @@ function main(argv: string[]): Promise<void> | void {
   }
 
   const now = today();
-  const since = values.since ?? monthsBefore(now, values.months ? toInt(values.months, "--months") : DEFAULT_MONTHS);
+  const since = values.since ?? sinceMonths(values.months ? toInt(values.months, "--months") : DEFAULT_MONTHS);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) throw new UsageError(`--since must be YYYY-MM-DD (got "${since}")`);
   const top = values.top ? toInt(values.top, "--top") : 10;
-  const dataDir = process.env.SETSCOPE_DATA ?? join(import.meta.dirname, "..", "data");
+  const dataDir = defaultDataDir();
   const store = new TracklistStore(dataDir);
   const print = (report: object, text: string) => console.log(values.json ? JSON.stringify(report, null, 2) : text);
 

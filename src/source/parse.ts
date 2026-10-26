@@ -30,17 +30,20 @@ export function parseTracklist(html: string, url: string): Tracklist {
   const title = $("#pageTitle").text().replace(/\s+/g, " ").trim() || $("title").text().trim();
 
   // DJs are the artist links in the page title; the label/source link ("Toolroom Radio") isn't.
-  const djs = $("#pageTitle a[href*='/artist/'], #pageTitle a[href*='/dj/']")
-    .map((_, a) => $(a).text().trim())
+  const djLinks = $("#pageTitle a[href*='/artist/'], #pageTitle a[href*='/dj/']")
+    .map((_, a) => ({ name: $(a).text().trim(), href: $(a).attr("href") ?? "" }))
     .get()
-    .filter((name) => name.length > 0);
+    .filter((link) => link.name.length > 0);
+  const djs = djLinks.map((link) => link.name);
+  const djPages: Record<string, string> = {};
+  for (const link of djLinks) if (link.href) djPages[link.name] = absolute(link.href);
 
   const tracks: Track[] = $("div.tlpItem")
     .map((_, row) => parseRow($(row)))
     .get()
     .filter((t): t is Track => t !== undefined);
 
-  return { id, url: absolute(url), title, djs: unique(djs), date: setDate($, title), tracks };
+  return { id, url: absolute(url), title, djs: unique(djs), djPages, date: setDate($, title), tracks };
 }
 
 type Selection = ReturnType<cheerio.CheerioAPI>;

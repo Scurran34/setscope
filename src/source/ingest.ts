@@ -30,21 +30,8 @@ export async function ingestUrls(
   options: IngestOptions,
 ): Promise<IngestResult> {
   const log = options.log ?? (() => {});
-  const result: IngestResult = { fetched: 0, alreadyCached: 0, skippedOld: 0, failed: [], remaining: [] };
-
-  const todo = urls.filter((url) => {
-    const id = tracklistId(url);
-    if (id && store.has(id)) {
-      result.alreadyCached++;
-      return false;
-    }
-    const date = dateFromUrl(url);
-    if (date && date < options.since) {
-      result.skippedOld++;
-      return false;
-    }
-    return true;
-  });
+  const { todo, alreadyCached, skippedOld } = triage(urls, store, options.since);
+  const result: IngestResult = { fetched: 0, alreadyCached, skippedOld, failed: [], remaining: [] };
 
   for (const [i, url] of todo.entries()) {
     if (options.limit !== undefined && result.fetched >= options.limit) {
@@ -66,6 +53,27 @@ export async function ingestUrls(
     }
   }
   return result;
+}
+
+/** Split URLs into ones to fetch, ones already cached, and ones too old to bother with. */
+export function triage(urls: string[], store: TracklistStore, since: string) {
+  let alreadyCached = 0;
+  let skippedOld = 0;
+  const todo = urls.filter((url) => {
+    const id = tracklistId(url);
+    if (!id) return false;
+    if (store.has(id)) {
+      alreadyCached++;
+      return false;
+    }
+    const date = dateFromUrl(url);
+    if (date && date < since) {
+      skippedOld++;
+      return false;
+    }
+    return true;
+  });
+  return { todo, alreadyCached, skippedOld };
 }
 
 /** Store a tracklist page you saved from your browser. Returns the set's id. */

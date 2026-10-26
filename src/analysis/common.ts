@@ -36,17 +36,25 @@ export function today(): string {
 export class Counter {
   private counts = new Map<string, number>();
   private display = new Map<string, string>();
+  private urls = new Map<string, string>();
 
-  add(key: string, displayName: string = key): void {
+  /** `url` is optional; the first one seen for a key is kept. */
+  add(key: string, displayName: string = key, url?: string): void {
     this.counts.set(key, (this.counts.get(key) ?? 0) + 1);
     if (!this.display.has(key)) this.display.set(key, displayName);
+    if (url && !this.urls.has(key)) this.urls.set(key, url);
   }
 
   /** Highest counts first, ties broken alphabetically so output is stable. */
   top(n: number, minCount = 1): Ranked[] {
     return [...this.counts.entries()]
       .filter(([, count]) => count >= minCount)
-      .map(([key, count]) => ({ name: this.display.get(key) ?? key, count }))
+      .map(([key, count]) => {
+        const ranked: Ranked = { name: this.display.get(key) ?? key, count };
+        const url = this.urls.get(key);
+        if (url) ranked.url = url;
+        return ranked;
+      })
       .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
       .slice(0, n);
   }

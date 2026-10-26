@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { monthsBefore } from "../src/analysis/common.ts";
-import { creditedArtists, isId, normalizeName, parseSongQuery, songKey, splitArtists } from "../src/normalize.ts";
+import {
+  creditedArtists,
+  isId,
+  matchesSong,
+  normalizeName,
+  parseSongQuery,
+  songKey,
+  splitArtists,
+} from "../src/normalize.ts";
 
 describe("normalize", () => {
   it("makes spelling variants of a name equal", () => {
@@ -28,6 +36,25 @@ describe("normalize", () => {
       "Lello Russo",
       "Alex Rai",
     ]);
+  });
+
+  it("matches a song when you name only some of its artists, in either order", () => {
+    const friction = { artist: "Riordan & Locky", title: "Friction" };
+    expect(matchesSong(friction, parseSongQuery("Riordan - Friction"))).toBe(true);
+    expect(matchesSong(friction, parseSongQuery("Friction - Riordan"))).toBe(true);
+    expect(matchesSong(friction, parseSongQuery("locky & riordan - friction"))).toBe(true);
+    expect(matchesSong(friction, parseSongQuery("Riordan & Fisher - Friction"))).toBe(false);
+    expect(matchesSong(friction, parseSongQuery("Riordan - Frictions"))).toBe(false);
+  });
+
+  it("ignores version tags but not someone else's remix", () => {
+    const q = parseSongQuery("Riordan - Friction");
+    expect(matchesSong({ artist: "Riordan", title: "Friction (Extended Mix)" }, q)).toBe(true);
+    expect(matchesSong({ artist: "Fisher", title: "Friction (Riordan Remix)" }, q)).toBe(false);
+  });
+
+  it("never matches ID rows by name", () => {
+    expect(matchesSong({ artist: "ID", title: "ID" }, parseSongQuery("ID - ID"))).toBe(false);
   });
 
   it("rejects song input without an artist", () => {

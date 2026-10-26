@@ -1,6 +1,6 @@
 # setscope
 
-A personal command-line tool that analyzes DJ sets from [1001Tracklists](https://www.1001tracklists.com).
+A personal web app (plus a command-line version) that analyzes DJ sets from [1001Tracklists](https://www.1001tracklists.com).
 Work in progress: a project I'm building for fun, not a finished product.
 
 **Song mode.** Give it a song, and it looks at recent sets containing that song:
@@ -24,7 +24,52 @@ npm install
 npm test
 ```
 
-## Usage
+## Web app
+
+```bash
+npm run web
+```
+
+Open http://127.0.0.1:7331. The first time, add the Chrome extension (the page shows these steps
+until it's installed):
+
+1. Go to `chrome://extensions` and turn on **Developer mode**.
+2. Click **Load unpacked** and choose this project's `extension/` folder.
+3. Reload the setscope page.
+
+Then:
+
+1. Type a song (`Artist - Title`) or an artist and click **Analyze**. Anything already cached shows up at once.
+2. Click **Find sets on 1001Tracklists**. A popup opens 1001Tracklists' own search. If exactly one
+   result matches what you typed, the extension opens it; otherwise you click the right one. If the
+   site asks you to verify you're human, you do that yourself.
+3. On the track or DJ page, the extension sends the set links to setscope and **closes the popup**.
+4. setscope fetches those sets in the background (8 seconds apart) and the report **updates as they
+   arrive**. A progress bar shows how many are left.
+5. **Batches of 5.** Of the sets found, the 5 newest are fetched right away. The rest wait under
+   "N more sets found" with **Fetch 5 more**, **Fetch all** and **Clear** buttons, so a lookup never sends
+   dozens of requests unless you ask for them.
+6. **More data around a song:** in "DJs who play it most", **Get sets** opens that DJ's page and the
+   extension adds their sets to the found list. You can also paste set links under **Add sets by link**.
+7. **The search box suggests songs and artists already in your cache** as you type (most-played
+   first), and a search that finds nothing shows **Did you mean**. Matching ignores case, accents,
+   periods and apostrophes, so "lp rhythm - how ya feelin" finds "L.P. Rhythm - How Ya Feelin'".
+8. If 1001Tracklists starts refusing the app (a 401 after a run of requests), fetching **pauses**. You
+   can wait and click **Try again**, or click **Open** next to any waiting set (the one it stopped on is
+   marked). That opens the set in a popup, the extension saves its tracks, and the popup closes. Opening
+   a set saves that set; it does not restart automated fetching. The waiting and found lists are saved
+   to `data/queue.json`, so they survive restarts (waiting sets come back paused).
+
+### Why an extension?
+
+A web page can't read another site's tab, and 1001Tracklists' track and DJ pages put scripts through a
+human check. The extension reads the page *you* opened in your own browser (the same thing as saving it)
+and passes the set links to the local app. It only acts in tabs setscope opened, never in your normal
+browsing, and it never fills in or skips the human check.
+
+## Command line
+
+Everything the web app does is also available from the terminal:
 
 ```bash
 npm run setscope -- help
@@ -87,6 +132,8 @@ So setscope:
 - only fetches `/tracklist/` pages automatically
 - **stops the whole run** at the first sign of a bot check (401/403/429/503 or a "please wait" page), with no retries and no workarounds
 - caches everything locally, so repeated lookups make no requests
+- counts a failed connection toward the 8-second gap too, and shows the site's `Retry-After` when it sends one
+- pauses (instead of dropping the set) when a fetch fails for any other reason, such as a network or parse error. The set stays in `data/queue.json` until you click **Try again** or **Open**
 
 This is for personal, non-commercial use at small scale.
 
@@ -100,15 +147,30 @@ src/
     song.ts           song mode
     artist.ts         artist mode
     common.ts         date filters, Counter
+    catalog.ts        loose text search over the cache (search dropdown, "Did you mean")
   source/             data access: everything that touches the network or disk
     parse.ts          1001Tracklists HTML -> Tracklist
     fetcher.ts        polite HTTP fetcher (HtmlSource interface)
     store.ts          local cache in data/
     ingest.ts         URLs -> fetch -> parse -> cache
+    queue.ts          background fetching for the web app (found list, batches, pause on block)
   format.ts           report -> terminal text
-  cli.ts              argument parsing and wiring
+  cli.ts              command line
+  server.ts           local web server (node:http, no framework) + JSON API
+  config.ts           defaults shared by both
+web/
+  index.html          the page
+  app.ts              browser code, served with types stripped by Node (no bundler)
+extension/            Chrome extension (plain JS: Chrome can't run TypeScript)
+  capture.js          on 1001Tracklists: collect set links, auto-open an exact search match
+  background.js       decides which tabs are setscope's, posts links to the server, closes the tab
+  app-bridge.js       on the setscope page: tells the extension a search popup is opening
 test/                 Vitest tests, fixture tracklists in test/fixtures/
 ```
+
+`web/app.ts` imports the report types from `src/analysis/` with `import type`. Those lines are erased
+before the browser sees the file, so the page and the server share one definition of each report
+without a bundler.
 
 The analysis only ever sees `Tracklist[]`. It doesn't know whether a set came from the network, a
 saved page, or a test fixture, so another data source could be added by writing a new `source/`
@@ -132,6 +194,11 @@ module, without touching `analysis/`.
 - **B2B sets:** every DJ on a set gets credit for every track. (The page marks "X played:" sections,
   which a later version could parse.)
 - **Artist names containing "&"** (e.g. "Butch & Santos") get split into two artists.
+- **The extension hasn't been run in Chrome yet.** The server, page, queue and capture endpoint are
+  tested, and the search-match logic was checked against a real results page, but the full
+  popup → capture → auto-close loop needs a first real run.
+- **Track and DJ pages may only list some of their sets** (if 1001Tracklists paginates them, only the
+  first page is captured).
 - **Saved DJ/track pages can include unrelated sidebar links**, which then get fetched too. They don't
   affect song mode (those sets don't contain the song), but they do add to the denominator in
   artist trends.

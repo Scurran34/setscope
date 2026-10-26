@@ -19,6 +19,8 @@ export interface Tracklist {
   title: string;
   /** Everyone credited with playing the set (B2B sets have several). */
   djs: string[];
+  /** Each DJ's 1001Tracklists page (their list of sets), keyed by name as in `djs`. */
+  djPages?: Record<string, string>;
   /** Date the set was played, "YYYY-MM-DD". */
   date: string;
   tracks: Track[];
@@ -28,4 +30,6 @@ export interface Tracklist {
 export interface Ranked {
   name: string;
   count: number;
+  /** A 1001Tracklists page for this entry, when there is one (e.g. a DJ's set list). */
+  url?: string;
 }

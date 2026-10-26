@@ -25,10 +25,14 @@ export function formatSongReport(r: SongReport): string {
     `Song: ${r.song}\n` +
     `Sets since ${r.since}: ${r.setsConsidered} cached, ${r.setsWithSong} contain this song.\n`;
   if (r.setsWithSong === 0) {
-    return `${header}\nNo cached sets contain it. Add some with: setscope add <saved track page>\n`;
+    const didYouMean = r.suggestions.length
+      ? `\n${rankedList("Did you mean", r.suggestions, "set", "")}`
+      : "";
+    return `${header}\nNo cached sets contain it. Add some with: setscope add <saved track page>\n${didYouMean}`;
   }
+  const spellings = r.matchedAs.map((m) => m.name).join(", ");
   return [
-    header,
+    `${header}Matched: ${spellings}\n`,
     rankedList("DJs who play it most", r.topDjs, "set", "none"),
     rankedList("Recurring IDs in those sets", r.recurringIds, "set", "No ID showed up in more than one set."),
     rankedList("Most played alongside it", r.coPlayed, "set", "none"),

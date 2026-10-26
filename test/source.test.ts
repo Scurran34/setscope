@@ -24,6 +24,10 @@ describe("parseTracklist", () => {
     expect(set.djs).toEqual(["DJ Alpha", "DJ Beta"]);
     expect(set.date).toBe("2026-09-10");
     expect(set.title).toBe("DJ Alpha & DJ Beta - Fixture Radio 101 2026-09-10");
+    expect(set.djPages).toEqual({
+      "DJ Alpha": "https://www.1001tracklists.com/artist/dj-alpha/tracklists.html",
+      "DJ Beta": "https://www.1001tracklists.com/artist/dj-beta/tracklists.html",
+    });
   });
 
   it("reads every row, including IDs and rows with only metadata", () => {
@@ -116,6 +120,35 @@ describe("PoliteFetcher", () => {
     await new PoliteFetcher({ ...options, fetchFn: fakeFetch([]).fn }).fetchHtml(pageUrl);
     rmSync(dir, { recursive: true, force: true });
     expect(sleeps).toEqual([MIN_DELAY_MS - 1_000]);
+  });
+
+  it("counts a failed connection toward the delay, and says it was a network failure", async () => {
+    let clock = 0;
+    const sleeps: number[] = [];
+    let first = true;
+    const fetcher = new PoliteFetcher({
+      fetchFn: (async () => {
+        if (first) {
+          first = false;
+          throw new Error("ECONNRESET");
+        }
+        return new Response(pageHtml);
+      }) as typeof fetch,
+      now: () => clock,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+    });
+    await expect(fetcher.fetchHtml(pageUrl)).rejects.toThrow(/Network failure.*ECONNRESET/);
+    await fetcher.fetchHtml(pageUrl);
+    expect(sleeps).toEqual([MIN_DELAY_MS]);
+  });
+
+  it("includes Retry-After in the block message when the site sends it", async () => {
+    const fn = (async () => new Response("slow down", { status: 429, headers: { "Retry-After": "600" } })) as typeof fetch;
+    const fetcher = new PoliteFetcher({ fetchFn: fn, sleep: async () => {} });
+    await expect(fetcher.fetchHtml(pageUrl)).rejects.toThrow(/Retry-After: 600/);
   });
 
   it("refuses track and DJ pages", async () => {

@@ -8,6 +8,7 @@
     "node": ">=22.18"
   },
   "scripts": {
+    "web": "node --disable-warning=ExperimentalWarning src/server.ts",
     "setscope": "node src/cli.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

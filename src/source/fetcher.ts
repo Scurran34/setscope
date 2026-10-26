@@ -67,16 +67,25 @@ export class PoliteFetcher implements HtmlSource {
     const wait = this.lastRequestAt + this.delayMs - this.now();
     if (wait > 0) await this.sleep(wait);
 
-    const response = await this.fetchFn(url, {
-      headers: { "User-Agent": USER_AGENT, Accept: "text/html" },
-      redirect: "follow",
-    });
+    // Record before connecting: a timeout or TLS failure still counts as a request
+    // and must not let the next one go out sooner than the delay allows.
     this.lastRequestAt = this.now();
     if (this.stateFile) writeFileSync(this.stateFile, String(this.lastRequestAt));
+    let response: Response;
+    try {
+      response = await this.fetchFn(url, {
+        headers: { "User-Agent": USER_AGENT, Accept: "text/html" },
+        redirect: "follow",
+      });
+    } catch (error) {
+      throw new Error(`Network failure while fetching ${url}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const retryAfter = response.headers.get("retry-after");
     const body = await response.text();
 
     if (BLOCK_STATUSES.has(response.status)) {
-      throw new BlockedError(`HTTP ${response.status} from ${url}: the site is refusing automated requests right now.`, response.status);
+      const hint = retryAfter ? ` Retry-After: ${retryAfter}.` : "";
+      throw new BlockedError(`HTTP ${response.status} from ${url}: the site is refusing automated requests right now.${hint}`, response.status);
     }
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} from ${url}`);

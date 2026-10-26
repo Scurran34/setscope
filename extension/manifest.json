@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "setscope capture",
+  "version": "0.1.2",
+  "description": "Sends the set links from a 1001Tracklists page you opened from setscope to your local setscope app, then closes that tab.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:7331/*",
+    "http://localhost:7331/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.1001tracklists.com/*",
+        "https://1001tracklists.com/*"
+      ],
+      "js": [
+        "capture.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://127.0.0.1:7331/*",
+        "http://localhost:7331/*"
+      ],
+      "js": [
+        "app-bridge.js"
+      ],
+      "run_at": "document_start"
+    }
+  ]
+}
