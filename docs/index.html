@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>setscope</title>
+  <meta name="description" content="A personal project for analyzing DJ sets: who plays a song, recurring IDs, and which artists are trending.">
+  <style>
+    :root { --bg: #f6f5f2; --card: #ffffff; --text: #1c1b19; --muted: #6b6862; --line: #e4e1db; --accent: #5b4bd6; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #131316; --card: #1c1c21; --text: #ecebf0; --muted: #9b99a6; --line: #2d2d35; --accent: #8b7cf6; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { max-width: 720px; margin: 0 auto; padding: 48px 16px 64px; }
+    h1 { font-size: 36px; margin: 0 0 4px; letter-spacing: -0.03em; }
+    h2 { font-size: 18px; margin: 32px 0 8px; }
+    .muted { color: var(--muted); }
+    a { color: var(--accent); }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; margin-top: 16px; }
+    ul { padding-left: 20px; }
+    footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 14px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>setscope</h1>
+    <p class="muted">A personal project for analyzing DJ sets. Work in progress.</p>
+
+    <p>
+      setscope looks at DJ tracklists from 1001Tracklists and answers questions like: which DJs play a
+      song the most, which unreleased IDs keep showing up next to it, what it's usually played with, and
+      whether an artist is being played more lately. It runs locally on my own computer.
+    </p>
+
+    <h2>What it does</h2>
+    <ul>
+      <li><b>Song pages:</b> top DJs, recurring IDs, songs played alongside, every set with a SoundCloud listen link, genre, key and BPM.</li>
+      <li><b>Artist pages:</b> profile, their sets, their most played songs, who they play, and whether other DJs are playing them more.</li>
+      <li><b>Trending:</b> songs and artists whose share of sets is rising.</li>
+      <li><b>Likes and categories:</b> sets that play your liked songs, and songs that might fit your categories.</li>
+    </ul>
+
+    <h2>How it's built</h2>
+    <p>
+      TypeScript on Node, with the data-access layer kept separate from pure analysis functions that are
+      covered by unit tests. Collecting is deliberately polite: an honest user agent, at least 8 seconds
+      between requests, local caching so nothing is fetched twice, and it stops on any sign of a block.
+    </p>
+    <div class="card">Source code: <a href="https://github.com/Scurran34/setscope">github.com/Scurran34/setscope</a></div>
+
+    <footer>
+      Key and BPM data provided by <a href="https://getsongbpm.com">GetSongBPM</a>.
+      Tracklist data from <a href="https://www.1001tracklists.com">1001Tracklists</a>.
+    </footer>
+  </main>
+</body>
+</html>
