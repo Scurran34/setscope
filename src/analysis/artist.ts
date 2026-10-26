@@ -34,6 +34,15 @@ export interface ArtistReport {
   ownSets: number;
   /** Artists whose tracks appear most in the artist's own sets. */
   mostPlayedArtists: Ranked[];
+  /** Set when the server swapped a search that found nothing for the cached artist it clearly meant. */
+  correctedFrom?: string;
+  /** When nothing was found: cached artists that look like what was typed (filled in by the server). */
+  suggestions?: Ranked[];
+}
+
+/** True when the artist appears nowhere in the cached sets in range. */
+export function foundNothing(report: ArtistReport): boolean {
+  return report.ownSets === 0 && report.monthly.every((m) => m.setsWithArtist === 0);
 }
 
 export interface ArtistOptions {

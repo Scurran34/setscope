@@ -3,7 +3,9 @@
 // Rules this follows (see README "Data access"):
 // - Honest User-Agent. We never pretend to be a browser.
 // - At least 8s between requests (robots.txt Crawl-delay: 8).
-// - Only /tracklist/ pages. Track and DJ pages sit behind a human check, and we leave those alone.
+// - Only /tracklist/ pages, plus the front page for the background collector. Track and DJ
+//   pages sit behind a human check, and we leave those alone.
+// - One request at a time, even when the queue and the background collector both want one.
 // - Any sign of a bot check stops the whole run. No retries, no workarounds.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -11,6 +13,7 @@ import { isTracklistPage } from "./parse.ts";
 
 export const USER_AGENT = "setscope/0.1 (personal non-commercial project; respects robots.txt)";
 export const MIN_DELAY_MS = 8_000;
+export const FRONT_PAGE = "https://www.1001tracklists.com/";
 
 /** Anything that can hand us the HTML for a URL. Tests pass a fake one. */
 export interface HtmlSource {
@@ -46,6 +49,8 @@ export class PoliteFetcher implements HtmlSource {
   private readonly now: () => number;
   private readonly stateFile: string | undefined;
   private lastRequestAt = Number.NEGATIVE_INFINITY;
+  /** Requests line up here, so two callers can't both decide the delay has passed. */
+  private chain: Promise<unknown> = Promise.resolve();
 
   constructor(options: FetcherOptions = {}) {
     // A smaller delay than robots.txt asks for is never allowed, even if requested.
@@ -59,11 +64,26 @@ export class PoliteFetcher implements HtmlSource {
     }
   }
 
-  async fetchHtml(url: string): Promise<string> {
+  /** A set page. Anything that isn't a tracklist is treated as a bot check. */
+  fetchHtml(url: string): Promise<string> {
     if (!isFetchAllowed(url)) {
-      throw new Error(`Refusing to fetch ${url}: only 1001Tracklists /tracklist/ pages are fetched automatically.`);
+      return Promise.reject(new Error(`Refusing to fetch ${url}: only 1001Tracklists /tracklist/ pages are fetched automatically.`));
     }
+    return this.lineUp(() => this.request(url, isTracklistPage, "a page without a tracklist"));
+  }
 
+  /** The 1001Tracklists front page, for finding new sets. It should link to some sets. */
+  fetchFrontPage(): Promise<string> {
+    return this.lineUp(() => this.request(FRONT_PAGE, (body) => body.includes("/tracklist/"), "a front page with no sets"));
+  }
+
+  private lineUp<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(task);
+    this.chain = run.catch(() => {});
+    return run;
+  }
+
+  private async request(url: string, looksRight: (body: string) => boolean, wrongPage: string): Promise<string> {
     const wait = this.lastRequestAt + this.delayMs - this.now();
     if (wait > 0) await this.sleep(wait);
 
@@ -90,9 +110,9 @@ export class PoliteFetcher implements HtmlSource {
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} from ${url}`);
     }
-    // A 200 that isn't a tracklist is a "please wait" or verification page.
-    if (!isTracklistPage(body)) {
-      throw new BlockedError(`${url} returned a page without a tracklist (probably a bot check).`, response.status);
+    // A 200 that isn't the page we asked for is a "please wait" or verification page.
+    if (!looksRight(body)) {
+      throw new BlockedError(`${url} returned ${wrongPage} (probably a bot check).`, response.status);
     }
     return body;
   }

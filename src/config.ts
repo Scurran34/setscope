@@ -6,9 +6,6 @@ import { monthsBefore, today } from "./analysis/common.ts";
 /** Default freshness cutoff: sets older than this many months are ignored. */
 export const DEFAULT_MONTHS = 18;
 
-/** How many sets to fetch right away when new ones are found; the rest wait for "fetch more". */
-export const BATCH_SIZE = 5;
-
 /** Where the cache lives. Override with SETSCOPE_DATA. */
 export function dataDir(): string {
   return process.env.SETSCOPE_DATA ?? join(import.meta.dirname, "..", "data");

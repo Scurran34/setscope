@@ -1,6 +1,7 @@
-// Searching what's in the cache by loose text, for the search-box dropdown and
-// "Did you mean". Exact matching lives in normalize.ts; this is for when you only
-// half-remember a name ("lp rhythm feelin").
+// Searching what's in the cache by loose text, for the search-box dropdown,
+// "Did you mean", and auto-correcting a search that finds nothing. Exact matching
+// lives in normalize.ts; this is for when you only half-remember a name
+// ("lp rhythm feelin") or misspell it ("chris stussy" for "CHRIS STASSY").
 
 import type { Ranked, Tracklist } from "../model.ts";
 import { baseTitle, displayName, isId, normalizeName, songKey, splitArtists } from "../normalize.ts";
@@ -14,17 +15,54 @@ function words(s: string): string[] {
 }
 
 /**
- * Share of the typed words that start some word in the candidate, 0 to 1.
- * Prefixes count so the dropdown works while you're still typing ("feel" -> "feelin").
+ * Edits (insert, delete, change, or swap two neighbors) to turn `a` into `b`.
+ * "stussy" -> "stassy" is 1, "rythm" -> "rhythm" is 1.
  */
+export function editDistance(a: string, b: string): number {
+  // d[i][j] = edits between the first i letters of a and the first j letters of b.
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array<number>(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0]![j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      let best = Math.min(d[i - 1]![j]! + 1, d[i]![j - 1]! + 1, d[i - 1]![j - 1]! + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) best = Math.min(best, d[i - 2]![j - 2]! + 1);
+      d[i]![j] = best;
+    }
+  }
+  return d[a.length]![b.length]!;
+}
+
+/** Score for a typo: high, but below a real match so exact spellings still win. */
+const TYPO = 0.8;
+
+/**
+ * How well one typed word matches one candidate word: 1 if the candidate starts
+ * with it ("feel" -> "feelin"), TYPO if it's a near spelling, else 0. Short words
+ * must be exact, since "ab" vs "ac" is a different word, not a typo.
+ */
+function wordMatch(typed: string, candidate: string): number {
+  if (candidate.startsWith(typed)) return 1;
+  if (typed.length < 4) return 0;
+  const allowed = typed.length >= 8 ? 2 : 1;
+  // Compare against the whole word and against its start, for words still being typed.
+  const distance = Math.min(editDistance(typed, candidate), editDistance(typed, candidate.slice(0, typed.length)));
+  return distance <= allowed ? TYPO : 0;
+}
+
+/** How well the typed words match a candidate, 0 to 1 (the average of each word's best match). */
 export function wordScore(typed: string[], candidate: string[]): number {
   if (typed.length === 0) return 0;
-  const hits = typed.filter((t) => candidate.some((c) => c.startsWith(t))).length;
-  return hits / typed.length;
+  const total = typed.reduce((sum, t) => sum + Math.max(0, ...candidate.map((c) => wordMatch(t, c))), 0);
+  return total / typed.length;
 }
 
 interface Scored extends Ranked {
   score: number;
+}
+
+function byBest(a: Scored, b: Scored): number {
+  return b.score - a.score || b.count - a.count || a.name.localeCompare(b.name);
 }
 
 /**
@@ -35,13 +73,33 @@ function best(scored: Scored[], limit: number): Ranked[] {
   const fullMatch = scored.some((s) => s.score === 1);
   return scored
     .filter((s) => !fullMatch || s.score === 1)
-    .sort((a, b) => b.score - a.score || b.count - a.count || a.name.localeCompare(b.name))
+    .sort(byBest)
     .slice(0, limit)
     .map(({ name, count }) => ({ name, count }));
 }
 
+/**
+ * The one cached name a search clearly meant, if any: a close match (all words
+ * matching or near-spelled) well ahead of the runner-up, and not just what was typed.
+ */
+function correction(scored: Scored[], typed: string): string | undefined {
+  const [top, second] = [...scored].sort(byBest);
+  if (!top || top.score < 0.75) return undefined;
+  if (second && second.score > top.score - 0.15) return undefined;
+  return normalizeName(top.name) === normalizeName(typed) ? undefined : top.name;
+}
+
 /** Cached songs that look like `text`, with how many sets each is in. */
 export function searchSongs(sets: Tracklist[], text: string, since: string, limit = 8): Ranked[] {
+  return best(scoreSongs(sets, text, since), limit);
+}
+
+/** The cached song `text` clearly meant, e.g. a misspelling of one. */
+export function correctSong(sets: Tracklist[], text: string, since: string): string | undefined {
+  return correction(scoreSongs(sets, text, since), text);
+}
+
+function scoreSongs(sets: Tracklist[], text: string, since: string): Scored[] {
   const typed = words(text.replace(/\s+-\s+/, " "));
   // Same title, any artist: "Somebody - Pulse" should still suggest "Nova - Pulse".
   const dash = text.indexOf(" - ");
@@ -59,11 +117,20 @@ export function searchSongs(sets: Tracklist[], text: string, since: string, limi
     const score = Math.max(wordScore(typed, words(song.name)), sameTitle ? 0.6 : 0);
     if (score >= 0.5) scored.push({ ...song, score });
   }
-  return best(scored, limit);
+  return scored;
 }
 
 /** Cached artists (DJs or track artists) that look like `text`, with how many sets each appears in. */
 export function searchArtists(sets: Tracklist[], text: string, since: string, limit = 8): Ranked[] {
+  return best(scoreArtists(sets, text, since), limit);
+}
+
+/** The cached artist `text` clearly meant, e.g. "chris stussy" -> "CHRIS STASSY". */
+export function correctArtist(sets: Tracklist[], text: string, since: string): string | undefined {
+  return correction(scoreArtists(sets, text, since), text);
+}
+
+function scoreArtists(sets: Tracklist[], text: string, since: string): Scored[] {
   const typed = words(text);
   const counter = new Counter();
   for (const set of filterSince(sets, since)) {
@@ -77,5 +144,18 @@ export function searchArtists(sets: Tracklist[], text: string, since: string, li
     const score = wordScore(typed, words(artist.name));
     if (score >= 0.5) scored.push({ ...artist, score });
   }
-  return best(scored, limit);
+  return scored;
+}
+
+/** Cached songs with exactly this title (any artist), most-played first: for title-only searches. */
+export function songsWithTitle(sets: Tracklist[], title: string, since: string): Ranked[] {
+  const wanted = baseTitle(title);
+  const counter = new Counter();
+  for (const set of filterSince(sets, since)) {
+    const seen = new Map(
+      set.tracks.filter((t) => !isId(t) && baseTitle(t.title) === wanted).map((t) => [songKey(t), displayName(t)]),
+    );
+    for (const [key, name] of seen) counter.add(key, name);
+  }
+  return counter.top(Number.POSITIVE_INFINITY);
 }

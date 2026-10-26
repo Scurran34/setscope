@@ -1,6 +1,7 @@
 // Song mode: given a song, look at the recent sets that contain it.
 
-import type { Ranked, Track, Tracklist } from "../model.ts";
+import type { Ranked, SetSummary, Track, Tracklist } from "../model.ts";
+import { summarize } from "../model.ts";
 import {
   displayName,
   isId,
@@ -10,6 +11,7 @@ import {
   type SongQuery,
 } from "../normalize.ts";
 import { searchSongs } from "./catalog.ts";
+import type { CategoryHint } from "./personal.ts";
 import { Counter, filterSince } from "./common.ts";
 
 export interface SongReport {
@@ -21,6 +23,10 @@ export interface SongReport {
   setsWithSong: number;
   /** How the matched song is actually written in the sets, so you can see what was counted. */
   matchedAs: Ranked[];
+  /** Set when the server swapped a search that found nothing for the cached song it clearly meant. */
+  correctedFrom?: string;
+  /** Title-only search: other cached songs with the same title (set by the server). */
+  otherVersions?: Ranked[];
   /** When nothing matched: cached songs that look like what was typed. */
   suggestions: Ranked[];
   /** DJs credited on the most sets containing the song. */
@@ -29,6 +35,16 @@ export interface SongReport {
   recurringIds: Ranked[];
   /** Other released songs that show up most in those sets. */
   coPlayed: Ranked[];
+  /** Most common genre tag on the song across those sets, e.g. "Tech House". */
+  genre?: string;
+  /** The sets that play it, newest first. */
+  sets: SetSummary[];
+  /** Filled in by the server from your own data: */
+  liked?: boolean;
+  /** Your categories this song is in. */
+  categories?: string[];
+  /** Categories it keeps getting played next to ("maybe part of Party"). */
+  hints?: CategoryHint[];
 }
 
 export interface SongOptions {
@@ -42,14 +58,17 @@ export function analyzeSong(sets: Tracklist[], query: SongQuery, options: SongOp
   const withSong = recent.filter((set) => set.tracks.some((t) => matchesSong(t, query)));
 
   const matched = new Counter();
+  const genres = new Counter();
   const djs = new Counter();
   const ids = new Counter();
   const others = new Counter();
 
   for (const set of withSong) {
     for (const dj of set.djs) djs.add(normalizeName(dj), dj, set.djPages?.[dj]);
-    const spellings = new Set(set.tracks.filter((t) => matchesSong(t, query)).map(displayName));
-    for (const name of spellings) matched.add(name);
+    const hits = set.tracks.filter((t) => matchesSong(t, query));
+    for (const name of new Set(hits.map(displayName))) matched.add(name);
+    const genre = hits.find((t) => t.genre)?.genre;
+    if (genre) genres.add(genre);
 
     // Count each song or ID once per set, even if the DJ played it twice.
     const seenIds = new Map<string, string>();
@@ -68,7 +87,7 @@ export function analyzeSong(sets: Tracklist[], query: SongQuery, options: SongOp
   }
 
 
-  return {
+  const report: SongReport = {
     song: query.label,
     since: options.since,
     setsConsidered: recent.length,
@@ -78,7 +97,11 @@ export function analyzeSong(sets: Tracklist[], query: SongQuery, options: SongOp
     topDjs: djs.top(top),
     recurringIds: ids.top(top, 2),
     coPlayed: others.top(top),
+    sets: [...withSong].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 10).map(summarize),
   };
+  const genre = genres.top(1)[0]?.name;
+  if (genre) report.genre = genre;
+  return report;
 }
 
 /**

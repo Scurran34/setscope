@@ -128,6 +128,39 @@ describe("FetchQueue batches", () => {
   });
 });
 
+describe("FetchQueue clearing and pause reasons", () => {
+  it("says why it paused, and clearing the queue unpauses it", async () => {
+    const fake = fakeSource();
+    fake.blockOnce();
+    const queue = new FetchQueue(store, fake.source);
+    queue.enqueue([url("q1", "2026-03-01"), url("q2", "2026-02-01"), url("q3", "2026-01-01")], "2025-01-01", 2);
+    await queue.settled();
+    expect(queue.status()).toMatchObject({ state: "blocked", pauseReason: "site", found: [url("q3", "2026-01-01")] });
+
+    expect(queue.clearQueue()).toEqual({ waiting: 2, found: 1 });
+    expect(queue.status()).toMatchObject({ state: "idle", waiting: [], found: [] });
+    expect(queue.status().pauseReason).toBeUndefined();
+  });
+});
+
+describe("FetchQueue older sets", () => {
+  it("sets aside sets older than the cutoff, then includes them on request", async () => {
+    const saveFile = join(dir, "queue.json");
+    const fake = fakeSource();
+    const queue = new FetchQueue(store, fake.source, { saveFile });
+    const result = queue.enqueue([url("n1", "2026-05-01"), url("o1", "2023-01-01"), url("o2", "2022-01-01")], "2025-01-01", 0);
+    expect(result).toMatchObject({ queued: 1, skippedOld: 2, fetchingNow: 0 });
+    expect(queue.status()).toMatchObject({ older: 2, found: [url("n1", "2026-05-01")] });
+    expect(new FetchQueue(store, fake.source, { saveFile }).status().older).toBe(2); // saved
+
+    expect(queue.includeOlder()).toBe(2);
+    expect(queue.status()).toMatchObject({ older: 0, found: [url("n1", "2026-05-01"), url("o1", "2023-01-01"), url("o2", "2022-01-01")] });
+    queue.more(Number.POSITIVE_INFINITY);
+    await queue.settled();
+    expect(fake.requested).toHaveLength(3); // older sets fetch fine once included
+  });
+});
+
 describe("FetchQueue failures", () => {
   it("pauses on an ordinary failure and keeps the set, then retries it on resume", async () => {
     let failNext = true;
@@ -145,7 +178,7 @@ describe("FetchQueue failures", () => {
     const queue = new FetchQueue(store, source);
     queue.enqueue([url("f1"), url("f2")], "2025-01-01");
     await queue.settled();
-    expect(queue.status()).toMatchObject({ state: "blocked", failed: 1, pendingFailures: 1, waiting: [url("f1"), url("f2")] });
+    expect(queue.status()).toMatchObject({ state: "blocked", pauseReason: "failure", failed: 1, pendingFailures: 1, waiting: [url("f1"), url("f2")] });
     expect(queue.status().blocked).toMatch(/not a site block.*socket hang up/);
 
     queue.resume();
@@ -159,10 +192,10 @@ describe("FetchQueue failures", () => {
     writeFileSync(saveFile, JSON.stringify({ not: "a list" }));
     expect(() => new FetchQueue(store, fakeSource().source, { saveFile })).toThrow(/Invalid saved queue/);
 
-    // Older saves were a plain list; they come back as found sets, newest first, not fetching.
+    // Older saves were a plain list; they come back waiting (newest first), paused until you say so.
     writeFileSync(saveFile, JSON.stringify([url("ok1", "2026-01-01"), url("ok1", "2026-01-01"), 42, "https://evil.example/tracklist/x/y.html", url("ok2", "2026-05-05")]));
     const status = new FetchQueue(store, fakeSource().source, { saveFile }).status();
-    expect(status).toMatchObject({ state: "idle", waiting: [], found: [url("ok2", "2026-05-05"), url("ok1", "2026-01-01")] });
+    expect(status).toMatchObject({ state: "blocked", pauseReason: "restart", waiting: [url("ok2", "2026-05-05"), url("ok1", "2026-01-01")], found: [] });
   });
 });
 
@@ -176,7 +209,7 @@ describe("FetchQueue persistence", () => {
     await first.settled(); // blocked on p1
 
     const restarted = new FetchQueue(store, fake.source, { saveFile });
-    expect(restarted.status()).toMatchObject({ state: "blocked", waiting: [url("p1"), url("p2")] });
+    expect(restarted.status()).toMatchObject({ state: "blocked", pauseReason: "restart", waiting: [url("p1"), url("p2")] });
     expect(fake.requested).toHaveLength(1); // the restart itself sent nothing
 
     restarted.resume();
@@ -233,7 +266,7 @@ describe("server", () => {
     expect(await (await fetch(`${base}/`)).text()).toContain("<title>setscope</title>");
     const js = await (await fetch(`${base}/app.js`)).text();
     expect(js).not.toMatch(/^import type/m);
-    expect(js).toContain("function analyze");
+    expect(js).toContain("function showRoute");
   });
 
   it("queues captured links, ignoring anything that isn't a tracklist", async () => {
@@ -255,9 +288,11 @@ describe("server", () => {
     const report = await (await fetch(`${base}/api/song?q=${encodeURIComponent("Nova - Pulse")}&months=24`)).json();
     expect(report).toMatchObject({ song: "Nova - Pulse", setsWithSong: 1 });
 
-    const bad = await fetch(`${base}/api/song?q=no-dash`);
+    const byTitle = await (await fetch(`${base}/api/song?q=pulse&months=24`)).json();
+    expect(byTitle).toMatchObject({ setsWithSong: 1, matchedAs: [{ name: "Nova - Pulse" }], otherVersions: [] });
+
+    const bad = await fetch(`${base}/api/song?q=%20`);
     expect(bad.status).toBe(400);
-    expect((await bad.json()).error).toMatch(/Artist - Title/);
   });
 
   it("imports a whole set page sent by the extension", async () => {
@@ -278,22 +313,15 @@ describe("server", () => {
   const postJson = (path: string, body: object, headers: Record<string, string> = { "X-Setscope": "1" }) =>
     fetch(`${base}${path}`, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
 
-  it("fetches the first 5 captured sets and keeps the rest found until asked", async () => {
+  it("fetches every captured set on its own, newest first, with no batches to ask for", async () => {
     const urls = Array.from({ length: 7 }, (_, i) => url(`m${i}`, `2026-0${i + 1}-01`));
     const res = await capture(urls);
-    expect(await res.json()).toMatchObject({ found: 7, queued: 7, fetchingNow: 5 });
+    expect(await res.json()).toMatchObject({ found: 7, queued: 7, fetchingNow: 7 });
     await queue.settled();
-    expect(queue.status().found).toEqual([url("m1", "2026-02-01"), url("m0", "2026-01-01")]);
-
-    expect(await (await postJson("/api/more", { count: "all" })).json()).toEqual({ moved: 2 });
-    await queue.settled();
-    expect(queue.status().found).toEqual([]);
+    expect(queue.status()).toMatchObject({ state: "idle", done: 7, found: [], waiting: [] });
   });
 
-  it("clears found sets, and adds pasted links", async () => {
-    await capture(Array.from({ length: 6 }, (_, i) => url(`n${i}`)));
-    expect(await (await postJson("/api/clear-found", {})).json()).toEqual({ cleared: 1 });
-
+  it("adds pasted links", async () => {
     const pasted = await postJson("/api/add-links", { text: `see ${url("p1")} and junk /dj/x/index.html` });
     expect(await pasted.json()).toMatchObject({ found: 1, queued: 1, fetchingNow: 1 });
     const nothing = await postJson("/api/add-links", { text: "no links here" });
@@ -309,6 +337,74 @@ describe("server", () => {
     const artists = await (await fetch(`${base}/api/suggest?mode=artist&q=dj%20alp&months=24`)).json();
     expect(artists).toEqual([{ name: "DJ Alpha", count: 1 }]);
     expect(await (await fetch(`${base}/api/suggest?q=n`)).json()).toEqual([]);
+  });
+
+  it("auto-corrects a misspelled search that finds nothing, unless exact=1", async () => {
+    await capture([url("c1")]);
+    await queue.settled();
+    const fixed = await (await fetch(`${base}/api/song?q=${encodeURIComponent("Nova - Pulze")}&months=24`)).json();
+    expect(fixed).toMatchObject({ correctedFrom: "Nova - Pulze", setsWithSong: 1, matchedAs: [{ name: "Nova - Pulse" }] });
+
+    const exact = await (await fetch(`${base}/api/song?q=${encodeURIComponent("Nova - Pulze")}&months=24&exact=1`)).json();
+    expect(exact).toMatchObject({ setsWithSong: 0 });
+    expect(exact.correctedFrom).toBeUndefined();
+
+    const artist = await (await fetch(`${base}/api/artist?name=${encodeURIComponent("roland clrak")}&months=24`)).json();
+    expect(artist).toMatchObject({ artist: "Roland Clark", correctedFrom: "roland clrak" });
+  });
+
+  it("serves trending and clears the queue", async () => {
+    const report = await (await fetch(`${base}/api/trending?days=14`)).json();
+    expect(report).toMatchObject({ enoughData: false, songs: [], artists: [] });
+
+    await capture(Array.from({ length: 7 }, (_, i) => url(`z${i}`)));
+    const cleared = await (await postJson("/api/clear-queue", {})).json();
+    expect(cleared).toEqual({ waiting: expect.any(Number), found: 0 });
+    await queue.settled();
+    expect(queue.status()).toMatchObject({ waiting: [], found: [] });
+  });
+
+  it("likes and categories show up on song pages, in for-you, and on category pages", async () => {
+    await capture([url("c1")]);
+    await queue.settled();
+    expect((await postJson("/api/like", { song: "Nova - Pulse", liked: true })).status).toBe(200);
+    expect((await postJson("/api/label", { song: "Nova - Pulse", category: "Party", on: true })).status).toBe(200);
+    expect((await postJson("/api/label", { song: "no dash", category: "Party", on: true })).status).toBe(400);
+    expect((await postJson("/api/like", { song: "Nova - Pulse", liked: true }, {})).status).toBe(400); // header
+
+    const song = await (await fetch(`${base}/api/song?q=${encodeURIComponent("Nova - Pulse")}&months=24`)).json();
+    expect(song).toMatchObject({ liked: true, categories: ["Party"], genre: "Tech House", sets: [{ id: "c1", soundcloud: "https://api.soundcloud.com/tracks/2423741796" }] });
+
+    expect(await (await fetch(`${base}/api/me`)).json()).toEqual({ likes: ["Nova - Pulse"], categories: [{ name: "Party", songs: ["Nova - Pulse"] }] });
+    const forYou = await (await fetch(`${base}/api/for-you?months=24`)).json();
+    expect(forYou).toMatchObject({ likes: ["Nova - Pulse"], sets: [{ id: "c1", liked: ["Nova - Pulse"] }] });
+    expect(await (await fetch(`${base}/api/category?name=party&months=24`)).json()).toMatchObject({ name: "Party", songs: ["Nova - Pulse"] });
+    expect((await fetch(`${base}/api/category?name=nope`)).status).toBe(404);
+  });
+
+  it("reports no GetSongBPM key instead of failing", async () => {
+    const info = await (await fetch(`${base}/api/song-info?song=${encodeURIComponent("Nova - Pulse")}`)).json();
+    expect(info).toEqual({ status: "no-key" });
+    expect((await fetch(`${base}/api/song-info?song=nodash`)).status).toBe(400);
+  });
+
+  it("includes older sets and controls background collecting", async () => {
+    expect(await (await postJson("/api/include-older", {})).json()).toEqual({ moved: 0 });
+    // This test app has no collector: the switch says so instead of pretending.
+    expect((await postJson("/api/background", { enabled: true })).status).toBe(400);
+    expect((await postJson("/api/background", { enabled: "yes" })).status).toBe(400);
+  });
+
+  it("artist reports carry a profile; the account page reports and saves the GetSongBPM key", async () => {
+    await capture([url("c1")]);
+    await queue.settled();
+    const artist = await (await fetch(`${base}/api/artist?name=dj%20alpha&months=24`)).json();
+    expect(artist.profile).toMatchObject({ name: "DJ Alpha", country: "Netherlands", ownSets: [{ id: "c1" }] });
+
+    expect(await (await fetch(`${base}/api/account`)).json()).toMatchObject({ sets: 1, getSongBpmKey: false });
+    expect((await postJson("/api/account/getsongbpm-key", { key: "not a key!" })).status).toBe(400);
+    expect(await (await postJson("/api/account/getsongbpm-key", { key: "abc123def456" })).json()).toEqual({ getSongBpmKey: true });
+    expect(await (await fetch(`${base}/api/account`)).json()).toMatchObject({ getSongBpmKey: true });
   });
 
   it("reports cache size and queue progress", async () => {

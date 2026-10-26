@@ -27,6 +27,13 @@ export function isId(track: Track): boolean {
   return isIdPart(track.artist) || isIdPart(track.title);
 }
 
+/** "Artist - Title" -> a Track, for turning a display name back into a song key. */
+export function trackFromName(name: string): Track {
+  const dash = name.indexOf(" - ");
+  if (dash === -1) throw new Error(`Song must look like "Artist - Title" (got "${name}")`);
+  return { artist: name.slice(0, dash).trim(), title: name.slice(dash + 3).trim() };
+}
+
 /** "Artist - Title" for display. */
 export function displayName(track: Track): string {
   return `${track.artist} - ${track.title}`;
@@ -95,14 +102,16 @@ interface SongGuess {
 }
 
 /**
- * What the user typed for song mode: "Artist - Title", "Title - Artist", or a
- * 1001Tracklists track URL (/track/<id>/...).
+ * What the user typed for song mode: "Artist - Title", "Title - Artist", just a
+ * title, or a 1001Tracklists track URL (/track/<id>/...).
  */
 export interface SongQuery {
   label: string;
   trackId?: string;
   /** Both readings of "X - Y", since people type the two halves in either order. */
   guesses?: SongGuess[];
+  /** No artist given: any song with this title matches. */
+  titleOnly?: boolean;
 }
 
 export function parseSongQuery(input: string): SongQuery {
@@ -112,7 +121,9 @@ export function parseSongQuery(input: string): SongQuery {
   }
   const dash = input.indexOf(" - ");
   if (dash === -1) {
-    throw new Error(`Song must look like "Artist - Title" (got "${input}")`);
+    const title = input.trim();
+    if (!title) throw new Error("Type a song title, or Artist - Title.");
+    return { label: title, guesses: [{ artists: [], title: baseTitle(title) }], titleOnly: true };
   }
   const left = input.slice(0, dash).trim();
   const right = input.slice(dash + 3).trim();
@@ -127,6 +138,7 @@ export function parseSongQuery(input: string): SongQuery {
  * A track matches if the titles agree (ignoring version tags) and every artist the
  * user typed is one of the track's main artists. So "Riordan - Friction" matches
  * "Riordan & Locky - Friction (Extended Mix)", but not "X - Friction (Riordan Remix)".
+ * A title on its own matches that title by any artist.
  */
 export function matchesSong(track: Track, query: SongQuery): boolean {
   if (query.trackId !== undefined && track.trackId === query.trackId) return true;
@@ -134,6 +146,6 @@ export function matchesSong(track: Track, query: SongQuery): boolean {
   const title = baseTitle(track.title);
   const mainArtists = new Set(splitArtists(track.artist).map(normalizeName));
   return query.guesses.some(
-    (g) => g.title === title && g.artists.length > 0 && g.artists.every((a) => mainArtists.has(a)),
+    (g) => g.title === title && g.artists.every((a) => mainArtists.has(a)),
   );
 }

@@ -39,26 +39,50 @@ until it's installed):
 
 Then:
 
-1. Type a song (`Artist - Title`) or an artist and click **Analyze**. Anything already cached shows up at once.
-2. Click **Find sets on 1001Tracklists**. A popup opens 1001Tracklists' own search. If exactly one
-   result matches what you typed, the extension opens it; otherwise you click the right one. If the
-   site asks you to verify you're human, you do that yourself.
-3. On the track or DJ page, the extension sends the set links to setscope and **closes the popup**.
-4. setscope fetches those sets in the background (8 seconds apart) and the report **updates as they
-   arrive**. A progress bar shows how many are left.
-5. **Batches of 5.** Of the sets found, the 5 newest are fetched right away. The rest wait under
-   "N more sets found" with **Fetch 5 more**, **Fetch all** and **Clear** buttons, so a lookup never sends
-   dozens of requests unless you ask for them.
-6. **More data around a song:** in "DJs who play it most", **Get sets** opens that DJ's page and the
-   extension adds their sets to the found list. You can also paste set links under **Add sets by link**.
-7. **The search box suggests songs and artists already in your cache** as you type (most-played
-   first), and a search that finds nothing shows **Did you mean**. Matching ignores case, accents,
-   periods and apostrophes, so "lp rhythm - how ya feelin" finds "L.P. Rhythm - How Ya Feelin'".
-8. If 1001Tracklists starts refusing the app (a 401 after a run of requests), fetching **pauses**. You
-   can wait and click **Try again**, or click **Open** next to any waiting set (the one it stopped on is
-   marked). That opens the set in a popup, the extension saves its tracks, and the popup closes. Opening
-   a set saves that set; it does not restart automated fetching. The waiting and found lists are saved
-   to `data/queue.json`, so they survive restarts (waiting sets come back paused).
+The app has real pages, each with its own address, so links, Back and Forward work. The top bar
+(Home · Trending · Account, plus the search box) is on every page.
+
+- **Home**: sets with the most of your liked songs, songs you might like, a trending preview, and
+  your categories.
+- **Trending**: songs and artists whose share of your cached sets rose after a date you pick (last 2
+  weeks, month, or 3 months), with the percent change or **NEW**, plus the most played songs and
+  artists in that window. Based on the sets you've collected, not all of 1001Tracklists.
+- **Artist pages** (`#/artist/<name>`): their picture, country, links (SoundCloud, Spotify, Instagram,
+  Beatport...) and 1001Tracklists page, all read from the DJ cards on cached set pages. Also how many of
+  their sets you have, how many other DJs' sets play them, genres, labels, and a trend chart. Below that
+  are **their songs**: click one to open its numbers (DJs who play it, songs played alongside, IDs, key/BPM)
+  right there, without leaving the artist page. Their own sets and who they play are at the bottom.
+- **Song pages** live under their artist (`#/artist/<name>/song/<song>`): who plays it, recurring IDs, what
+  it's played alongside, every set with a **▶ Listen** link to the set's SoundCloud recording, genre,
+  key and BPM, ♡ Like, and your categories with **Maybe part of "Party"** hints. Every song and artist name
+  anywhere is a link to its page.
+- **Account**: liked songs, your categories (each has a page of songs that **might fit**), collecting
+  controls, background collecting, adding sets by link, your GetSongBPM key, and cache stats. Everything
+  is stored on this computer; there's no login yet.
+
+**Searching:** type a title alone or `Artist - Title`. The box suggests cached songs and artists as
+you type. Matching ignores case, accents, periods and apostrophes, and tolerates typos. If a search
+finds nothing but one cached name is clearly what you meant, you get that page with "Showing results
+for CHRIS STASSY · Search for “chris stussy” instead".
+
+**Collecting sets:** on a song or artist page, **Gather more sets** opens 1001Tracklists' own search
+in a popup. The extension opens the matching result (or you click it; if the site asks you to verify
+you're human, you do that yourself), scrolls the page the way you would until every set is listed (the
+page loads 20 at a time, up to 300), sends the links to setscope, and closes the popup. setscope then
+fetches **all** of them on its own, newest first, one every 8 seconds. A slim strip under the top bar
+shows progress on every page, and the full queue (up next, with **Show the rest / Hide the rest**) is on
+Account. Home and Trending update as sets arrive; artist, song and category pages offer **Refresh**
+instead, so they don't change under you. "Get sets" next to a DJ collects that DJ's sets the same way.
+
+**Older sets aren't dropped.** Sets older than your window (default 18 months) are set aside, and
+Account offers **Include them**. The window goes up to **last 3 years** and **all time**.
+
+**If 1001Tracklists starts refusing the app** (a 401/403 after a run of requests), collecting
+**pauses** with a one-line explanation and next steps (technical details are folded away). You can wait
+and click **Try again**, **Clear queue**, or **Open** any waiting set yourself (the one it stopped on
+is marked): it opens in a popup, the extension saves its tracks, and the popup closes. Opening a set
+saves that set; it does not restart automated fetching. The queue is saved in `data/queue.json`, so it
+survives restarts (and comes back paused).
 
 ### Why an extension?
 
@@ -66,6 +90,43 @@ A web page can't read another site's tab, and 1001Tracklists' track and DJ pages
 human check. The extension reads the page *you* opened in your own browser (the same thing as saving it)
 and passes the set links to the local app. It only acts in tabs setscope opened, never in your normal
 browsing, and it never fills in or skips the human check.
+
+### Background collecting
+
+A switch on the home page. When it's on, setscope slowly caches the sets on the 1001Tracklists front
+page (new and featured sets), so reports and trending have more to work with, within strict limits:
+
+- only while your own queue isn't fetching or paused (your requests come first)
+- the front page at most once an hour, then one set every 90 seconds, through the same fetcher
+  (honest User-Agent, one request at a time, 8 s minimum gap)
+- at most 100 sets a day
+- any sign of a block pauses it for 24 hours. It never retries early or works around it.
+
+Its state (on/off, today's count, the sets still to fetch) is saved in `data/background.json`.
+
+### Key and BPM (GetSongBPM)
+
+Song pages get key and BPM from [GetSongBPM](https://getsongbpm.com)'s free API:
+
+1. Register at getsongbpm.com/api for a free API key.
+2. Save it where setscope looks for it (the `data/` folder is never committed):
+   ```bash
+   echo "YOUR_KEY" > ~/Documents/setscope/data/getsongbpm-key
+   ```
+   (or set `SETSCOPE_GETSONGBPM_KEY`), then restart `npm run web`.
+
+How it stays cheap: a song is looked up **once**, the first time you open its page, and the answer is
+cached in `data/songinfo.json` for good ("not found" is retried after 30 days; errors are never cached).
+Lookups run one at a time, 1.5 s apart, far under the API's 3,000/hour limit. Only a result whose title
+and artist match is used, never just the first hit. GetSongBPM's terms require a visible link back to
+them, so song pages show "data: GetSongBPM.com" next to the key and BPM.
+
+Their API docs were behind a bot check when this was written, so the address and field names
+(`tempo`, `key_of`, `open_key`) come from their published examples. If lookups fail, set
+`SETSCOPE_GETSONGBPM_URL` (default `https://api.getsong.co`) to the address in their current docs.
+
+Why not Beatport: Beatport's pages put scripts through a bot check (HTTP 403), and its API is for
+approved partners only.
 
 ## Command line
 
@@ -148,16 +209,22 @@ src/
     artist.ts         artist mode
     common.ts         date filters, Counter
     catalog.ts        loose text search over the cache (search dropdown, "Did you mean")
+    trending.ts       songs and artists rising in share of sets
+    personal.ts       sets for you, songs you might like, "maybe part of" category hints
+    profile.ts        artist profile pages (DJ card info, their songs, sets, labels)
   source/             data access: everything that touches the network or disk
     parse.ts          1001Tracklists HTML -> Tracklist
     fetcher.ts        polite HTTP fetcher (HtmlSource interface)
     store.ts          local cache in data/
     ingest.ts         URLs -> fetch -> parse -> cache
-    queue.ts          background fetching for the web app (found list, batches, pause on block)
+    queue.ts          background fetching for the web app (found list, batches, older sets, pause on block)
+    background.ts     background collecting of front-page sets (switch, slow, daily cap)
+    songinfo.ts       key/BPM from GetSongBPM, looked up once per song and cached
   format.ts           report -> terminal text
   cli.ts              command line
   server.ts           local web server (node:http, no framework) + JSON API
   config.ts           defaults shared by both
+  user.ts             your likes and categories (data/user.json)
 web/
   index.html          the page
   app.ts              browser code, served with types stripped by Node (no bundler)

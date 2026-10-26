@@ -3,8 +3,8 @@
 // - Search results: opens the result if exactly one matches your search, otherwise
 //   asks you to click the right one.
 // - Human check: does nothing. You pass it; the page reloads and this runs again.
-// - Track, DJ or artist page: collects the set links, sends them to setscope, and
-//   the background worker closes the tab.
+// - Track, DJ or artist page: scrolls to load every set on it (the page loads 20 at a
+//   time), sends the links to setscope, and the background worker closes the tab.
 // - Tracklist page (a set setscope couldn't fetch itself): sends the page so setscope
 //   can read the tracks, then closes the tab.
 
@@ -38,6 +38,8 @@ function tracklistLinks() {
   return [...urls];
 }
 
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /** Links can render after load, so wait until the count stops growing (max ~10s). */
 async function waitForLinks() {
   let previous = -1;
@@ -45,9 +47,40 @@ async function waitForLinks() {
     const count = tracklistLinks().length;
     if (count > 0 && count === previous) break;
     previous = count;
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await pause(500);
   }
   return tracklistLinks();
+}
+
+/** Most sets setscope will collect from one page (about 15 loads of 20). */
+const MAX_SETS_PER_PAGE = 300;
+
+/**
+ * Track and DJ pages show the first ~16 sets and load 20 more each time you scroll to
+ * the bottom. Scroll the way you would, pausing between loads, until nothing new
+ * appears (or the cap). Only on a page you opened from setscope.
+ */
+async function loadAllSets() {
+  let urls = await waitForLinks();
+  let stalls = 0;
+  while (urls.length < MAX_SETS_PER_PAGE && stalls < 2) {
+    banner(`setscope: loading more sets… ${urls.length} so far`);
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    let grew = false;
+    for (let i = 0; i < 8 && !grew; i++) {
+      await pause(500);
+      grew = tracklistLinks().length > urls.length;
+    }
+    if (grew) {
+      stalls = 0;
+      await pause(1_000); // let the batch finish rendering, and don't hammer the site
+    } else {
+      stalls++;
+    }
+    urls = tracklistLinks();
+  }
+  window.scrollTo(0, 0);
+  return urls.slice(0, MAX_SETS_PER_PAGE);
 }
 
 function normalize(s) {
@@ -92,15 +125,16 @@ async function main() {
   }
 
   banner("setscope: collecting sets…");
-  const urls = await waitForLinks();
+  const urls = await loadAllSets();
   if (urls.length === 0) {
     banner("setscope: no sets on this page");
     return;
   }
   const reply = await chrome.runtime.sendMessage({ type: "capture", pageUrl: location.href, urls });
   if (reply?.ok) {
-    const { queued, alreadyCached } = reply.result;
-    banner(`setscope: sent ${urls.length} sets (${queued} new, ${alreadyCached} already cached). Closing…`);
+    const { queued, alreadyCached, skippedOld } = reply.result;
+    const older = skippedOld ? `, ${skippedOld} older than your window` : "";
+    banner(`setscope: sent ${urls.length} sets (${queued} new, ${alreadyCached} already cached${older}). Closing…`);
   } else {
     banner(`setscope: couldn't reach the app (${reply?.error ?? "unknown error"}). Is npm run web running?`);
   }

@@ -57,8 +57,12 @@ describe("normalize", () => {
     expect(matchesSong({ artist: "ID", title: "ID" }, parseSongQuery("ID - ID"))).toBe(false);
   });
 
-  it("rejects song input without an artist", () => {
-    expect(() => parseSongQuery("Just A Title")).toThrow(/Artist - Title/);
+  it("accepts a title on its own, matching it by any artist", () => {
+    const q = parseSongQuery("friction (extended mix)");
+    expect(q).toMatchObject({ titleOnly: true, label: "friction (extended mix)" });
+    expect(matchesSong({ artist: "Riordan & Locky", title: "Friction" }, q)).toBe(true);
+    expect(matchesSong({ artist: "Riordan", title: "Frictions" }, q)).toBe(false);
+    expect(() => parseSongQuery("   ")).toThrow(/title/);
   });
 
   it("shifts dates by months, clamping the day", () => {

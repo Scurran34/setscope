@@ -2,10 +2,18 @@
 // string, whether it came from the fetcher or from a page you saved in your browser.
 
 import * as cheerio from "cheerio";
-import type { Track, Tracklist } from "../model.ts";
+import type { DjProfile, Track, Tracklist } from "../model.ts";
 
 const SITE = "https://www.1001tracklists.com";
 const TRACKLIST_PATH = /\/tracklist\/([a-z0-9]+)\/[^"'\s?#]*\.html/i;
+
+/**
+ * Bump when the parser learns something new; cached sets read by an older version
+ * are re-read from their saved HTML at startup (no network).
+ * 2: genre per track, SoundCloud per set.
+ * 3: artist page links per track, DJ cards (country, picture, contact links) per set.
+ */
+export const PARSER_VERSION = 3;
 
 /** Id from a tracklist URL or path, e.g. "p3yju6k". */
 export function tracklistId(url: string): string | undefined {
@@ -43,7 +51,14 @@ export function parseTracklist(html: string, url: string): Tracklist {
     .get()
     .filter((t): t is Track => t !== undefined);
 
-  return { id, url: absolute(url), title, djs: unique(djs), djPages, date: setDate($, title), tracks };
+  const set: Tracklist = { id, url: absolute(url), title, djs: unique(djs), djPages, date: setDate($, title), tracks };
+  // The page embeds SoundCloud's player for the set's recording, when there is one.
+  const soundcloudId = html.match(/api\.soundcloud\.com\/tracks\/(\d+)/)?.[1];
+  if (soundcloudId) set.soundcloud = `https://api.soundcloud.com/tracks/${soundcloudId}`;
+  const profiles = djCards($);
+  if (profiles.length > 0) set.djProfiles = profiles;
+  set.parserVersion = PARSER_VERSION;
+  return set;
 }
 
 type Selection = ReturnType<cheerio.CheerioAPI>;
@@ -64,7 +79,43 @@ function parseRow(row: Selection): Track | undefined {
   if (label) track.label = label;
   const trackId = row.attr("data-trackid");
   if (trackId) track.trackId = trackId;
+  const genre = row.find("meta[itemprop='genre']").first().attr("content")?.trim();
+  if (genre && genre.toLowerCase() !== "tracklist") track.genre = genre;
+  // Each artist name is a span holding its own text plus a hidden "open artist page" link.
+  const pages: Record<string, string> = {};
+  row.find(".trackValue a[href*='/artist/']").each((_, a) => {
+    const holder = row.find(a).closest("span.tgHid").parent();
+    const name = holder.contents().filter((_, n) => n.type === "text").text().trim();
+    const href = row.find(a).attr("href");
+    if (name && href) pages[name] = absolute(href);
+  });
+  if (Object.keys(pages).length > 0) track.artistPages = pages;
   return track;
+}
+
+/** The DJ cards near the bottom of a set page: link, flag, picture and "Contact Links". */
+function djCards($: cheerio.CheerioAPI): DjProfile[] {
+  const cards: DjProfile[] = [];
+  $("div.fTab").each((_, tab) => {
+    const card = $(tab);
+    const nameLink = card.find(".h a[href*='/artist/']").first();
+    const name = nameLink.text().trim();
+    if (!name) return;
+    const profile: DjProfile = { name, links: [] };
+    const page = nameLink.attr("href");
+    if (page) profile.page = absolute(page);
+    const country = card.find(".h img.flag").attr("title")?.replace(/^Home Country\s+/i, "").trim();
+    if (country) profile.country = country;
+    const image = card.find("img.artwork").attr("data-src") ?? card.find("img.artwork").attr("src");
+    if (image && !image.includes("empty.png")) profile.image = image;
+    card.find("details a[href^='http']").each((_, a) => {
+      const label = ($(a).attr("title") ?? $(a).text()).replace(/\s+Link$/i, "").trim();
+      const url = $(a).attr("href")?.trim();
+      if (label && url) profile.links.push({ label, url });
+    });
+    cards.push(profile);
+  });
+  return cards;
 }
 
 /**

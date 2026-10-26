@@ -2,13 +2,14 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { BlockedError, MIN_DELAY_MS, PoliteFetcher, USER_AGENT, type HtmlSource } from "../src/source/fetcher.ts";
+import { BlockedError, FRONT_PAGE, MIN_DELAY_MS, PoliteFetcher, USER_AGENT, type HtmlSource } from "../src/source/fetcher.ts";
 import { importSavedTracklist, ingestUrls } from "../src/source/ingest.ts";
 import {
   canonicalUrl,
   dateFromUrl,
   extractTracklistUrls,
   isChallengePage,
+  PARSER_VERSION,
   parseTracklist,
 } from "../src/source/parse.ts";
 import { TracklistStore } from "../src/source/store.ts";
@@ -24,6 +25,20 @@ describe("parseTracklist", () => {
     expect(set.djs).toEqual(["DJ Alpha", "DJ Beta"]);
     expect(set.date).toBe("2026-09-10");
     expect(set.title).toBe("DJ Alpha & DJ Beta - Fixture Radio 101 2026-09-10");
+    expect(set.soundcloud).toBe("https://api.soundcloud.com/tracks/2423741796");
+    expect(set.parserVersion).toBe(PARSER_VERSION);
+    expect(set.djProfiles).toEqual([
+      {
+        name: "DJ Alpha",
+        page: "https://www.1001tracklists.com/artist/dj-alpha/tracklists.html",
+        country: "Netherlands",
+        image: "https://i1.sndcdn.com/avatars-alpha.jpg",
+        links: [
+          { label: "SoundCloud", url: "https://soundcloud.com/djalpha" },
+          { label: "Instagram", url: "https://www.instagram.com/djalpha/" },
+        ],
+      },
+    ]);
     expect(set.djPages).toEqual({
       "DJ Alpha": "https://www.1001tracklists.com/artist/dj-alpha/tracklists.html",
       "DJ Beta": "https://www.1001tracklists.com/artist/dj-beta/tracklists.html",
@@ -32,7 +47,14 @@ describe("parseTracklist", () => {
 
   it("reads every row, including IDs and rows with only metadata", () => {
     expect(set.tracks).toEqual([
-      { artist: "Nova", title: "Pulse", label: "FIXTURE", trackId: "nova111" },
+      {
+        artist: "Nova",
+        title: "Pulse",
+        label: "FIXTURE",
+        trackId: "nova111",
+        genre: "Tech House",
+        artistPages: { Nova: "https://www.1001tracklists.com/artist/nova/tracks.html" },
+      },
       { artist: "ID", title: "ID" },
       { artist: "Roland Clark & Amy Alexander", title: "Feel It" },
       { artist: "Kite", title: "ID", trackId: "kiteid9" },
@@ -149,6 +171,32 @@ describe("PoliteFetcher", () => {
     const fn = (async () => new Response("slow down", { status: 429, headers: { "Retry-After": "600" } })) as typeof fetch;
     const fetcher = new PoliteFetcher({ fetchFn: fn, sleep: async () => {} });
     await expect(fetcher.fetchHtml(pageUrl)).rejects.toThrow(/Retry-After: 600/);
+  });
+
+  it("sends one request at a time, even when two callers ask at once", async () => {
+    let clock = 0;
+    const sleeps: number[] = [];
+    const fetcher = new PoliteFetcher({
+      fetchFn: fakeFetch([]).fn,
+      now: () => clock,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+    });
+    await Promise.all([fetcher.fetchHtml(pageUrl), fetcher.fetchHtml(pageUrl)]);
+    expect(sleeps).toEqual([MIN_DELAY_MS]);
+  });
+
+  it("fetches the front page, and treats one with no set links as a block", async () => {
+    const { fn, calls } = fakeFetch([
+      { status: 200, body: '<a href="/tracklist/abc/x-2026-10-01.html">x</a>' },
+      { status: 200, body: "Please wait, you will be forwarded" },
+    ]);
+    const fetcher = new PoliteFetcher({ fetchFn: fn, sleep: async () => {} });
+    expect(await fetcher.fetchFrontPage()).toContain("/tracklist/abc/");
+    expect(calls[0]!.url).toBe(FRONT_PAGE);
+    await expect(fetcher.fetchFrontPage()).rejects.toBeInstanceOf(BlockedError);
   });
 
   it("refuses track and DJ pages", async () => {

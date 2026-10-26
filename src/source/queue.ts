@@ -5,6 +5,7 @@
 // Two lists:
 //   found    sets we know about but haven't asked for yet, newest first
 //   waiting  sets being fetched now (pulled from `found` in batches, e.g. 5 at a time)
+//   older    sets found but older than your cutoff; kept aside until you include them
 
 import { BlockedError, isFetchAllowed, MIN_DELAY_MS, type HtmlSource } from "./fetcher.ts";
 import { triage } from "./ingest.ts";
@@ -14,6 +15,9 @@ import { canonicalUrl, dateFromUrl, parseTracklist, tracklistId } from "./parse.
 import type { TracklistStore } from "./store.ts";
 
 export type QueueState = "idle" | "running" | "blocked";
+
+/** Why the queue is paused, so the page can explain it in plain words. */
+export type PauseReason = "site" | "failure" | "restart";
 
 export interface QueueStatus {
   state: QueueState;
@@ -25,12 +29,16 @@ export interface QueueStatus {
   /** Failures still sitting in the queue (it pauses on them rather than dropping the set). */
   pendingFailures: number;
   current?: string;
+  /** Technical details of the pause. */
   blocked?: string;
+  pauseReason?: PauseReason;
   etaSeconds: number;
   /** URLs not fetched yet, so the page can offer to open them by hand when blocked. */
   waiting: string[];
   /** Sets found but not requested yet, newest first (fetch them with "more"). */
   found: string[];
+  /** Sets older than the cutoff, set aside rather than dropped ("include them"). */
+  older: number;
 }
 
 export interface EnqueueResult {
@@ -56,12 +64,14 @@ export class FetchQueue {
   private readonly saveFile: string | undefined;
   private readonly waiting: string[] = [];
   private readonly found: string[] = [];
+  private readonly older: string[] = [];
   private state: QueueState = "idle";
   private done = 0;
   private failed = 0;
   private pendingFailures = 0;
   private current: string | undefined;
   private blocked: string | undefined;
+  private pauseReason: PauseReason | undefined;
   private running: Promise<void> | undefined;
 
   constructor(store: TracklistStore, source: HtmlSource, options: QueueOptions = {}) {
@@ -72,17 +82,19 @@ export class FetchQueue {
     // Sets left over from last time come back paused: nothing is requested until you say so.
     if (this.saveFile && existsSync(this.saveFile)) {
       const saved: unknown = JSON.parse(readFileSync(this.saveFile, "utf8"));
-      // Older saves were one plain list: treat it all as found, to fetch in batches.
-      const { waiting, found } = Array.isArray(saved) ? { waiting: [], found: saved } : (saved as Record<string, unknown>);
-      if (!Array.isArray(waiting) || !Array.isArray(found)) throw new Error(`Invalid saved queue file: ${this.saveFile}`);
+      // Older saves were one plain list of sets still to fetch.
+      const { waiting, found, older = [] } = Array.isArray(saved) ? { waiting: [], found: saved } : (saved as Record<string, unknown>);
+      if (!Array.isArray(waiting) || !Array.isArray(found) || !Array.isArray(older)) throw new Error(`Invalid saved queue file: ${this.saveFile}`);
       const usable = (list: unknown[]) =>
         list.filter((url): url is string => typeof url === "string" && isFetchAllowed(url) && !this.store.has(tracklistId(url) ?? ""));
       this.waiting.push(...new Set(usable(waiting)));
       this.found.push(...new Set(usable(found).filter((url) => !this.waiting.includes(url))));
       sortNewestFirst(this.found);
+      this.older.push(...new Set(usable(older)));
+      // Sets "found" by older versions (which fetched in batches) just wait their turn now.
+      this.waiting.push(...this.found.splice(0, this.found.length));
       if (this.waiting.length > 0) {
-        this.state = "blocked";
-        this.blocked = `${this.waiting.length} sets were still waiting when setscope last stopped.`;
+        this.pause("restart", `${this.waiting.length} sets were still waiting when setscope last stopped.`);
       }
     }
   }
@@ -90,7 +102,7 @@ export class FetchQueue {
   private save(): void {
     if (!this.saveFile) return;
     const waiting = this.current ? [this.current, ...this.waiting] : this.waiting;
-    writeFileSync(this.saveFile, JSON.stringify({ waiting, found: this.found }));
+    writeFileSync(this.saveFile, JSON.stringify({ waiting, found: this.found, older: this.older }));
   }
 
   /**
@@ -98,9 +110,10 @@ export class FetchQueue {
    * then start fetching the newest `take` of them.
    */
   enqueue(urls: string[], since: string, take = Number.POSITIVE_INFINITY): EnqueueResult {
-    const { todo, alreadyCached, skippedOld } = triage(urls, this.store, since);
-    const known = new Set([...this.waiting, ...this.found, this.current]);
+    const { todo, alreadyCached, skippedOld, old } = triage(urls, this.store, since);
+    const known = new Set([...this.waiting, ...this.found, ...this.older, this.current]);
     const fresh = [...new Set(todo)].filter((url) => !known.has(url));
+    this.older.push(...new Set(old.filter((url) => !known.has(url))));
     this.found.push(...fresh);
     sortNewestFirst(this.found);
     const fetchingNow = this.more(take);
@@ -122,6 +135,26 @@ export class FetchQueue {
     return batch.length;
   }
 
+  /** Move the sets older than the cutoff into found, so "Fetch more" can get them. */
+  includeOlder(): number {
+    const moved = this.older.splice(0, this.older.length);
+    this.found.push(...moved.filter((url) => !this.found.includes(url)));
+    sortNewestFirst(this.found);
+    this.save();
+    return moved.length;
+  }
+
+  /** Empty the whole queue: waiting, found and older sets. A fetch already in flight finishes. */
+  clearQueue(): { waiting: number; found: number } {
+    const cleared = { waiting: this.waiting.length, found: this.found.length };
+    this.waiting.length = 0;
+    this.found.length = 0;
+    this.older.length = 0;
+    if (this.state === "blocked") this.unpause();
+    this.save();
+    return cleared;
+  }
+
   /** Forget the found-but-not-fetched sets. Sets already fetching are unaffected. */
   clearFound(): number {
     const cleared = this.found.length;
@@ -133,9 +166,8 @@ export class FetchQueue {
   /** After a block: try again with whatever is still waiting. */
   resume(): void {
     if (this.state !== "blocked") return;
-    this.blocked = undefined;
+    this.unpause();
     this.pendingFailures = 0; // they're back in line and about to be retried
-    this.state = "idle";
     this.start();
   }
 
@@ -152,13 +184,12 @@ export class FetchQueue {
       this.waiting.splice(index, 1);
       this.done++;
     }
-    const foundIndex = this.found.findIndex((url) => tracklistId(url) === set.id);
-    if (foundIndex !== -1) this.found.splice(foundIndex, 1);
-    this.save();
-    if (this.state === "blocked" && this.waiting.length === 0) {
-      this.blocked = undefined;
-      this.state = "idle";
+    for (const list of [this.found, this.older]) {
+      const i = list.findIndex((url) => tracklistId(url) === set.id);
+      if (i !== -1) list.splice(i, 1);
     }
+    this.save();
+    if (this.state === "blocked" && this.waiting.length === 0) this.unpause();
     return set;
   }
 
@@ -173,15 +204,29 @@ export class FetchQueue {
       etaSeconds: Math.round((remaining * this.delayMs) / 1000),
       waiting: [...this.waiting],
       found: [...this.found],
+      older: this.older.length,
     };
     if (this.current) status.current = this.current;
     if (this.blocked) status.blocked = this.blocked;
+    if (this.pauseReason) status.pauseReason = this.pauseReason;
     return status;
   }
 
   /** Resolves when the queue is empty or blocked. Used by tests. */
   async settled(): Promise<void> {
     while (this.running) await this.running;
+  }
+
+  private pause(reason: PauseReason, details: string): void {
+    this.state = "blocked";
+    this.pauseReason = reason;
+    this.blocked = details;
+  }
+
+  private unpause(): void {
+    this.state = "idle";
+    this.pauseReason = undefined;
+    this.blocked = undefined;
   }
 
   private start(): void {
@@ -206,8 +251,7 @@ export class FetchQueue {
         if (error instanceof BlockedError) {
           this.waiting.unshift(url); // try this one again on resume
           this.current = undefined;
-          this.blocked = error.message;
-          this.state = "blocked";
+          this.pause("site", error.message);
           this.save();
           return;
         }
@@ -216,8 +260,7 @@ export class FetchQueue {
         this.pendingFailures++;
         this.waiting.unshift(url);
         this.current = undefined;
-        this.blocked = `Paused on a request failure (not a site block): ${error instanceof Error ? error.message : String(error)}. Check the connection, then try again.`;
-        this.state = "blocked";
+        this.pause("failure", `Paused on a request failure (not a site block): ${error instanceof Error ? error.message : String(error)}.`);
         this.save();
         return;
       }

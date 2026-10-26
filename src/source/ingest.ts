@@ -58,7 +58,7 @@ export async function ingestUrls(
 /** Split URLs into ones to fetch, ones already cached, and ones too old to bother with. */
 export function triage(urls: string[], store: TracklistStore, since: string) {
   let alreadyCached = 0;
-  let skippedOld = 0;
+  const old: string[] = [];
   const todo = urls.filter((url) => {
     const id = tracklistId(url);
     if (!id) return false;
@@ -68,12 +68,12 @@ export function triage(urls: string[], store: TracklistStore, since: string) {
     }
     const date = dateFromUrl(url);
     if (date && date < since) {
-      skippedOld++;
+      old.push(url);
       return false;
     }
     return true;
   });
-  return { todo, alreadyCached, skippedOld };
+  return { todo, alreadyCached, skippedOld: old.length, old };
 }
 
 /** Store a tracklist page you saved from your browser. Returns the set's id. */
