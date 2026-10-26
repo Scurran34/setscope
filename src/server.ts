@@ -6,7 +6,7 @@
 // an account; site-wide settings (GetSongBPM key, background collecting) are the owner's
 // (the first account).
 //
-//   GET  /  /app.js                     the page, and web/app.ts with types stripped
+//   GET  /  /app.js  /player.ts          the page, and its browser modules with types stripped
 //   GET  /api/auth/me                    who you are, and whether sign-up is open
 //   POST /api/auth/register|login|logout
 //   GET  /api/song?q=  /api/artist?name=  /api/suggest  /api/trending
@@ -146,12 +146,10 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
   switch (route) {
     case "GET /":
       return sendFile(res, "index.html", "text/html; charset=utf-8");
-    case "GET /app.js": {
-      const source = readFileSync(join(WEB_DIR, "app.ts"), "utf8");
-      res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" });
-      res.end(stripTypeScriptTypes(source));
-      return;
-    }
+    case "GET /app.js":
+      return sendScript(res, "app.ts");
+    case "GET /player.ts": // imported by app.ts
+      return sendScript(res, "player.ts");
 
     // ---- accounts ----
     case "GET /api/auth/me":
@@ -495,6 +493,13 @@ async function readJson(req: IncomingMessage, maxChars = 1_000_000): Promise<unk
   } catch {
     throw new BadRequest("Body must be JSON");
   }
+}
+
+/** A browser module from web/, with its TypeScript types stripped. */
+function sendScript(res: ServerResponse, file: string): void {
+  const source = readFileSync(join(WEB_DIR, file), "utf8");
+  res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(stripTypeScriptTypes(source));
 }
 
 function sendFile(res: ServerResponse, file: string, type: string): void {

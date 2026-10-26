@@ -21,6 +21,7 @@ import type { BackgroundStatus } from "../src/source/background.ts";
 import type { DiscoveryRecord } from "../src/collect/discovery.ts";
 import type { QueueStatus } from "../src/collect/jobs.ts";
 import type { SongInfoResult } from "../src/source/songinfo.ts";
+import { mountPlayerBar, PlayerCore, SoundCloudProvider } from "./player.ts";
 
 type Mode = "song" | "artist";
 
@@ -161,18 +162,11 @@ function soundcloudSearch(song: string): string {
   return `https://soundcloud.com/search/sounds?q=${enc(song.replace(/\s+-\s+/, " "))}`;
 }
 
-/** SoundCloud's own player page for a set's recording. */
-function soundcloudPlayer(apiUrl: string): string {
-  return `https://w.soundcloud.com/player/?url=${enc(apiUrl)}&auto_play=false&visual=true`;
-}
-
 /** A list of sets: date, title (to 1001Tracklists), and a SoundCloud player link when there is one. */
 function setsCard(title: string, sets: (SetSummary & { liked?: string[] })[], empty = "none", preview = Number.POSITIVE_INFINITY): HTMLElement {
   const list = el("ol", { class: "sets" });
   sets.forEach((set, i) => {
-    const listen = set.soundcloud
-      ? externalLink(soundcloudPlayer(set.soundcloud), "▶ Listen", "act-link")
-      : el("span", { class: "muted small" }, "no recording");
+    const listen = set.soundcloud ? playButton(set) : el("span", { class: "muted small" }, "no recording");
     const row = el(
       "li",
       {},
@@ -192,6 +186,41 @@ function setsCard(title: string, sets: (SetSummary & { liked?: string[] })[], em
   if (sets.length > preview) card.append(showAllButton(list, sets.length));
   return card;
 }
+
+// ---- playback ----
+
+/** The one player for the whole app (see player.ts). */
+const player = new PlayerCore((events) => new SoundCloudProvider($<HTMLIFrameElement>("scFrame"), events));
+mountPlayerBar(player, $("player"), $<HTMLIFrameElement>("scFrame"));
+
+/** ▶ Play for a set with a recording; shows ❚❚ while it's the one playing. */
+function playButton(set: SetSummary): HTMLElement {
+  const button = el("button", { type: "button", class: "play-btn", "data-source": set.soundcloud! }, "▶ Play");
+  button.addEventListener("click", () =>
+    player.play({
+      provider: "soundcloud",
+      source: set.soundcloud!,
+      title: set.title,
+      subtitle: `${set.djs.join(" & ")} · ${set.date}`,
+      pageUrl: set.url,
+    }),
+  );
+  markPlaying(button);
+  return button;
+}
+
+function markPlaying(button: Element): void {
+  const state = player.get();
+  const mine = player.isCurrent((button as HTMLElement).dataset.source ?? "");
+  const on = mine && (state.status === "playing" || state.status === "loading");
+  button.classList.toggle("on", on);
+  button.textContent = on ? (state.status === "loading" ? "Loading…" : "❚❚ Pause") : "▶ Play";
+}
+
+// Keep every play button on the page in step with the player.
+player.subscribe(() => {
+  for (const button of document.querySelectorAll(".play-btn")) markPlaying(button);
+});
 
 /** "Show all N" / "Show fewer" for a list whose extra rows start hidden. */
 function showAllButton(list: HTMLElement, total: number): HTMLElement {

@@ -138,6 +138,26 @@ human check. The extension reads the page *you* opened in your own browser (the 
 and passes the set links to the local app. It only acts in tabs setscope opened, never in your normal
 browsing, and it never fills in or skips the human check.
 
+### Playback
+
+Sets with a SoundCloud recording (1001Tracklists embeds it on the set page) have a **▶ Play** button
+wherever they're listed: song pages, artist pages, and "For you". Playing a set opens the **player bar**
+at the bottom of every page: artwork, title, play/pause, a seek bar with time, volume, and a close
+button (which pauses). It's one player for the whole app and lives outside the page area, so moving
+between pages keeps it playing and never starts a second one. Nothing plays until you press play.
+
+How it works: SoundCloud's own embedded player (through its official Widget API) does the streaming.
+setscope only sends it play/pause/seek/volume commands, and never downloads or proxies audio. Its slim
+strip stays visible under the bar, and the bar credits the uploader and SoundCloud with links to the
+track, as SoundCloud's terms ask for custom players. If a recording can't be embedded (private, removed,
+or the uploader disallows it), the bar says so and links to the set page. If playback stalls at 0:00 for
+12 seconds, it offers to open the track on SoundCloud. Songs (as opposed to sets) don't have SoundCloud
+links yet; that comes with the SoundCloud integration in the next stage.
+
+The player has three layers in `web/player.ts`: `PlayerCore` (state, no page code, unit tested), a
+`PlaybackProvider` per service (`SoundCloudProvider` today), and the bar. Adding another service means
+writing another provider.
+
 ### How collecting works
 
 Every set to fetch is a job in the database (`collection_jobs`), shared by everyone and kept across
@@ -317,6 +337,7 @@ src/
 web/
   index.html          the page
   app.ts              browser code, served with types stripped by Node (no bundler)
+  player.ts           the player: core, SoundCloud provider (official Widget API), and the bar
 extension/            Chrome extension (plain JS: Chrome can't run TypeScript)
   capture.js          on 1001Tracklists: collect set links, auto-open an exact search match
   background.js       decides which tabs are setscope's, posts links to the server, closes the tab

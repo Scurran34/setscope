@@ -100,6 +100,11 @@ describe.skipIf(!available)("server", () => {
     const js = await (await fetch(`${base}/app.js`)).text();
     expect(js).not.toMatch(/^import type/m);
     expect(js).toContain("function showRoute");
+    const player = await fetch(`${base}/player.ts`);
+    expect(player.headers.get("content-type")).toMatch(/javascript/);
+    const playerJs = await player.text();
+    expect(playerJs).toContain("class PlayerCore");
+    expect(playerJs).not.toMatch(/^\s*interface /m);
   });
 
   it("signs up the owner (importing old likes), keeps them signed in, and signs out", async () => {
