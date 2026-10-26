@@ -18,6 +18,8 @@
 //   POST /api/capture  /api/capture-set   from the browser extension
 //   POST /api/add-links /api/resume /api/clear-queue /api/include-older /api/retry-failed (needs login)
 //   POST /api/refresh-set { url }        re-read a set now (needs login)
+//   GET  /api/charts/songs  /api/charts/artists  ?period=week|month|3months|year|all&genre=&q=&page=
+//   GET  /api/sets?q=&dj=&year=&page=  /api/set?id=  /api/genres  /api/search?q=  /api/vault-preview
 //   GET  /api/song-links?song=           confirmed SoundCloud links for a song
 //   POST /api/song-links  /api/song-links/remove        confirm (or remove) one (needs login)
 //   GET  /api/soundcloud/candidates?song=  /api/soundcloud/remixes?song=  /api/soundcloud/likes?profile=
@@ -47,7 +49,7 @@ import { DEFAULT_MONTHS, dataDir, sinceMonths } from "./config.ts";
 import { importLegacySets } from "./db/import-legacy.ts";
 import { migrate } from "./db/migrate.ts";
 import { createPool } from "./db/pool.ts";
-import { normalizeName, parseSongQuery, songKey, trackFromName } from "./normalize.ts";
+import { normalizeName, parseSongQuery, songKey, splitArtists, trackFromName } from "./normalize.ts";
 import { PgUserData, UserDataError } from "./personal/user-data.ts";
 import { BackgroundCollector } from "./source/background.ts";
 import { isFetchAllowed, PoliteFetcher } from "./source/fetcher.ts";
@@ -57,6 +59,7 @@ import { ScError, ScRateLimited, SoundCloudClient, type ScTrack } from "./soundc
 import { isTrackLink, LinkStore } from "./soundcloud/links.ts";
 import { classify, remixesOf, songCandidates, type Candidate } from "./soundcloud/match.ts";
 import { versionOf } from "./catalog/identity.ts";
+import { artistChart, genres, idStats, listSets, PERIODS, setDetail, songChart, type Period } from "./catalog/browse.ts";
 
 export const PORT = Number(process.env.SETSCOPE_PORT ?? 7331);
 const WEB_DIR = join(import.meta.dirname, "..", "web");
@@ -183,6 +186,7 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       return sendJson(res, 200, {
         user: user ? { ...user, owner: await app.accounts.isOwner(user.id) } : null,
         signup: await app.accounts.signupStatus(),
+        soundcloud: app.soundcloud.configured(),
       });
     case "POST /api/auth/register": {
       requireOwnHeader(req);
@@ -237,7 +241,10 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
         const fix = report.setsWithSong === 0 && params.get("exact") !== "1" ? correctSong(sets, q, app.since) : undefined;
         if (fix) report = { ...analyzeSong(sets, parseSongQuery(fix), options), correctedFrom: q };
       }
-      return sendJson(res, 200, await withUserData(app, user, report, sets));
+      // A photo of the song's first artist, when we have one (shown in place of cover art, which we don't have).
+      const first = report.matchedAs[0]?.name;
+      const image = first ? await artistImage(app.pool, trackFromName(first).artist) : null;
+      return sendJson(res, 200, { ...(await withUserData(app, user, report, sets)), image });
     }
     case "GET /api/artist": {
       const name = required(params, "name");
@@ -269,6 +276,39 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       const song = required(params, "song");
       if (!song.includes(" - ")) throw new BadRequest('Expected "Artist - Title"');
       return sendJson(res, 200, await app.songInfo.info(song));
+    }
+
+    // ---- browsing (charts by performance date, sets, search) ----
+    case "GET /api/charts/songs":
+      return sendJson(res, 200, await songChart(app.pool, { ...chartParams(params), pageSize: pageSizeParam(params, 25) }));
+    case "GET /api/charts/artists":
+      return sendJson(res, 200, await artistChart(app.pool, { ...chartParams(params), pageSize: pageSizeParam(params, 24), withPhoto: params.get("photo") === "1" }));
+    case "GET /api/sets": {
+      const year = params.get("year") ? intParam(params, "year", 0) : undefined;
+      const query: Parameters<typeof listSets>[1] = { page: intParam(params, "page", 1), pageSize: pageSizeParam(params, 24) };
+      const q = params.get("q")?.trim();
+      const dj = params.get("dj")?.trim();
+      if (q) query.q = q;
+      if (dj) query.dj = dj;
+      if (year) query.year = year;
+      return sendJson(res, 200, await listSets(app.pool, query, normalizeName));
+    }
+    case "GET /api/set": {
+      const set = await setDetail(app.pool, required(params, "id"));
+      if (!set) return sendJson(res, 404, { error: "That set isn't indexed." });
+      return sendJson(res, 200, set);
+    }
+    case "GET /api/genres":
+      return sendJson(res, 200, await genres(app.pool));
+    case "GET /api/vault-preview":
+      return sendJson(res, 200, await idStats(app.pool));
+    case "GET /api/search": {
+      // One box for everything: songs, artists and sets (IDs join when the Vault arrives).
+      const q = required(params, "q");
+      const since = sinceMonths(intParam(params, "months", DEFAULT_MONTHS));
+      const all = await app.catalog.all();
+      const sets = await listSets(app.pool, { q, page: 1, pageSize: 6 }, normalizeName);
+      return sendJson(res, 200, { songs: searchSongs(all, q, since, 8), artists: searchArtists(all, q, since, 8), sets: sets.items, setsTotal: sets.total });
     }
 
     // ---- your data (needs login) ----
@@ -564,6 +604,31 @@ async function withUserData(app: App, user: User | undefined, report: SongReport
     categories: all.filter((c) => key in c.songs).map((c) => c.name),
     hints: categoryHints(sets, key, all, report.since),
   };
+}
+
+async function artistImage(pool: pg.Pool, artistText: string): Promise<string | null> {
+  const names = splitArtists(artistText).map(normalizeName);
+  if (!names.length) return null;
+  const r = await pool.query<{ image_url: string }>(
+    "select image_url from artists where name_key = any($1) and image_url is not null order by array_position($1, name_key) limit 1",
+    [names],
+  );
+  return r.rows[0]?.image_url ?? null;
+}
+
+function chartParams(params: URLSearchParams): { period: Period; genre?: string; q?: string; page: number; today: string } {
+  const period = (params.get("period") ?? "month") as Period;
+  if (!PERIODS.includes(period)) throw new BadRequest(`"period" must be one of ${PERIODS.join(", ")}`);
+  const out: { period: Period; genre?: string; q?: string; page: number; today: string } = { period, page: intParam(params, "page", 1), today: today() };
+  const genre = params.get("genre")?.trim();
+  const q = params.get("q")?.trim();
+  if (genre) out.genre = genre;
+  if (q) out.q = q;
+  return out;
+}
+
+function pageSizeParam(params: URLSearchParams, fallback: number): number {
+  return Math.min(intParam(params, "size", fallback), 100);
 }
 
 /** "Artist - Title" from ?song=. */

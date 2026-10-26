@@ -86,29 +86,46 @@ until it's installed):
 
 Then:
 
-The app has real pages, each with its own address, so links, Back and Forward work. The top bar
-(Home · Trending · Account, plus the search box) is on every page.
+The app has real pages, each with its own address, so links, Back and Forward work. The look follows
+the design wireframe: dark, with artist photos where 1001Tracklists has them. Where there's no photo
+(and there's never song cover art), a plain colored tile with initials stands in; nothing pretends to
+be a real cover. The top bar (Home · Explore · Songs · Artists · Sets · Library, the search box, and your
+account) is on every page. On a phone it becomes a tab bar at the bottom.
 
-- **Home**: sets with the most of your liked songs, songs you might like, a trending preview, and
-  your categories.
-- **Trending**: songs and artists whose share of your cached sets rose after a date you pick (last 2
-  weeks, month, or 3 months), with the percent change or **NEW**, plus the most played songs and
-  artists in that window. Based on the sets you've collected, not all of 1001Tracklists.
-- **Artist pages** (`#/artist/<name>`): their picture, country, links (SoundCloud, Spotify, Instagram,
-  Beatport...) and 1001Tracklists page, all read from the DJ cards on cached set pages. Also how many of
-  their sets you have, how many other DJs' sets play them, genres, labels, and a trend chart. Below that
-  are **their songs**: click one to open its numbers (DJs who play it, songs played alongside, IDs, key/BPM)
-  right there, without leaving the artist page. Their own sets and who they play are at the bottom.
-- **Song pages** live under their artist (`#/artist/<name>/song/<song>`): who plays it, recurring IDs, what
-  it's played alongside, every set with a **▶ Listen** link to the set's SoundCloud recording, genre,
-  key and BPM, ♡ Like, and your categories with **Maybe part of "Party"** hints. Every song and artist name
-  anywhere is a link to its page.
-- **Account**: liked songs, your categories (each has a page of songs that **might fit**), collecting
-  controls, background collecting, adding sets by link, your GetSongBPM key, and cache stats. Everything
-  is stored on this computer; there's no login yet.
+- **Home**: a search hero, then **Trending Songs** (This Week / This Month / Last 3 Months / Last 12
+  Months / All Time, plus a genre filter), **Trending Artists**, **Popular Artists to Explore**, **Recent DJ
+  Sets**, a SoundCloud discovery entry, **Your Music** (a few likes and your categories), and an
+  **Unreleased Vault · Coming soon** spot next to it.
+- **Songs** (`#/songs?period=&genre=&q=&page=`): most played songs, 25 per page with numbered pages,
+  filters that live in the address (so a filtered page can be bookmarked), sets, unique DJs, trend, and
+  ▶ when the song has a confirmed SoundCloud link. **Rising** (`#/trending`) is linked from here.
+- **Artists** (`#/artists`): the same filters, ranked by how many sets played their tracks.
+- **Sets** (`#/sets`): cards for every indexed set, newest performance first, filtered by text, DJ and
+  year. A **set page** (`#/set/<id>`) has the full tracklist in order, with IDs marked and every song and
+  artist linked, ▶ for the recording, and **Re-read this set**.
+- **Search results** (`#/find/<text>`): songs, artists and sets together, from the top-bar box (which
+  also suggests all three as you type).
+- **Artist pages** (`#/artist/<name>`): a photo header with country, genres, labels and their links, a
+  stats strip, **their songs** (click one to open its numbers in place), recent sets, trend, and who they
+  play.
+- **Song pages** (`#/artist/<name>/song/<song>`): a header with the artist's photo, genre, key & BPM, ▶ (once
+  a SoundCloud link is confirmed), ♡ Like and Gather more sets; a stats strip (sets, unique DJs, share
+  of indexed sets, last played); your categories; SoundCloud links and remixes; who plays it; IDs; what
+  it's played alongside; and every set that played it.
+- **Library**: liked songs, your categories, sets with the most of your liked songs, and songs you might
+  like. **Account**: collecting controls, settings and keys.
 
-**Searching:** type a title alone or `Artist - Title`. The box suggests cached songs and artists as
-you type. Matching ignores case, accents, periods and apostrophes, and tolerates typos. If a search
+**How charts count.** A song's number is how many *different* indexed sets played it, by the date each
+set was **performed** (a set played in July counts for July, even if setscope collected it in
+October; sets without a date only count toward All Time). Unidentified IDs never enter the song chart.
+**Trend** compares the song's *share* of sets with the window just before (so collecting more sets one
+week doesn't make everything look like it's rising), and only shows when both windows have at least 5
+sets and the song had at least 3 earlier plays; a song with none before and 3+ now is **NEW**. All of
+this reflects sets indexed by setscope, not every set in existence. The queries are in
+`src/catalog/browse.ts` and run in Postgres, one page at a time.
+
+**Searching:** the top-bar box suggests artists, songs and sets as you type; Enter shows all
+results. For a song, a title alone or `Artist - Title` works. Matching ignores case, accents, periods and apostrophes, and tolerates typos. If a search
 finds nothing but one cached name is clearly what you meant, you get that page with "Showing results
 for CHRIS STASSY · Search for “chris stussy” instead".
 
@@ -349,6 +366,7 @@ src/
   catalog/            the shared catalog
     catalog.ts        the Catalog interface (has / save / all / count)
     pg-catalog.ts     Catalog on Postgres: saving sets, artists, tracks; history on refresh
+    browse.ts         song/artist charts by performance date, set list and set pages, paged in SQL
     identity.ts       which tracklist lines are the same recording; versions; IDs
   db/                 database plumbing
     pool.ts           connection (DATABASE_URL)

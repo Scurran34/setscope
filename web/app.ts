@@ -3,9 +3,14 @@
 // types with the analysis code without bundling any of it.
 //
 // Each page has its own address (the part after #), so links, Back and Forward work:
-//   #/                               Home: for you, a trending preview, your categories
-//   #/trending                       Trending
-//   #/account                        Your library, collecting, settings
+//   #/                               Home: discovery first (trending songs and artists, recent sets)
+//   #/songs?period=&genre=&q=&page=  Most played songs, by when sets were performed
+//   #/artists?period=&genre=&q=&page= Artist rankings
+//   #/sets?q=&dj=&year=&page=        DJ sets;  #/set/<id>  one set's tracklist
+//   #/find/<text>                    Search results: songs, artists, sets
+//   #/trending                       Rising songs and artists
+//   #/library                        Your likes, categories, picks for you
+//   #/account                        Your account, collecting, settings
 //   #/artist/<name>                  Artist page (songs open in place, without leaving it)
 //   #/artist/<name>/song/<song>      Song page, under its artist
 //   #/song/<text>                    A song search; moves to the song's page once found
@@ -22,6 +27,7 @@ import type { BackgroundStatus } from "../src/source/background.ts";
 import type { DiscoveryRecord } from "../src/collect/discovery.ts";
 import type { QueueStatus } from "../src/collect/jobs.ts";
 import type { SongInfoResult } from "../src/source/songinfo.ts";
+import type { ArtistRow, Paged, Period, SetCard, SetLine, SongRow } from "../src/catalog/browse.ts";
 import { mountPlayerBar, PlayerCore, SoundCloudProvider, type Playable } from "./player.ts";
 
 type Mode = "song" | "artist";
@@ -30,6 +36,12 @@ type Route =
   | { page: "home" }
   | { page: "trending" }
   | { page: "account" }
+  | { page: "library" }
+  | { page: "songs"; params: URLSearchParams }
+  | { page: "artists"; params: URLSearchParams }
+  | { page: "sets"; params: URLSearchParams }
+  | { page: "set"; id: string }
+  | { page: "find"; query: string }
   | { page: "artist"; name: string; exact: boolean }
   | { page: "song"; artist: string; song: string }
   | { page: "search"; query: string; exact: boolean }
@@ -68,6 +80,8 @@ let me: Me = { likes: [], categories: [] };
 interface AuthState {
   user: { id: number; email: string; displayName: string; owner: boolean } | null;
   signup: "open" | "invite" | "closed";
+  /** Is the SoundCloud app connected (search, remixes, Explore)? */
+  soundcloud?: boolean;
 }
 let auth: AuthState = { user: null, signup: "closed" };
 let lastStatus: Status | undefined;
@@ -156,6 +170,11 @@ function chips(items: { name: string; href: string }[]): HTMLElement {
   return el("div", { class: "chips" }, ...items.map((i) => el("a", { class: "chip", href: i.href }, i.name)));
 }
 
+/** A number in the stats strip under a page's hero. */
+function bigStat(value: string | number, label: string): HTMLElement {
+  return el("div", {}, el("b", {}, String(value)), el("span", {}, label));
+}
+
 function stat(value: string | number, label: string): HTMLElement {
   return el("span", { class: "stat" }, el("b", {}, String(value)), el("span", {}, label));
 }
@@ -176,7 +195,7 @@ function setsCard(title: string, sets: (SetSummary & { liked?: string[] })[], em
       el(
         "span",
         { class: "set-name" },
-        externalLink(set.url, set.title),
+        el("a", { class: "link", href: `#/set/${enc(set.id)}` }, set.title),
         set.liked?.length ? el("div", { class: "small muted" }, `♥ ${set.liked.length}: ${set.liked.join(", ")}`) : "",
       ),
       listen,
@@ -206,9 +225,9 @@ function playButton(set: SetSummary): HTMLElement {
   });
 }
 
-/** ▶ Play for anything the player can play (a set, a SoundCloud upload). */
-function playableButton(item: Playable): HTMLElement {
-  const button = el("button", { type: "button", class: "play-btn", "data-source": item.source }, "▶ Play");
+/** ▶ Play for anything the player can play (a set, a SoundCloud upload). `round`: the icon-only chart button. */
+function playableButton(item: Playable, round = false): HTMLElement {
+  const button = el("button", { type: "button", class: round ? "play-btn play-round" : "play-btn", "data-source": item.source, "aria-label": `Play ${item.title}` }, "▶ Play");
   button.addEventListener("click", () => player.play(item));
   markPlaying(button);
   return button;
@@ -219,7 +238,8 @@ function markPlaying(button: Element): void {
   const mine = player.isCurrent((button as HTMLElement).dataset.source ?? "");
   const on = mine && (state.status === "playing" || state.status === "loading");
   button.classList.toggle("on", on);
-  button.textContent = on ? (state.status === "loading" ? "Loading…" : "❚❚ Pause") : "▶ Play";
+  if (button.classList.contains("play-round")) button.textContent = on ? (state.status === "loading" ? "…" : "❚❚") : "▶";
+  else button.textContent = on ? (state.status === "loading" ? "Loading…" : "❚❚ Pause") : "▶ Play";
 }
 
 // Keep every play button on the page in step with the player.
@@ -296,17 +316,26 @@ async function loadMe(): Promise<void> {
   } catch {
     // keep what we had
   }
-  const account = document.querySelector<HTMLAnchorElement>('.nav a[data-nav="account"]');
-  if (account) account.textContent = auth.user ? auth.user.displayName : "Sign in";
+  $("meName").textContent = auth.user ? auth.user.displayName : "Sign in";
+  $("meDot").textContent = auth.user ? (auth.user.displayName.match(/[A-Za-z0-9]/)?.[0] ?? "?").toUpperCase() : "?";
 }
 
 // ---- navigation ----
 
 function parseRoute(hash: string): Route {
-  const parts = hash.replace(/^#\/?/, "").split("/").map((p) => decodeURIComponent(p));
+  // Names in addresses are encoded, so a literal "?" only starts our own filters.
+  const [path = "", query = ""] = hash.replace(/^#\/?/, "").split("?");
+  const params = new URLSearchParams(query);
+  const parts = path.split("/").map((p) => decodeURIComponent(p));
   const [first, second, third, fourth] = parts;
   if (first === "trending") return { page: "trending" };
   if (first === "account") return { page: "account" };
+  if (first === "library") return { page: "library" };
+  if (first === "songs") return { page: "songs", params };
+  if (first === "artists") return { page: "artists", params };
+  if (first === "sets") return { page: "sets", params };
+  if (first === "set" && second) return { page: "set", id: second };
+  if (first === "find" && second) return { page: "find", query: second };
   if (first === "artist" && second && third === "song" && fourth) return { page: "song", artist: second, song: fourth };
   if (first === "artist" && second) return { page: "artist", name: second, exact: third === "exact" };
   if (first === "song" && second) return { page: "search", query: second, exact: third === "exact" };
@@ -319,11 +348,15 @@ function parseRoute(hash: string): Route {
 async function showRoute(): Promise<void> {
   hideSuggest();
   route = parseRoute(location.hash);
-  const nav = route.page === "trending" || route.page === "account" || route.page === "discover" ? route.page : route.page === "home" ? "home" : "";
-  for (const a of document.querySelectorAll<HTMLAnchorElement>(".nav a")) a.classList.toggle("active", a.dataset.nav === nav);
+  const NAV: Partial<Record<Route["page"], string>> = {
+    home: "home", songs: "songs", trending: "songs", song: "songs", search: "songs", artists: "artists", artist: "artists",
+    sets: "sets", set: "sets", library: "library", category: "library", account: "account", discover: "discover",
+  };
+  const nav = NAV[route.page] ?? "";
+  for (const a of document.querySelectorAll<HTMLAnchorElement>("[data-nav]")) a.classList.toggle("active", a.dataset.nav === nav);
   if (route.page === "artist") setMode("artist");
   if (route.page === "song" || route.page === "search") setMode("song");
-  $<HTMLInputElement>("query").value = route.page === "song" ? route.song : route.page === "search" ? route.query : route.page === "artist" ? route.name : "";
+  $<HTMLInputElement>("query").value = route.page === "find" ? route.query : "";
   $("formError").hidden = true;
   await loadMe();
   await render();
@@ -349,6 +382,18 @@ async function render(): Promise<void> {
         return show(await songPage(route.query, undefined, route.exact));
       case "category":
         return show(await categoryPage(route.name));
+      case "library":
+        return show(await libraryPage());
+      case "songs":
+        return show(await songsPage(route.params));
+      case "artists":
+        return show(await artistsPage(route.params));
+      case "sets":
+        return show(await setsPage(route.params));
+      case "set":
+        return show(await setPage(route.id));
+      case "find":
+        return show(await findPage(route.query));
       case "discover":
         return show(discoverPage(route.profile));
     }
@@ -379,72 +424,598 @@ function pageHead(title: string | Node, sub?: string | Node, crumbs?: (Node | st
 
 const homeCrumb = () => el("a", { href: "#/" }, "Home");
 
+// ---- artwork, filters and paging (shared by the browse pages) ----
+
+/** A real photo when we have one; otherwise a plain colored tile with initials (never a made-up cover). */
+function art(name: string, image: string | null | undefined, cls = ""): HTMLElement {
+  const fallback = () => {
+    const words = name.replace(/[^\p{L}\p{N} ]/gu, " ").split(/\s+/).filter(Boolean);
+    const initials = words.slice(0, 2).map((w) => w[0]!.toUpperCase()).join("") || "♪";
+    let hue = 0;
+    for (const c of name) hue = (hue * 31 + c.codePointAt(0)!) % 360;
+    return el("div", { class: `art ${cls}`, style: `background:linear-gradient(135deg,hsl(${hue} 55% 34%),hsl(${(hue + 60) % 360} 55% 16%))`, "aria-hidden": "true" }, initials);
+  };
+  if (!image) return fallback();
+  const img = el("img", { class: `art ${cls}`, src: image, alt: "", loading: "lazy", referrerpolicy: "no-referrer" });
+  img.addEventListener("error", () => img.replaceWith(fallback()));
+  return img;
+}
+
+/** Round ▶ for chart rows; a dimmed one when there's nothing to play yet. */
+function playRound(item: Playable | null, missing = "No SoundCloud link yet: open the song to find one"): HTMLElement {
+  if (item) return playableButton(item, true);
+  return el("button", { type: "button", class: "play-round", disabled: "", title: missing, "aria-label": missing }, "▶");
+}
+
+const PERIOD_LABELS: Record<Period, string> = { week: "This Week", month: "This Month", "3months": "Last 3 Months", year: "Last 12 Months", all: "All Time" };
+const PERIOD_WORDS: Record<Period, string> = { week: "week", month: "month", "3months": "3 months", year: "12 months", all: "" };
+
+function periodTabs(current: Period, pick: (p: Period) => void): HTMLElement {
+  return el(
+    "div",
+    { class: "tabs", role: "group", "aria-label": "Time" },
+    ...(Object.keys(PERIOD_LABELS) as Period[]).map((p) => {
+      const b = el("button", { type: "button", class: p === current ? "on" : "", "aria-pressed": String(p === current) }, PERIOD_LABELS[p]);
+      b.addEventListener("click", () => pick(p));
+      return b;
+    }),
+  );
+}
+
+let genreList: { name: string; lines: number }[] | undefined;
+
+/** "All genres" + the catalog's genres, most common first. */
+async function genreSelect(current: string, pick: (genre: string) => void): Promise<HTMLElement> {
+  genreList ??= await getJson<{ name: string; lines: number }[]>("/api/genres").catch(() => []);
+  const select = el(
+    "select",
+    { "aria-label": "Genre" },
+    el("option", { value: "" }, "All genres"),
+    ...genreList.map((g) => el("option", g.name === current ? { value: g.name, selected: "" } : { value: g.name }, g.name)),
+  ) as HTMLSelectElement;
+  select.addEventListener("change", () => pick(select.value));
+  return select;
+}
+
+/** The same list page with some filters changed (and back to page 1 unless a page is given). */
+function listHash(page: string, params: URLSearchParams, changes: Record<string, string | null>): string {
+  const next = new URLSearchParams(params);
+  if (!("page" in changes)) next.delete("page");
+  for (const [key, value] of Object.entries(changes)) {
+    if (value === null || value === "") next.delete(key);
+    else next.set(key, value);
+  }
+  const query = next.toString();
+  return `#/${page}${query ? `?${query}` : ""}`;
+}
+
+/** 1 2 3 … 20 › */
+function pager(p: { page: number; pages: number }, hrefFor: (page: number) => string): HTMLElement {
+  const nav = el("nav", { class: "pager", "aria-label": "Pages" });
+  if (p.pages <= 1) return nav;
+  const shown = new Set([1, p.pages, p.page - 1, p.page, p.page + 1].filter((n) => n >= 1 && n <= p.pages));
+  if (p.page > 1) nav.append(el("a", { href: hrefFor(p.page - 1), "aria-label": "Previous page" }, "‹"));
+  let last = 0;
+  for (const n of [...shown].sort((a, b) => a - b)) {
+    if (n - last > 1) nav.append(el("span", { class: "gap" }, "…"));
+    nav.append(n === p.page ? el("span", { class: "on", "aria-current": "page" }, String(n)) : el("a", { href: hrefFor(n) }, String(n)));
+    last = n;
+  }
+  if (p.page < p.pages) nav.append(el("a", { href: hrefFor(p.page + 1), "aria-label": "Next page" }, "›"));
+  return nav;
+}
+
+function trendCell(trend: number | "new" | null): HTMLElement {
+  if (trend === null) return el("span", { class: "trend none", title: "Not enough sets in one of the two windows to say" }, "–");
+  if (trend === "new") return el("span", { class: "trend new" }, "NEW");
+  return el("span", { class: `trend ${trend >= 0 ? "up" : "down"}` }, `${trend >= 0 ? "▲" : "▼"} ${trend >= 0 ? "+" : ""}${trend}%`);
+}
+
+function sectionHead(title: string, seeAll?: string, right?: Node): HTMLElement {
+  return el("div", { class: "section-head" }, el("h2", {}, title), el("div", { class: "btns" }, right ?? "", seeAll ? el("a", { class: "see-all", href: seeAll }, "See all →") : ""));
+}
+
+function songName(row: { artist: string; title: string }): string {
+  return `${row.artist} - ${row.title}`;
+}
+
+/** The songs chart table (Home preview and the Songs page). */
+function songsTable(rows: SongRow[], options: { compact?: boolean } = {}): HTMLElement {
+  const head = el(
+    "tr",
+    {},
+    el("th", { class: "rank" }, "#"),
+    el("th", {}, "Song"),
+    options.compact ? "" : el("th", { class: "hide-sm" }, "Genre"),
+    el("th", { class: "num" }, "Sets"),
+    options.compact ? "" : el("th", { class: "num hide-sm" }, "DJs"),
+    el("th", { class: "num" }, "Trend"),
+    el("th", {}, ""),
+  );
+  const body = rows.map((r) => {
+    const name = songName(r);
+    return el(
+      "tr",
+      {},
+      el("td", { class: "rank" }, String(r.rank)),
+      el(
+        "td",
+        { class: "song-col" },
+        el(
+          "div",
+          { class: "song-cell" },
+          art(r.artist, r.artistImage),
+          el("div", {}, el("a", { href: songHash(name) }, r.title), el("div", { class: "who small" }, ...joined(artistsOf(name).map(artistLink), ", "))),
+        ),
+      ),
+      options.compact ? "" : el("td", { class: "hide-sm muted small" }, r.genre ?? ""),
+      el("td", { class: "num" }, String(r.sets)),
+      options.compact ? "" : el("td", { class: "num hide-sm muted" }, String(r.djs)),
+      el("td", { class: "num" }, trendCell(r.trend)),
+      el("td", {}, playRound(r.soundcloud ? { provider: "soundcloud", source: r.soundcloud, title: r.title, subtitle: r.artist, pageUrl: r.soundcloud } : null)),
+    );
+  });
+  return el("table", { class: "chart" }, el("thead", {}, head), el("tbody", {}, ...body));
+}
+
+/** One DJ set as a card: the DJ's photo (when we have one), event, DJs, date, track count. */
+function setCardEl(set: SetCard): HTMLElement {
+  const photo = set.djs.find((d) => d.image)?.image;
+  const cover = el("div", { class: "cover" });
+  const plain = () => {
+    let hue = 0;
+    for (const c of set.event) hue = (hue * 31 + c.codePointAt(0)!) % 360;
+    cover.style.background = `linear-gradient(135deg,hsl(${hue} 50% 30%),hsl(${(hue + 70) % 360} 55% 14%))`;
+    cover.replaceChildren(el("div", { class: "initials", "aria-hidden": "true" }, (set.djs[0]?.name ?? set.event).slice(0, 2).toUpperCase()));
+  };
+  if (photo) {
+    const img = el("img", { src: photo, alt: "", loading: "lazy", referrerpolicy: "no-referrer" });
+    img.addEventListener("error", plain);
+    cover.append(img);
+  } else plain();
+  const facts = [set.date ?? "date unknown", plural(set.tracks, "track"), set.ids ? plural(set.ids, "ID") : ""].filter(Boolean).join(" · ");
+  return el(
+    "div",
+    { class: "set-card" },
+    el(
+      "a",
+      { href: `#/set/${enc(set.id)}`, style: "text-decoration:none" },
+      cover,
+      el("div", { class: "info" }, el("div", { class: "event" }, set.event), el("div", { class: "djs" }, set.djs.map((d) => d.name).join(" & ") || "Unknown DJ"), el("div", { class: "facts" }, facts)),
+    ),
+    set.soundcloud
+      ? playRound({ provider: "soundcloud", source: set.soundcloud, title: set.title, subtitle: `${set.djs.map((d) => d.name).join(" & ")} · ${set.date ?? ""}`, pageUrl: set.url })
+      : "",
+  );
+}
+
+function peopleList(rows: ArtistRow[]): HTMLElement {
+  return el(
+    "ol",
+    { class: "people" },
+    ...rows.map((a) =>
+      el(
+        "li",
+        {},
+        el(
+          "a",
+          { href: artistHash(a.name) },
+          el("span", { class: "n" }, String(a.rank)),
+          art(a.name, a.image, "round"),
+          el("span", { class: "who" }, a.name, el("small", {}, `played in ${plural(a.playedIn, "set")}`)),
+          trendCell(a.trend),
+          el("span", { class: "chev", "aria-hidden": "true" }, "›"),
+        ),
+      ),
+    ),
+  );
+}
+
+function circles(rows: ArtistRow[]): HTMLElement {
+  return el(
+    "div",
+    { class: "circles" },
+    ...rows.map((a) => el("a", { href: artistHash(a.name) }, art(a.name, a.image, "round"), a.name, el("span", { class: "sub" }, `in ${plural(a.playedIn, "set")}`))),
+  );
+}
+
+/** Fill a card once its data arrives (each Home section loads on its own). */
+function loading(card: HTMLElement, title: string): HTMLElement {
+  card.replaceChildren(el("h2", {}, title), el("p", { class: "muted small" }, "Loading…"));
+  return card;
+}
+
+function failed(card: HTMLElement, title: string, error: unknown): void {
+  card.replaceChildren(el("h2", {}, title), el("p", { class: "error small" }, (error as Error).message));
+}
+
 // ---- Home ----
+
+async function homePage(): Promise<HTMLElement> {
+  const heroInput = el("input", { type: "text", placeholder: "Search artists, songs, or sets…", "aria-label": "Search" }) as HTMLInputElement;
+  const heroForm = el("form", { class: "hero-search", role: "search" }, heroInput, el("button", { type: "submit", class: "primary" }, "Search"));
+  heroForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const text = heroInput.value.trim();
+    if (text) location.hash = `#/find/${enc(text)}`;
+  });
+  const hero = el(
+    "section",
+    { class: "hero" },
+    el("h1", {}, "Discover what's being played now."),
+    el("p", {}, `The songs DJs keep reaching for, the artists behind them, and full tracklists, from ${plural(lastStatus?.sets ?? 0, "indexed DJ set")}.`),
+    heroForm,
+    el(
+      "div",
+      { class: "entry" },
+      el("a", { href: "#/songs?period=week" }, "Top songs this week"),
+      el("a", { href: "#/trending" }, "Rising"),
+      el("a", { href: "#/artists" }, "Artists"),
+      el("a", { href: "#/sets" }, "Latest sets"),
+      el("a", { href: "#/discover" }, "Explore SoundCloud"),
+    ),
+  );
+
+  // Trending songs, with its own time and genre filters.
+  const songsCard = loading(el("section", { class: "card" }), "Trending Songs");
+  let period: Period = "week";
+  let genre = "";
+  const drawSongs = async () => {
+    try {
+      const r = await getJson<Paged<SongRow>>(`/api/charts/songs?period=${period}&genre=${enc(genre)}&size=6`);
+      const filters = el("div", { class: "filters" }, periodTabs(period, (p) => ((period = p), void drawSongs())), await genreSelect(genre, (g) => ((genre = g), void drawSongs())));
+      songsCard.replaceChildren(
+        sectionHead("Trending Songs", listHash("songs", new URLSearchParams(), { period, genre })),
+        filters,
+        r.items.length ? songsTable(r.items, { compact: true }) : el("p", { class: "empty" }, `No indexed sets ${period === "all" ? "yet" : `in the last ${PERIOD_WORDS[period]}`}.`),
+      );
+    } catch (e) {
+      failed(songsCard, "Trending Songs", e);
+    }
+  };
+
+  const artistsCard = loading(el("section", { class: "card" }), "Trending Artists");
+  const exploreCard = loading(el("section", { class: "card" }), "Popular Artists to Explore");
+  const setsSection = loading(el("section", { class: "card" }), "Recent DJ Sets");
+  const youCard = loading(el("section", { class: "card" }), "Your Music");
+  const vaultCard = vaultSpot();
+
+  void drawSongs();
+  void getJson<Paged<ArtistRow>>("/api/charts/artists?period=week&size=5")
+    .then((r) => artistsCard.replaceChildren(sectionHead("Trending Artists", "#/artists?period=week"), r.items.length ? peopleList(r.items) : el("p", { class: "empty" }, "No sets this week yet.")))
+    .catch((e) => failed(artistsCard, "Trending Artists", e));
+  void getJson<Paged<ArtistRow>>("/api/charts/artists?period=3months&photo=1&size=8")
+    .then((r) => exploreCard.replaceChildren(sectionHead("Popular Artists to Explore", "#/artists?period=3months"), circles(r.items)))
+    .catch((e) => failed(exploreCard, "Popular Artists to Explore", e));
+  void getJson<Paged<SetCard>>("/api/sets?size=8")
+    .then((r) => setsSection.replaceChildren(sectionHead("Recent DJ Sets", "#/sets"), el("div", { class: "set-grid" }, ...r.items.map(setCardEl))))
+    .catch((e) => failed(setsSection, "Recent DJ Sets", e));
+  fillYourMusic(youCard);
+
+  const scCard = el(
+    "section",
+    { class: "card" },
+    sectionHead("Discover on SoundCloud"),
+    el(
+      "p",
+      { class: "muted small" },
+      auth.soundcloud
+        ? "Browse what a DJ, label or friend has liked on SoundCloud, or open any song to find its SoundCloud upload and remixes."
+        : "Once SoundCloud is connected (Account), you can browse curators' likes and find songs' uploads and remixes here.",
+    ),
+    el("div", { class: "btns" }, el("a", { class: "act-link", href: "#/discover" }, "Explore curators' likes →")),
+  );
+
+  return el(
+    "div",
+    { class: "stack" },
+    hero,
+    el("div", { class: "split" }, songsCard, artistsCard),
+    exploreCard,
+    setsSection,
+    scCard,
+    el("div", { class: "split" }, youCard, vaultCard),
+  );
+}
+
+/** Home's one personal section: a few liked songs and your categories. */
+function fillYourMusic(card: HTMLElement): void {
+  if (!auth.user) {
+    card.replaceChildren(
+      sectionHead("Your Music"),
+      el("p", { class: "muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to like songs, save SoundCloud finds and sort them into your own categories."),
+    );
+    return;
+  }
+  const likes = me.likes.slice(-6).reverse();
+  card.replaceChildren(
+    sectionHead(`Your Music`, "#/library"),
+    likes.length
+      ? el("ol", { class: "people" }, ...likes.map((song) => el("li", {}, el("a", { href: songHash(song) }, art(song, null), el("span", { class: "who" }, song.slice(song.indexOf(" - ") + 3), el("small", {}, artistsOf(song).join(", ")))))))
+      : el("p", { class: "muted small" }, "Like songs (♡ on a song page) and they'll show up here."),
+    me.categories.length ? el("div", { style: "margin-top:12px" }, chips(me.categories.map((c) => ({ name: `${c.name} (${c.songs.length})`, href: categoryHash(c.name) })))) : "",
+  );
+}
+
+/** Where the Unreleased Vault will go: following IDs until they're identified or released. */
+function vaultSpot(): HTMLElement {
+  const stat = el("p", { class: "small muted" });
+  void getJson<{ lines: number; sets: number }>("/api/vault-preview")
+    .then((r) => (stat.textContent = `${plural(r.lines, "unidentified ID line")} across ${plural(r.sets, "indexed set")} so far.`))
+    .catch(() => {});
+  return el(
+    "section",
+    { class: "card vault-spot" },
+    el("div", { class: "section-head" }, el("h2", {}, "Unreleased Vault"), el("span", { class: "soon" }, "Coming soon")),
+    el("p", { class: "small" }, "Save the IDs you hear in sets, and setscope will tell you when one gets identified or released."),
+    stat,
+  );
+}
+
+// ---- Songs ----
+
+async function songsPage(params: URLSearchParams): Promise<HTMLElement> {
+  const period = (params.get("period") ?? "month") as Period;
+  const genre = params.get("genre") ?? "";
+  const q = params.get("q") ?? "";
+  const page = Number(params.get("page") ?? 1) || 1;
+  const r = await getJson<Paged<SongRow> & { setsInWindow: number }>(`/api/charts/songs?period=${period}&genre=${enc(genre)}&q=${enc(q)}&page=${page}`);
+  const to = (changes: Record<string, string | null>) => (location.hash = listHash("songs", params, changes));
+
+  const search = el("input", { type: "search", placeholder: "Search songs…", value: q, "aria-label": "Search songs" }) as HTMLInputElement;
+  const form = el("form", {}, search);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    to({ q: search.value.trim() });
+  });
+  return el(
+    "div",
+    { class: "stack" },
+    pageHead("Most Played Songs", "Songs played in the most DJ sets, counted by when each set was performed.", undefined, el("a", { class: "see-all", href: "#/trending" }, "Rising songs →")),
+    el(
+      "section",
+      { class: "card" },
+      el("div", { class: "filters" }, periodTabs(period, (p) => to({ period: p })), form, await genreSelect(genre, (g) => to({ genre: g }))),
+      r.items.length ? songsTable(r.items) : el("p", { class: "empty" }, q ? `No songs matching “${q}” in this window.` : "No indexed sets in this window."),
+      pager(r, (n) => listHash("songs", params, { page: String(n) })),
+      el(
+        "p",
+        { class: "footnote" },
+        `${plural(r.total, "song")} from ${plural(r.setsInWindow, "set")} indexed by setscope${period === "all" ? "" : ` in the last ${PERIOD_WORDS[period]}`}, not every set in existence. `,
+        period === "all" ? "" : `Trend compares each song's share of sets with the ${PERIOD_WORDS[period]} before, and shows only when both windows have enough sets.`,
+      ),
+    ),
+  );
+}
+
+// ---- Artists ----
+
+async function artistsPage(params: URLSearchParams): Promise<HTMLElement> {
+  const period = (params.get("period") ?? "3months") as Period;
+  const genre = params.get("genre") ?? "";
+  const q = params.get("q") ?? "";
+  const page = Number(params.get("page") ?? 1) || 1;
+  const r = await getJson<Paged<ArtistRow>>(`/api/charts/artists?period=${period}&genre=${enc(genre)}&q=${enc(q)}&page=${page}`);
+  const to = (changes: Record<string, string | null>) => (location.hash = listHash("artists", params, changes));
+  const search = el("input", { type: "search", placeholder: "Search artists…", value: q, "aria-label": "Search artists" }) as HTMLInputElement;
+  const form = el("form", {}, search);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    to({ q: search.value.trim() });
+  });
+  const rows = r.items.map((a) =>
+    el(
+      "tr",
+      {},
+      el("td", { class: "rank" }, String(a.rank)),
+      el("td", { class: "song-col" }, el("div", { class: "song-cell" }, art(a.name, a.image, "round"), el("div", {}, el("a", { href: artistHash(a.name) }, a.name), a.country ? el("div", { class: "who small muted" }, a.country) : ""))),
+      el("td", { class: "num" }, String(a.playedIn)),
+      el("td", { class: "num hide-sm muted" }, String(a.ownSets)),
+      el("td", { class: "num" }, trendCell(a.trend)),
+    ),
+  );
+  return el(
+    "div",
+    { class: "stack" },
+    pageHead("Artists", "Ranked by how many DJ sets played their tracks (as artist or remixer)."),
+    el(
+      "section",
+      { class: "card" },
+      el("div", { class: "filters" }, periodTabs(period, (p) => to({ period: p })), form, await genreSelect(genre, (g) => to({ genre: g }))),
+      r.items.length
+        ? el(
+            "table",
+            { class: "chart" },
+            el("thead", {}, el("tr", {}, el("th", { class: "rank" }, "#"), el("th", {}, "Artist"), el("th", { class: "num" }, "Played in sets"), el("th", { class: "num hide-sm" }, "Their own sets"), el("th", { class: "num" }, "Trend"))),
+            el("tbody", {}, ...rows),
+          )
+        : el("p", { class: "empty" }, q ? `No artists matching “${q}”.` : "No indexed sets in this window."),
+      pager(r, (n) => listHash("artists", params, { page: String(n) })),
+      el("p", { class: "footnote" }, "Counts DJ sets indexed by setscope, by performance date. Photos come from 1001Tracklists profiles."),
+    ),
+  );
+}
+
+// ---- Sets ----
+
+async function setsPage(params: URLSearchParams): Promise<HTMLElement> {
+  const q = params.get("q") ?? "";
+  const dj = params.get("dj") ?? "";
+  const year = params.get("year") ?? "";
+  const page = Number(params.get("page") ?? 1) || 1;
+  const r = await getJson<Paged<SetCard>>(`/api/sets?q=${enc(q)}&dj=${enc(dj)}${year ? `&year=${year}` : ""}&page=${page}`);
+  const to = (changes: Record<string, string | null>) => (location.hash = listHash("sets", params, changes));
+  const search = el("input", { type: "search", placeholder: "Search sets or events…", value: q, "aria-label": "Search sets" }) as HTMLInputElement;
+  const djInput = el("input", { type: "search", placeholder: "DJ", value: dj, "aria-label": "DJ", style: "width:160px" }) as HTMLInputElement;
+  const form = el("form", {}, search, djInput, el("button", { type: "submit" }, "Filter"));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    to({ q: search.value.trim(), dj: djInput.value.trim() });
+  });
+  const thisYear = new Date().getFullYear();
+  const years = el(
+    "select",
+    { "aria-label": "Year" },
+    el("option", { value: "" }, "All years"),
+    ...Array.from({ length: 7 }, (_, i) => String(thisYear - i)).map((y) => el("option", y === year ? { value: y, selected: "" } : { value: y }, y)),
+  ) as HTMLSelectElement;
+  years.addEventListener("change", () => to({ year: years.value }));
+  return el(
+    "div",
+    { class: "stack" },
+    pageHead("Sets", `${plural(r.total, "DJ set")} indexed${dj ? ` with ${dj}` : ""}, newest performances first.`),
+    el("div", { class: "filters" }, form, years, dj || q || year ? el("a", { class: "see-all", href: "#/sets" }, "Clear filters") : ""),
+    r.items.length ? el("div", { class: "set-grid" }, ...r.items.map(setCardEl)) : el("div", { class: "card empty" }, "No sets match those filters."),
+    pager(r, (n) => listHash("sets", params, { page: String(n) })),
+  );
+}
+
+async function setPage(id: string): Promise<HTMLElement> {
+  const s = await getJson<SetCard & { lines: SetLine[]; lastRefreshed: string | null }>(`/api/set?id=${enc(id)}`);
+  const photo = s.djs.find((d) => d.image)?.image;
+  const backdrop = el("div", { class: "backdrop" });
+  if (photo) backdrop.style.backgroundImage = `url(${JSON.stringify(photo)})`;
+  const playable: Playable | null = s.soundcloud ? { provider: "soundcloud", source: s.soundcloud, title: s.title, subtitle: `${s.djs.map((d) => d.name).join(" & ")} · ${s.date ?? ""}`, pageUrl: s.url } : null;
+  const refresh = el("button", { type: "button" }, "Re-read this set");
+  refresh.addEventListener("click", async () => {
+    refresh.textContent = "Queued…";
+    try {
+      await post("/api/refresh-set", { url: s.url });
+      refresh.textContent = "Queued: it'll update shortly";
+    } catch (e) {
+      refresh.textContent = (e as Error).message;
+    }
+  });
+  const hero = el(
+    "section",
+    { class: "profile-hero" },
+    backdrop,
+    art(s.djs[0]?.name ?? s.event, photo, "lg"),
+    el(
+      "div",
+      { class: "body" },
+      el("div", { class: "crumbs" }, homeCrumb(), " › ", el("a", { href: "#/sets" }, "Sets"), " › Set"),
+      el("div", { class: "kicker" }, "DJ set"),
+      el("h1", {}, s.event),
+      el("div", { class: "meta" }, ...joined(s.djs.map((d) => artistLink(d.name)), " & "), ` · ${s.date ?? "date unknown"}`),
+      el("div", { class: "tags" }, el("span", {}, plural(s.tracks, "track")), s.ids ? el("span", {}, `${plural(s.ids, "unidentified ID")}`) : ""),
+      el("div", { class: "btns", style: "margin-top:14px" }, playable ? playableButton(playable) : el("span", { class: "muted small" }, "No recording linked"), externalLink(s.url, "Open on 1001Tracklists", "act-link"), auth.user ? refresh : ""),
+    ),
+  );
+  const lines = s.lines.map((l) =>
+    el(
+      "li",
+      {},
+      el("span", { class: "pos" }, String(l.position + 1)),
+      el(
+        "span",
+        { class: "t" },
+        l.isId ? el("span", {}, el("span", { class: "id" }, "ID "), `${l.artist} - ${l.title}`) : el("a", { href: songHash(l.song!) }, l.title),
+        l.isId ? "" : el("div", { class: "who small muted" }, ...joined(artistsOf(l.song!).map(artistLink), ", ")),
+      ),
+      el("span", { class: "muted small hide-sm" }, l.genre ?? ""),
+      l.soundcloud ? playableButton({ provider: "soundcloud", source: l.soundcloud, title: l.title, subtitle: l.artist, pageUrl: l.soundcloud }, true) : "",
+    ),
+  );
+  return el(
+    "div",
+    { class: "stack" },
+    hero,
+    el(
+      "section",
+      { class: "card" },
+      el("h2", {}, "Tracklist"),
+      lines.length ? el("ol", { class: "tracklist" }, ...lines) : el("p", { class: "muted small" }, "No tracks listed."),
+      el("p", { class: "footnote" }, "As written on 1001Tracklists.", s.lastRefreshed ? ` Last re-read ${new Date(s.lastRefreshed).toLocaleDateString()}.` : ""),
+    ),
+  );
+}
+
+// ---- Search results ----
+
+interface FindResult {
+  songs: Ranked[];
+  artists: Ranked[];
+  sets: SetCard[];
+  setsTotal: number;
+}
+
+async function findPage(text: string): Promise<HTMLElement> {
+  const r = await getJson<FindResult>(`/api/search?q=${enc(text)}&months=${months()}`);
+  const nothing = !r.songs.length && !r.artists.length && !r.sets.length;
+  return el(
+    "div",
+    { class: "stack" },
+    pageHead(`Results for “${text}”`, nothing ? "Nothing indexed matches that yet." : `${plural(r.artists.length, "artist")} · ${plural(r.songs.length, "song")} · ${plural(r.setsTotal, "set")}`),
+    el(
+      "div",
+      { class: "grid" },
+      rankedCard("Songs", r.songs, "set", "No matching songs.", { linkTo: "song" }),
+      rankedCard("Artists", r.artists, "set", "No matching artists.", { linkTo: "artist" }),
+    ),
+    r.sets.length
+      ? el("section", { class: "card" }, sectionHead("Sets", r.setsTotal > r.sets.length ? listHash("sets", new URLSearchParams(), { q: text }) : undefined), el("div", { class: "set-grid" }, ...r.sets.map(setCardEl)))
+      : "",
+    el(
+      "div",
+      { class: "card small" },
+      "Not what you meant? ",
+      el("a", { class: "link", href: `#/song/${enc(text)}` }, "Search it as a song title"),
+      " (with spelling fixes), or look it up on 1001Tracklists: ",
+      findButton("Find songs", text, "song", false),
+      " ",
+      findButton("Find an artist", text, "artist", false),
+    ),
+  );
+}
+
+// ---- Library ----
+
+async function libraryPage(): Promise<HTMLElement> {
+  if (!auth.user) return signInPage();
+  const [a, forYou] = await Promise.all([getJson<Account>("/api/account"), getJson<ForYou>(`/api/for-you?months=${months()}`)]);
+  const likes = el("ol", { class: "ranked" });
+  for (const song of a.likes) {
+    const unlike = el("button", { type: "button", class: "act" }, "Unlike");
+    unlike.addEventListener("click", async () => {
+      await post("/api/like", { song, liked: false });
+      await loadMe();
+      await render();
+    });
+    likes.append(el("li", {}, el("span", { class: "name" }, songLink(song)), unlike));
+  }
+  return el(
+    "div",
+    { class: "stack" },
+    pageHead("Your Library", `${plural(a.likes.length, "liked song")} · ${a.categories.length} ${a.categories.length === 1 ? "category" : "categories"}`),
+    el(
+      "div",
+      { class: "grid" },
+      el("section", { class: "card" }, el("h2", {}, `Liked songs (${a.likes.length})`), a.likes.length ? likes : el("p", { class: "muted small" }, "Nothing liked yet: ♡ a song on its page.")),
+      el(
+        "section",
+        { class: "card" },
+        el("h2", {}, `Your categories (${a.categories.length})`),
+        a.categories.length
+          ? chips(a.categories.map((c) => ({ name: `${c.name} (${c.songs})`, href: categoryHash(c.name) })))
+          : el("p", { class: "muted small" }, "Add a song to a category from its page, or save a SoundCloud find into one."),
+      ),
+    ),
+    forYou.likes.length
+      ? el(
+          "div",
+          { class: "grid" },
+          setsCard("Sets with the most of your liked songs", forYou.sets, "No indexed set has your liked songs yet.", 5),
+          rankedCard("Songs you might like", forYou.songs, "shared set", "Like a few more songs, or gather more sets, to get suggestions.", { linkTo: "song" }),
+        )
+      : "",
+  );
+}
 
 interface ForYou {
   likes: string[];
   sets: SetForYou[];
   songs: Ranked[];
-}
-
-async function homePage(): Promise<HTMLElement> {
-  const [forYou, trend] = await Promise.all([
-    getJson<ForYou>(`/api/for-you?months=${months()}`),
-    getJson<TrendingReport>(`/api/trending?days=30&months=${months()}`),
-  ]);
-  const sets = lastStatus?.sets ?? 0;
-  const page = el(
-    "div",
-    { class: "stack" },
-    pageHead("What are DJs playing?", `${plural(sets, "set")} cached · ${plural(forYou.likes.length, "liked song")} · search a song or artist above`),
-  );
-
-  if (!auth.user) {
-    page.append(
-      el(
-        "div",
-        { class: "card" },
-        el("h2", {}, "For you"),
-        el("p", { class: "muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to like songs and get sets and songs picked for you."),
-      ),
-    );
-  } else if (forYou.likes.length === 0) {
-    page.append(
-      el(
-        "div",
-        { class: "card" },
-        el("h2", {}, "For you"),
-        el("p", { class: "muted small" }, "Like songs (♡ on a song page) and this fills with sets that play them and songs you might like."),
-      ),
-    );
-  } else {
-    page.append(
-      el(
-        "div",
-        { class: "grid" },
-        setsCard("Sets with the most of your liked songs", forYou.sets, "No cached set has your liked songs yet.", 5),
-        rankedCard("Songs you might like", forYou.songs, "shared set", "Like a few more songs, or gather more sets, to get suggestions.", { linkTo: "song" }),
-      ),
-    );
-  }
-
-  const preview = (title: string, kind: Mode, items: TrendingItem[]) => trendingList(title, kind, items.slice(0, 3));
-  page.append(
-    el(
-      "div",
-      { class: "card" },
-      el("div", { class: "row" }, el("h2", {}, `Trending since ${trend.recentFrom}`), el("a", { class: "act-link", href: "#/trending" }, "See all trending →")),
-      trend.enoughData
-        ? el("div", { class: "grid" }, preview("Songs", "song", trend.songs), preview("Artists", "artist", trend.artists))
-        : el("p", { class: "muted small" }, "Not enough cached sets to spot trends yet. Gather more sets, or turn on background collecting in Account."),
-    ),
-  );
-  if (me.categories.length) {
-    page.append(
-      el("div", { class: "card" }, el("h2", {}, "Your categories"), chips(me.categories.map((c) => ({ name: `${c.name} (${c.songs.length})`, href: categoryHash(c.name) })))),
-    );
-  }
-  return page;
 }
 
 // ---- Trending ----
@@ -528,16 +1099,6 @@ async function accountPage(): Promise<HTMLElement> {
     await render();
   });
 
-  const likes = el("ol", { class: "ranked" });
-  for (const song of a.likes) {
-    const unlike = el("button", { type: "button", class: "act" }, "Unlike");
-    unlike.addEventListener("click", async () => {
-      await post("/api/like", { song, liked: false });
-      await render();
-    });
-    likes.append(el("li", {}, el("span", { class: "name" }, songLink(song)), unlike));
-  }
-
 
   const keyInput = el("input", { type: "password", placeholder: a.getSongBpmKey ? "•••••••• (saved)" : "Paste your API key", class: "small-input", autocomplete: "off" }) as HTMLInputElement;
   const keyMsg = el("span", { class: "small muted" }, a.getSongBpmKey ? "Key saved: song pages show key & BPM." : "No key yet: song pages can't show key & BPM.");
@@ -598,16 +1159,9 @@ async function accountPage(): Promise<HTMLElement> {
     pageHead(a.user.displayName, `${a.user.email}${owner ? " · site owner" : ""}`, undefined, signOut),
     el(
       "div",
-      { class: "grid" },
-      el("div", { class: "card" }, el("h2", {}, `Liked songs (${a.likes.length})`), a.likes.length ? likes : el("p", { class: "muted small" }, "Nothing liked yet.")),
-      el(
-        "div",
-        { class: "card" },
-        el("h2", {}, `Your categories (${a.categories.length})`),
-        a.categories.length
-          ? chips(a.categories.map((c) => ({ name: `${c.name} (${c.songs})`, href: categoryHash(c.name) })))
-          : el("p", { class: "muted small" }, "Add a song to a category from its page."),
-      ),
+      { class: "card small" },
+      `${plural(a.likes.length, "liked song")} and ${a.categories.length} ${a.categories.length === 1 ? "category" : "categories"} · `,
+      el("a", { class: "link", href: "#/library" }, "Open your Library"),
     ),
     el("h2", {}, "Collecting sets"),
     el("div", { id: "queueMount" }, el("div", { class: "card muted small", id: "queueIdle" }, "Nothing queued. Use “Gather more sets” on a song or artist page.")),
@@ -729,44 +1283,53 @@ function signInPage(): HTMLElement {
 async function artistPage(name: string, exact: boolean): Promise<HTMLElement> {
   const r = await getJson<ArtistPage>(`/api/artist?name=${enc(name)}&months=${months()}${exact ? "&exact=1" : ""}`);
   const p = r.profile;
-  const initial = (p.name.match(/[A-Za-z0-9]/)?.[0] ?? "?").toUpperCase();
-  const avatar = p.image ? el("img", { class: "avatar", src: p.image, alt: "" }) : el("div", { class: "avatar" }, initial);
   const links = [...(p.page ? [{ label: "1001Tracklists", url: p.page }] : []), ...p.links];
+  const backdrop = el("div", { class: "backdrop" });
+  if (p.image) backdrop.style.backgroundImage = `url(${JSON.stringify(p.image)})`;
 
-  const header = el(
-    "div",
-    { class: "card" },
+  const hero = el(
+    "section",
+    { class: "profile-hero" },
+    backdrop,
+    art(p.name, p.image, "xl round"),
     el(
       "div",
-      { class: "profile" },
-      avatar,
+      { class: "body" },
+      el("div", { class: "crumbs" }, homeCrumb(), " › ", el("a", { href: "#/artists" }, "Artists"), " › Artist"),
+      el("div", { class: "kicker" }, "Artist"),
+      el("h1", {}, p.name),
+      el("div", { class: "meta" }, [p.country, p.genres[0]?.name].filter(Boolean).join(" · ") || "No profile on the indexed set pages yet"),
+      r.discovery ? el("div", { class: "small gathered" }, gatheredLine(r.discovery)) : "",
+      correctionNotice("artist", p.name, r.correctedFrom),
+      p.genres.length > 1 || p.labels.length ? el("div", { class: "tags" }, ...p.genres.slice(0, 4).map((g) => el("span", {}, g.name)), ...p.labels.slice(0, 3).map((l) => el("span", {}, l.name))) : "",
       el(
         "div",
-        { class: "profile-body" },
-        el("div", { class: "crumbs" }, homeCrumb(), " › Artist"),
-        el("h1", {}, p.name),
-        el("div", { class: "muted small" }, [p.country, p.lastSeen && `last seen ${p.lastSeen}`].filter(Boolean).join(" · ") || "No profile on the cached set pages yet"),
-        r.discovery ? el("div", { class: "small gathered" }, gatheredLine(r.discovery)) : "",
-        correctionNotice("artist", p.name, r.correctedFrom),
-        el("div", {}, stat(p.ownSets.length, "of their sets cached"), stat(p.playedBy, "sets by others play them"), stat(p.songs.length, "of their songs played")),
-        p.genres.length ? el("div", { class: "small" }, el("b", {}, "Genres: "), p.genres.map((g) => g.name).join(", ")) : "",
-        p.labels.length ? el("div", { class: "small" }, el("b", {}, "Labels: "), p.labels.map((l) => l.name).join(", ")) : "",
-        links.length ? el("div", { class: "chips" }, ...links.map((l) => externalLink(l.url, l.label, "chip"))) : "",
-        el("div", { class: "btns", style: "margin-top:10px" }, findButton(p.ownSets.length ? "Gather more sets" : "Find their sets on 1001Tracklists", p.name, "artist", p.ownSets.length === 0)),
+        { class: "btns", style: "margin-top:14px" },
+        findButton(p.ownSets.length ? "Gather more sets" : "Find their sets on 1001Tracklists", p.name, "artist", true),
+        el("a", { class: "act-link", href: listHash("sets", new URLSearchParams(), { dj: p.name }) }, "Their sets →"),
       ),
+      links.length ? el("div", { class: "chips", style: "margin-top:12px" }, ...links.map((l) => externalLink(l.url, l.label, "chip"))) : "",
     ),
   );
+  const stats = el(
+    "div",
+    { class: "stats" },
+    bigStat(p.ownSets.length, "Their sets indexed"),
+    bigStat(p.playedBy, "Sets playing their songs"),
+    bigStat(p.songs.length, "Songs played"),
+    bigStat(p.lastSeen ?? "–", "Last seen"),
+  );
 
-  const page = el("div", { class: "stack" }, header);
+  const page = el("div", { class: "stack" }, hero, stats);
   const suggestions = didYouMean("artist", r.suggestions ?? []);
   if (suggestions) page.append(suggestions);
-  page.append(artistTrendCard(r), artistSongsCard(p));
   page.append(
+    el("div", { class: "split" }, artistSongsCard(p), setsCard(`Recent sets (${p.ownSets.length})`, p.ownSets, "None of their own sets indexed yet.", 6)),
     el(
       "div",
       { class: "grid" },
-      setsCard(`Their sets (${p.ownSets.length})`, p.ownSets, "None of their own sets cached yet.", 5),
-      rankedCard(`Who ${p.name} plays most`, r.mostPlayedArtists, "play", "No sets by this artist cached yet.", { linkTo: "artist" }),
+      artistTrendCard(r),
+      rankedCard(`Who ${p.name} plays most`, r.mostPlayedArtists, "play", "No sets by this artist indexed yet.", { linkTo: "artist" }),
     ),
   );
   return page;
@@ -869,7 +1432,7 @@ function songSummary(r: SongReport, artist: string): HTMLElement {
 // ---- Song ----
 
 async function songPage(query: string, artist: string | undefined, exact: boolean): Promise<HTMLElement> {
-  const r = await getJson<SongReport>(`/api/song?q=${enc(query)}&months=${months()}${exact ? "&exact=1" : ""}`);
+  const r = await getJson<SongReport & { image: string | null }>(`/api/song?q=${enc(query)}&months=${months()}${exact ? "&exact=1" : ""}`);
   const none = r.setsWithSong === 0;
   const name = r.matchedAs[0]?.name ?? r.song;
   // A search that found the song moves to its proper page, under the artist.
@@ -883,27 +1446,44 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
   crumbs.push("Song");
 
   const artists = artistsOf(name);
+  const dash = name.indexOf(" - ");
+  const title = none || dash === -1 ? name : name.slice(dash + 3);
+  const backdrop = el("div", { class: "backdrop" });
+  if (r.image) backdrop.style.backgroundImage = `url(${JSON.stringify(r.image)})`;
+  // ▶ Play appears once we know the song has a confirmed SoundCloud link.
+  const playSlot = el("span", {});
+  if (!none) {
+    void getJson<{ links: { url: string }[] }>(`/api/song-links?song=${enc(name)}`)
+      .then((l) => {
+        const link = l.links[0];
+        if (link) playSlot.replaceChildren(playableButton({ provider: "soundcloud", source: link.url, title, subtitle: artists.join(", "), pageUrl: link.url }));
+      })
+      .catch(() => {});
+  }
   const head = el(
-    "div",
-    { class: "card" },
-    el("div", { class: "crumbs" }, ...crumbs),
+    "section",
+    { class: "profile-hero" },
+    backdrop,
+    art(name, r.image, "lg"),
     el(
       "div",
-      { class: "row" },
+      { class: "body" },
+      el("div", { class: "crumbs" }, ...crumbs),
+      el("div", { class: "kicker" }, "Song"),
+      el("h1", {}, title),
+      artists.length && !none ? el("div", { class: "meta" }, ...joined(artists.map(artistLink), ", ")) : "",
+      none ? el("div", { class: "meta" }, "No indexed sets contain this song yet. Find it on 1001Tracklists and setscope will collect its sets.") : "",
+      r.matchedAs.length > 1 ? el("div", { class: "muted small" }, `Also written as: ${r.matchedAs.slice(1).map((m) => m.name).join(", ")}`) : "",
+      correctionNotice("song", name, r.correctedFrom),
+      r.otherVersions?.length ? el("div", { class: "small" }, `Other songs called “${r.song}”:`, chips(r.otherVersions.map((v) => ({ name: v.name, href: songHash(v.name) })))) : "",
+      none ? "" : songFacts(name, r.genre),
       el(
         "div",
-        {},
-        el("h1", {}, name),
-        artists.length && !none ? el("div", { class: "small" }, "by ", ...joined(artists.map(artistLink))) : "",
-        el("div", { class: "muted small" }, none
-          ? "No cached sets contain this song yet. Find it on 1001Tracklists and setscope will collect its sets."
-          : `In ${r.setsWithSong} of ${r.setsConsidered} cached sets since ${r.since}.`),
-        r.matchedAs.length > 1 ? el("div", { class: "muted small" }, `Also written as: ${r.matchedAs.slice(1).map((m) => m.name).join(", ")}`) : "",
-        correctionNotice("song", name, r.correctedFrom),
-        r.otherVersions?.length ? el("div", { class: "small" }, `Other songs called “${r.song}”:`, chips(r.otherVersions.map((v) => ({ name: v.name, href: songHash(v.name) })))) : "",
-        none ? "" : songFacts(name, r.genre),
+        { class: "btns", style: "margin-top:14px" },
+        playSlot,
+        none ? "" : likeButton(name, r.liked ?? false, () => void render()),
+        findButton(none ? "Find sets on 1001Tracklists" : "Gather more sets", name, "song", none),
       ),
-      el("div", { class: "btns" }, none ? "" : likeButton(name, r.liked ?? false, () => void render()), findButton(none ? "Find sets on 1001Tracklists" : "Gather more sets", name, "song", none)),
     ),
   );
   const page = el("div", { class: "stack" }, head);
@@ -913,6 +1493,14 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
     return page;
   }
   page.append(
+    el(
+      "div",
+      { class: "stats" },
+      bigStat(r.setsWithSong, "Sets"),
+      bigStat(r.uniqueDjs, "Unique DJs"),
+      bigStat(`${r.setsConsidered ? Math.round((r.setsWithSong / r.setsConsidered) * 1000) / 10 : 0}%`, `of indexed sets since ${r.since}`),
+      bigStat(r.sets[0]?.date ?? "–", "Last played"),
+    ),
     categoriesCard(name, r.categories ?? [], r.hints ?? []),
     soundcloudCard(name),
     el(
@@ -930,7 +1518,7 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
       rankedCard("Recurring IDs", r.recurringIds, "set", "No ID showed up in more than one of these sets."),
     ),
     rankedCard("Most played alongside it", r.coPlayed, "set", "none", { linkTo: "song" }),
-    setsCard(`Sets with this song (newest ${r.sets.length} of ${r.setsWithSong})`, r.sets, "none", 5),
+    setsCard(`Recently played in sets (${r.setsWithSong})`, r.sets, "none", 10),
   );
   return page;
 }
@@ -1682,22 +2270,20 @@ let refreshWaiting = false;
 // ---- search box and dropdown: cached songs/artists that look like what you're typing ----
 
 let suggestTimer: ReturnType<typeof setTimeout> | undefined;
-let suggestItems: Ranked[] = [];
+interface Suggestion {
+  kind: "Artists" | "Songs" | "Sets";
+  name: string;
+  detail: string;
+  href: string;
+}
+
+let suggestItems: Suggestion[] = [];
 let suggestIndex = -1;
 /** Bumped on every lookup and every close, so only the latest lookup's answer is drawn. */
 let suggestRequest = 0;
 
-function go(kind: Mode, text: string): void {
+function goTo(hash: string): void {
   hideSuggest();
-  const hash = kind === "artist" ? artistHash(text) : text.includes(" - ") ? songHash(text) : `#/song/${enc(text)}`;
-  if (location.hash === hash) void render();
-  else location.hash = hash;
-}
-
-/** Search-box text goes through a search, so auto-correct and title-only matching apply. */
-function search(kind: Mode, text: string): void {
-  hideSuggest();
-  const hash = kind === "artist" ? artistHash(text) : `#/song/${enc(text)}`;
   if (location.hash === hash) void render();
   else location.hash = hash;
 }
@@ -1712,22 +2298,23 @@ function hideSuggest(): void {
 
 function drawSuggest(): void {
   const box = $("suggest");
-  box.replaceChildren(
-    ...suggestItems.map((item, i) => {
-      const option = el(
-        "button",
-        { type: "button", role: "option", "aria-selected": String(i === suggestIndex) },
-        el("span", {}, item.name),
-        el("span", { class: "count" }, plural(item.count, "set")),
-      );
-      // mousedown (not click) so it fires before the input loses focus and hides the list.
-      option.addEventListener("mousedown", (event) => {
-        event.preventDefault();
-        go(mode, item.name);
-      });
-      return option;
-    }),
-  );
+  const nodes: HTMLElement[] = [];
+  suggestItems.forEach((item, i) => {
+    if (item.kind !== suggestItems[i - 1]?.kind) nodes.push(el("div", { class: "group" }, item.kind));
+    const option = el(
+      "button",
+      { type: "button", role: "option", "aria-selected": String(i === suggestIndex) },
+      el("span", {}, item.name),
+      el("span", { class: "count" }, item.detail),
+    );
+    // mousedown (not click) so it fires before the input loses focus and hides the list.
+    option.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      goTo(item.href);
+    });
+    nodes.push(option);
+  });
+  box.replaceChildren(...nodes);
   box.hidden = suggestItems.length === 0;
   $("query").setAttribute("aria-expanded", String(!box.hidden));
 }
@@ -1735,10 +2322,15 @@ function drawSuggest(): void {
 async function updateSuggest(): Promise<void> {
   const request = ++suggestRequest;
   const q = $<HTMLInputElement>("query").value.trim();
-  let items: Ranked[] = [];
+  let items: Suggestion[] = [];
   if (q.length >= 2) {
     try {
-      items = await getJson<Ranked[]>(`/api/suggest?mode=${mode}&q=${enc(q)}&months=${months()}`);
+      const r = await getJson<FindResult>(`/api/search?q=${enc(q)}&months=${months()}`);
+      items = [
+        ...r.artists.slice(0, 3).map((a): Suggestion => ({ kind: "Artists", name: a.name, detail: plural(a.count, "set"), href: artistHash(a.name) })),
+        ...r.songs.slice(0, 5).map((t): Suggestion => ({ kind: "Songs", name: t.name, detail: plural(t.count, "set"), href: songHash(t.name) })),
+        ...r.sets.slice(0, 3).map((x): Suggestion => ({ kind: "Sets", name: x.event, detail: `${x.djs.map((d) => d.name).join(" & ")} · ${x.date ?? ""}`, href: `#/set/${enc(x.id)}` })),
+      ];
     } catch {
       items = [];
     }
@@ -1750,21 +2342,15 @@ async function updateSuggest(): Promise<void> {
   drawSuggest();
 }
 
+/** Which kind of page we're on (used when opening 1001Tracklists for more sets). */
 function setMode(next: Mode): void {
   mode = next;
-  for (const b of document.querySelectorAll<HTMLButtonElement>(".seg button")) {
-    b.setAttribute("aria-pressed", String(b.dataset.mode === next));
-  }
-  $<HTMLInputElement>("query").placeholder = next === "song" ? "Song title, or Artist - Title" : "Artist name";
 }
 
-for (const b of document.querySelectorAll<HTMLButtonElement>(".seg button")) {
-  b.addEventListener("click", () => setMode(b.dataset.mode as Mode));
-}
 $("searchForm").addEventListener("submit", (event) => {
   event.preventDefault();
   const text = $<HTMLInputElement>("query").value.trim();
-  if (text) search(mode, text);
+  if (text) goTo(`#/find/${enc(text)}`);
 });
 $("query").addEventListener("input", () => {
   clearTimeout(suggestTimer);
@@ -1779,7 +2365,7 @@ $("query").addEventListener("keydown", (event) => {
     drawSuggest();
   } else if (event.key === "Enter" && suggestIndex >= 0) {
     event.preventDefault();
-    go(mode, suggestItems[suggestIndex]!.name);
+    goTo(suggestItems[suggestIndex]!.href);
   } else if (event.key === "Escape") {
     hideSuggest();
   }

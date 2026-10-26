@@ -31,13 +31,15 @@ export interface SongReport {
   suggestions: Ranked[];
   /** DJs credited on the most sets containing the song. */
   topDjs: Ranked[];
+  /** How many different DJs played it. */
+  uniqueDjs: number;
   /** Unreleased IDs that show up in at least two of those sets. */
   recurringIds: Ranked[];
   /** Other released songs that show up most in those sets. */
   coPlayed: Ranked[];
   /** Most common genre tag on the song across those sets, e.g. "Tech House". */
   genre?: string;
-  /** The sets that play it, newest first. */
+  /** All the sets that play it, newest first. */
   sets: SetSummary[];
   /** Filled in by the server from your own data: */
   liked?: boolean;
@@ -95,9 +97,10 @@ export function analyzeSong(sets: Tracklist[], query: SongQuery, options: SongOp
     matchedAs: matched.top(5),
     suggestions: withSong.length === 0 && query.guesses ? searchSongs(sets, query.label, options.since, 5) : [],
     topDjs: djs.top(top),
+    uniqueDjs: djs.top(Number.POSITIVE_INFINITY).length,
     recurringIds: ids.top(top, 2),
     coPlayed: others.top(top),
-    sets: [...withSong].sort(newestFirst).slice(0, 10).map(summarize),
+    sets: [...withSong].sort(newestFirst).map(summarize),
   };
   const genre = genres.top(1)[0]?.name;
   if (genre) report.genre = genre;

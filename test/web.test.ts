@@ -107,10 +107,31 @@ describe.skipIf(!available)("server", () => {
     expect(playerJs).not.toMatch(/^\s*interface /m);
   });
 
+  it("serves charts, sets, set pages and search for the browse pages", async () => {
+    await capture([url("c1")]);
+    await queue.settled();
+    const songs = await (await fetch(`${base}/api/charts/songs?period=all`)).json();
+    expect(songs).toMatchObject({ page: 1, pages: 1 });
+    expect(songs.items[0]).toMatchObject({ rank: 1, sets: 1 });
+    expect((await fetch(`${base}/api/charts/songs?period=decade`)).status).toBe(400);
+    expect((await fetch(`${base}/api/charts/songs?page=0`)).status).toBe(400);
+    const artists = await (await fetch(`${base}/api/charts/artists?period=all&size=2`)).json();
+    expect(artists).toMatchObject({ pageSize: 2 });
+    const sets = await (await fetch(`${base}/api/sets`)).json();
+    expect(sets.items).toEqual([expect.objectContaining({ id: "c1", event: "Fixture Radio 101", djs: [{ name: "DJ Alpha", image: "https://i1.sndcdn.com/avatars-alpha.jpg" }, { name: "DJ Beta", image: null }], tracks: 6, ids: 3 })]);
+    const set = await (await fetch(`${base}/api/set?id=c1`)).json();
+    expect(set.lines[0]).toMatchObject({ position: 0, song: "Nova - Pulse", isId: false });
+    expect((await fetch(`${base}/api/set?id=nope`)).status).toBe(404);
+    const found = await (await fetch(`${base}/api/search?q=nova&months=24`)).json();
+    expect(found.songs[0]).toMatchObject({ name: "Nova - Pulse" });
+    expect(found.artists[0]).toMatchObject({ name: "Nova" });
+    expect(await (await fetch(`${base}/api/vault-preview`)).json()).toEqual({ lines: expect.any(Number), sets: expect.any(Number) });
+  });
+
   it("signs up the owner (importing old likes), keeps them signed in, and signs out", async () => {
     await capture([url("c1")]);
     await queue.settled();
-    expect(await (await fetch(`${base}/api/auth/me`)).json()).toEqual({ user: null, signup: "open" });
+    expect(await (await fetch(`${base}/api/auth/me`)).json()).toEqual({ user: null, signup: "open", soundcloud: false });
     const res = await postJson("/api/auth/register", { email: "Owner@Example.com", password: "a long password", displayName: "Owner" });
     expect(await res.json()).toMatchObject({ user: { email: "owner@example.com" }, imported: { imported: 1, skipped: 0 } });
     const setCookie = res.headers.get("set-cookie")!;
