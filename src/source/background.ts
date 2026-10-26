@@ -12,7 +12,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { BlockedError } from "./fetcher.ts";
 import { dateFromUrl, extractTracklistUrls, parseTracklist, tracklistId } from "./parse.ts";
 import type { FetchQueue } from "./queue.ts";
-import type { TracklistStore } from "./store.ts";
+import type { Catalog } from "../catalog/catalog.ts";
 
 export type BackgroundState = "off" | "collecting" | "waiting-for-queue" | "resting" | "daily-limit" | "paused";
 
@@ -57,7 +57,7 @@ interface Saved {
 }
 
 export class BackgroundCollector {
-  private readonly store: TracklistStore;
+  private readonly store: Catalog;
   private readonly queue: FetchQueue;
   private readonly source: CollectorSource;
   private readonly saveFile: string | undefined;
@@ -70,7 +70,7 @@ export class BackgroundCollector {
   private busy = false;
   private s: Saved = { enabled: false, day: "", today: 0, pending: [], lastChecked: 0, lastRequestAt: 0, pausedUntil: 0 };
 
-  constructor(store: TracklistStore, queue: FetchQueue, source: CollectorSource, options: CollectorOptions) {
+  constructor(store: Catalog, queue: FetchQueue, source: CollectorSource, options: CollectorOptions) {
     this.store = store;
     this.queue = queue;
     this.source = source;
@@ -134,16 +134,18 @@ export class BackgroundCollector {
       if (this.s.pending.length === 0) {
         this.s.lastRequestAt = this.s.lastChecked = this.now();
         const since = this.since();
-        this.s.pending = extractTracklistUrls(await this.source.fetchFrontPage())
-          .filter((url) => !this.store.has(tracklistId(url) ?? "") && (dateFromUrl(url) ?? since) >= since)
-          .sort((a, b) => (dateFromUrl(b) ?? "").localeCompare(dateFromUrl(a) ?? ""));
+        const fresh: string[] = [];
+        for (const link of extractTracklistUrls(await this.source.fetchFrontPage())) {
+          if ((dateFromUrl(link) ?? since) >= since && !(await this.store.has(tracklistId(link) ?? ""))) fresh.push(link);
+        }
+        this.s.pending = fresh.sort((a, b) => (dateFromUrl(b) ?? "").localeCompare(dateFromUrl(a) ?? ""));
         return;
       }
       url = this.s.pending.shift()!;
-      if (this.store.has(tracklistId(url) ?? "")) return; // cached meanwhile (e.g. by your queue)
+      if (await this.store.has(tracklistId(url) ?? "")) return; // cached meanwhile (e.g. by your queue)
       this.s.lastRequestAt = this.now();
       const html = await this.source.fetchHtml(url);
-      this.store.save(parseTracklist(html, url), html);
+      await this.store.save(parseTracklist(html, url), html);
       this.s.today++;
       delete this.s.lastError;
     } catch (error) {

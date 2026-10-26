@@ -1,5 +1,6 @@
 // Command-line entry point. Wires the data-access layer (source/) to the analysis
-// (analysis/) and prints the result. Run `npm run setscope -- help` for usage.
+// (analysis/) and prints the result. Uses the same database as the web app
+// (DATABASE_URL). Run `npm run setscope -- help` for usage.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -13,7 +14,9 @@ import { parseSongQuery } from "./normalize.ts";
 import { PoliteFetcher } from "./source/fetcher.ts";
 import { importSavedTracklist, ingestUrls } from "./source/ingest.ts";
 import { extractTracklistUrls, isChallengePage, isTracklistPage, tracklistId } from "./source/parse.ts";
-import { TracklistStore } from "./source/store.ts";
+import { PgCatalog } from "./catalog/pg-catalog.ts";
+import { migrate } from "./db/migrate.ts";
+import { createPool } from "./db/pool.ts";
 
 const USAGE = `setscope: analyze DJ sets from 1001Tracklists
 
@@ -39,7 +42,7 @@ Options:
   --json                    Print the raw report as JSON
 `;
 
-function main(argv: string[]): Promise<void> | void {
+async function main(argv: string[]): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
@@ -64,32 +67,50 @@ function main(argv: string[]): Promise<void> | void {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) throw new UsageError(`--since must be YYYY-MM-DD (got "${since}")`);
   const top = values.top ? toInt(values.top, "--top") : 10;
   const dataDir = defaultDataDir();
-  const store = new TracklistStore(dataDir);
+  const pool = createPool();
+  try {
+    await migrate(pool);
+    await run(command, args, values, new PgCatalog(pool), dataDir, since, top, now);
+  } finally {
+    await pool.end();
+  }
+}
+
+async function run(
+  command: string,
+  args: string[],
+  values: { json?: boolean; limit?: string; "recent-months"?: string },
+  store: PgCatalog,
+  dataDir: string,
+  since: string,
+  top: number,
+  now: string,
+): Promise<void> {
   const print = (report: object, text: string) => console.log(values.json ? JSON.stringify(report, null, 2) : text);
 
   switch (command) {
     case "add":
       return add(args, store, dataDir, since, values.limit ? toInt(values.limit, "--limit") : undefined);
     case "song": {
-      const report = analyzeSong(store.all(), parseSongQuery(requireArg(args, "song")), { since, top });
+      const report = analyzeSong(await store.all(), parseSongQuery(requireArg(args, "song")), { since, top });
       return print(report, formatSongReport(report));
     }
     case "artist": {
       const recentMonths = values["recent-months"] ? toInt(values["recent-months"], "--recent-months") : 6;
-      const report = analyzeArtist(store.all(), requireArg(args, "artist"), { since, today: now, recentMonths, top });
+      const report = analyzeArtist(await store.all(), requireArg(args, "artist"), { since, today: now, recentMonths, top });
       return print(report, formatArtistReport(report));
     }
     case "stats":
       return stats(store, since);
     case "reparse":
-      console.log(`Re-parsed ${store.reparseAll()} cached sets.`);
+      console.log(`Re-parsed ${await store.reparseAll()} cached sets.`);
       return;
     default:
       throw new UsageError(`Unknown command "${command}". Try: setscope help`);
   }
 }
 
-async function add(inputs: string[], store: TracklistStore, dataDir: string, since: string, limit?: number): Promise<void> {
+async function add(inputs: string[], store: PgCatalog, dataDir: string, since: string, limit?: number): Promise<void> {
   if (inputs.length === 0) throw new UsageError("add needs at least one file or URL.");
   const queue: string[] = [];
 
@@ -107,7 +128,7 @@ async function add(inputs: string[], store: TracklistStore, dataDir: string, sin
     if (!existsSync(input)) throw new UsageError(`No such file: ${input}`);
     const text = readFileSync(input, "utf8");
     if (isTracklistPage(text)) {
-      console.log(`Imported saved tracklist ${importSavedTracklist(text, store)} from ${input}`);
+      console.log(`Imported saved tracklist ${await importSavedTracklist(text, store)} from ${input}`);
     } else if (isChallengePage(text)) {
       console.log(`${input} is the "are you human" page, not the real one. Pass the check in your browser, then save again.`);
     } else {
@@ -134,8 +155,8 @@ async function add(inputs: string[], store: TracklistStore, dataDir: string, sin
   if (result.remaining.length > 0) console.log(`${result.remaining.length} sets left to fetch. Re-run to continue.`);
 }
 
-function stats(store: TracklistStore, since: string): void {
-  const sets = store.all();
+async function stats(store: PgCatalog, since: string): Promise<void> {
+  const sets = await store.all();
   const recent = sets.filter((s) => s.date >= since);
   const dates = sets.map((s) => s.date).sort();
   console.log(`${sets.length} sets cached (${recent.length} since ${since}).`);

@@ -2,7 +2,7 @@
 
 import { BlockedError, type HtmlSource } from "./fetcher.ts";
 import { canonicalUrl, dateFromUrl, parseTracklist, tracklistId } from "./parse.ts";
-import type { TracklistStore } from "./store.ts";
+import type { Catalog } from "../catalog/catalog.ts";
 
 export interface IngestOptions {
   /** Skip sets whose URL date is before this, without fetching them. */
@@ -25,12 +25,12 @@ export interface IngestResult {
 
 export async function ingestUrls(
   urls: string[],
-  store: TracklistStore,
+  store: Catalog,
   source: HtmlSource,
   options: IngestOptions,
 ): Promise<IngestResult> {
   const log = options.log ?? (() => {});
-  const { todo, alreadyCached, skippedOld } = triage(urls, store, options.since);
+  const { todo, alreadyCached, skippedOld } = await triage(urls, store, options.since);
   const result: IngestResult = { fetched: 0, alreadyCached, skippedOld, failed: [], remaining: [] };
 
   for (const [i, url] of todo.entries()) {
@@ -42,7 +42,7 @@ export async function ingestUrls(
     try {
       const html = await source.fetchHtml(url);
       result.fetched++;
-      store.save(parseTracklist(html, url), html);
+      await store.save(parseTracklist(html, url), html);
     } catch (error) {
       if (error instanceof BlockedError) {
         result.blocked = error.message;
@@ -56,31 +56,29 @@ export async function ingestUrls(
 }
 
 /** Split URLs into ones to fetch, ones already cached, and ones too old to bother with. */
-export function triage(urls: string[], store: TracklistStore, since: string) {
+export async function triage(urls: string[], store: Catalog, since: string) {
   let alreadyCached = 0;
   const old: string[] = [];
-  const todo = urls.filter((url) => {
+  const todo: string[] = [];
+  for (const url of urls) {
     const id = tracklistId(url);
-    if (!id) return false;
-    if (store.has(id)) {
+    if (!id) continue;
+    if (await store.has(id)) {
       alreadyCached++;
-      return false;
+      continue;
     }
     const date = dateFromUrl(url);
-    if (date && date < since) {
-      old.push(url);
-      return false;
-    }
-    return true;
-  });
+    if (date && date < since) old.push(url);
+    else todo.push(url);
+  }
   return { todo, alreadyCached, skippedOld: old.length, old };
 }
 
 /** Store a tracklist page you saved from your browser. Returns the set's id. */
-export function importSavedTracklist(html: string, store: TracklistStore, fallbackUrl?: string): string {
+export async function importSavedTracklist(html: string, store: Catalog, fallbackUrl?: string): Promise<string> {
   const url = canonicalUrl(html) ?? fallbackUrl;
   if (!url) throw new Error("Couldn't tell which tracklist this saved page is (no og:url/canonical link).");
   const set = parseTracklist(html, url);
-  store.save(set, html);
+  await store.save(set, html);
   return set.id;
 }

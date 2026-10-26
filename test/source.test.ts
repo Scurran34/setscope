@@ -250,7 +250,7 @@ describe("ingest + store", () => {
     const second = await ingestUrls([url("a1", "2026-09-10")], store, source, { since: "2025-04-25" });
     expect(second).toMatchObject({ fetched: 0, alreadyCached: 1 });
     expect(count()).toBe(1);
-    expect(store.all().map((s) => s.id)).toEqual(["a1"]);
+    expect((await store.all()).map((s) => s.id)).toEqual(["a1"]);
   });
 
   it("stops the whole run at the first bot check and reports what's left", async () => {
@@ -271,10 +271,10 @@ describe("ingest + store", () => {
     expect(result.remaining).toEqual([urls[1]]);
   });
 
-  it("imports a page saved from the browser and can re-parse the cache", () => {
-    expect(importSavedTracklist(pageHtml, store)).toBe("zz9fix1");
-    expect(store.has("zz9fix1")).toBe(true);
+  it("imports a page saved from the browser and can re-parse the cache", async () => {
+    expect(await importSavedTracklist(pageHtml, store)).toBe("zz9fix1");
+    expect(await store.has("zz9fix1")).toBe(true);
     expect(store.reparseAll()).toBe(1);
-    expect(store.all()[0]?.tracks).toHaveLength(6);
+    expect((await store.all())[0]?.tracks).toHaveLength(6);
   });
 });

@@ -59,6 +59,13 @@ const maybe = <T extends HTMLElement>(id: string) => document.getElementById(id)
 let mode: Mode = "song";
 let route: Route = { page: "home" };
 let me: Me = { likes: [], categories: [] };
+
+/** Who's signed in, and whether sign-up is open, invite-only or closed. */
+interface AuthState {
+  user: { id: number; email: string; displayName: string; owner: boolean } | null;
+  signup: "open" | "invite" | "closed";
+}
+let auth: AuthState = { user: null, signup: "closed" };
 let lastStatus: Status | undefined;
 let doneAtLastRender = 0;
 let setsAtLastRender = 0;
@@ -216,6 +223,11 @@ async function post<T = unknown>(path: string, body: object = {}): Promise<T> {
   });
   const json = await res.json();
   void poll();
+  if (res.status === 401) {
+    const error = $("formError");
+    error.replaceChildren(`${json.error} `, el("a", { class: "link", href: "#/account" }, "Sign in"));
+    error.hidden = false;
+  }
   if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
   return json as T;
 }
@@ -245,10 +257,12 @@ function monthsSelect(onChange: () => void): HTMLElement {
 
 async function loadMe(): Promise<void> {
   try {
-    me = await getJson<Me>("/api/me");
+    [auth, me] = await Promise.all([getJson<AuthState>("/api/auth/me"), getJson<Me>("/api/me")]);
   } catch {
     // keep what we had
   }
+  const account = document.querySelector<HTMLAnchorElement>('.nav a[data-nav="account"]');
+  if (account) account.textContent = auth.user ? auth.user.displayName : "Sign in";
 }
 
 // ---- navigation ----
@@ -347,7 +361,16 @@ async function homePage(): Promise<HTMLElement> {
     pageHead("What are DJs playing?", `${plural(sets, "set")} cached · ${plural(forYou.likes.length, "liked song")} · search a song or artist above`),
   );
 
-  if (forYou.likes.length === 0) {
+  if (!auth.user) {
+    page.append(
+      el(
+        "div",
+        { class: "card" },
+        el("h2", {}, "For you"),
+        el("p", { class: "muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to like songs and get sets and songs picked for you."),
+      ),
+    );
+  } else if (forYou.likes.length === 0) {
     page.append(
       el(
         "div",
@@ -446,6 +469,7 @@ async function trendingPage(): Promise<HTMLElement> {
 // ---- Account ----
 
 interface Account {
+  user: { email: string; displayName: string; owner: boolean };
   sets: number;
   oldest?: string;
   newest?: string;
@@ -455,7 +479,15 @@ interface Account {
 }
 
 async function accountPage(): Promise<HTMLElement> {
+  if (!auth.user) return signInPage();
   const a = await getJson<Account>("/api/account");
+  const owner = a.user.owner;
+  const signOut = el("button", { type: "button", class: "act" }, "Sign out");
+  signOut.addEventListener("click", async () => {
+    await post("/api/auth/logout");
+    await loadMe();
+    await render();
+  });
 
   const likes = el("ol", { class: "ranked" });
   for (const song of a.likes) {
@@ -466,6 +498,7 @@ async function accountPage(): Promise<HTMLElement> {
     });
     likes.append(el("li", {}, el("span", { class: "name" }, songLink(song)), unlike));
   }
+
 
   const keyInput = el("input", { type: "password", placeholder: a.getSongBpmKey ? "•••••••• (saved)" : "Paste your API key", class: "small-input", autocomplete: "off" }) as HTMLInputElement;
   const keyMsg = el("span", { class: "small muted" }, a.getSongBpmKey ? "Key saved: song pages show key & BPM." : "No key yet: song pages can't show key & BPM.");
@@ -503,7 +536,7 @@ async function accountPage(): Promise<HTMLElement> {
   return el(
     "div",
     { class: "stack" },
-    pageHead("Account", "Your library and settings. Everything is stored on this computer (no login yet)."),
+    pageHead(a.user.displayName, `${a.user.email}${owner ? " · site owner" : ""}`, undefined, signOut),
     el(
       "div",
       { class: "grid" },
@@ -519,11 +552,13 @@ async function accountPage(): Promise<HTMLElement> {
     ),
     el("h2", {}, "Collecting sets"),
     el("div", { id: "queueMount" }, el("div", { class: "card muted small", id: "queueIdle" }, "Nothing queued. Use “Gather more sets” on a song or artist page.")),
-    el(
-      "div",
-      { class: "card" },
-      el("div", { class: "row" }, el("label", { class: "switch" }, bgToggle, " ", el("b", {}, "Background collecting")), el("span", { id: "bgStatus", class: "small muted" })),
-    ),
+    owner
+      ? el(
+          "div",
+          { class: "card" },
+          el("div", { class: "row" }, el("label", { class: "switch" }, bgToggle, " ", el("b", {}, "Background collecting")), el("span", { id: "bgStatus", class: "small muted" })),
+        )
+      : "",
     el(
       "details",
       { class: "card" },
@@ -531,14 +566,16 @@ async function accountPage(): Promise<HTMLElement> {
       linksText,
       el("div", { class: "row" }, linksMsg, addLinks),
     ),
-    el("h2", {}, "Song data"),
-    el(
-      "div",
-      { class: "card" },
-      el("div", { class: "row" }, el("b", {}, "Key & BPM from GetSongBPM"), externalLink("https://getsongbpm.com/api", "Get a free key", "act-link")),
-      el("div", { class: "btns", style: "margin-top:8px" }, keyInput, saveKey, a.getSongBpmKey ? clearKey : ""),
-      el("div", { style: "margin-top:6px" }, keyMsg),
-    ),
+    owner ? el("h2", {}, "Song data") : "",
+    owner
+      ? el(
+          "div",
+          { class: "card" },
+          el("div", { class: "row" }, el("b", {}, "Key & BPM from GetSongBPM"), externalLink("https://getsongbpm.com/api", "Get a free key", "act-link")),
+          el("div", { class: "btns", style: "margin-top:8px" }, keyInput, saveKey, a.getSongBpmKey ? clearKey : ""),
+          el("div", { style: "margin-top:6px" }, keyMsg),
+        )
+      : "",
     el(
       "div",
       { class: "card" },
@@ -547,6 +584,73 @@ async function accountPage(): Promise<HTMLElement> {
       a.oldest ? stat(a.oldest, "oldest set") : "",
       a.newest ? stat(a.newest, "newest set") : "",
       el("div", { class: "muted small" }, `Chrome extension: ${extensionInstalled() ? "connected" : "not detected in this browser"}`),
+    ),
+  );
+}
+
+/** Sign in, or create an account (the first one freely, then with an invite code). */
+function signInPage(): HTMLElement {
+  const field = (label: string, input: HTMLElement) => el("label", { class: "field" }, el("span", { class: "small muted" }, label), input);
+  const input = (type: string, autocomplete: string) => el("input", { type, autocomplete, required: "" }) as HTMLInputElement;
+
+  const loginEmail = input("text", "email");
+  const loginPassword = input("password", "current-password");
+  const loginMsg = el("p", { class: "error small" });
+  const login = el("form", { class: "stack-form" }, field("Email", loginEmail), field("Password", loginPassword), el("button", { type: "submit", class: "primary" }, "Sign in"), loginMsg);
+  login.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await post("/api/auth/login", { email: loginEmail.value, password: loginPassword.value });
+      await loadMe();
+      await render();
+    } catch (e) {
+      loginMsg.textContent = (e as Error).message;
+    }
+  });
+
+  const name = input("text", "nickname");
+  const email = input("text", "email");
+  const password = input("password", "new-password");
+  const invite = input("text", "off");
+  const signupMsg = el("p", { class: "error small" });
+  const signup = el(
+    "form",
+    { class: "stack-form" },
+    field("Your name", name),
+    field("Email", email),
+    field("Password (10+ characters)", password),
+    auth.signup === "invite" ? field("Invite code", invite) : "",
+    el("button", { type: "submit", class: "primary" }, "Create account"),
+    signupMsg,
+  );
+  signup.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      const r = await post<{ imported?: { imported: number } }>("/api/auth/register", { displayName: name.value, email: email.value, password: password.value, inviteCode: invite.value });
+      await loadMe();
+      await render();
+      if (r.imported?.imported) {
+        const note = $("formError");
+        note.textContent = `Moved ${plural(r.imported.imported, "like or category entry")} from before accounts into your account.`;
+        note.hidden = false;
+      }
+    } catch (e) {
+      signupMsg.textContent = (e as Error).message;
+    }
+  });
+
+  const first = auth.signup === "open";
+  return el(
+    "div",
+    { class: "stack" },
+    pageHead(first ? "Create the owner account" : "Sign in", first ? "You're the first person here: this account will own the site (and gets your existing likes)." : "setscope is private: you need an account to like songs and collect sets."),
+    el(
+      "div",
+      { class: "grid" },
+      first ? "" : el("div", { class: "card" }, el("h2", {}, "Sign in"), login),
+      auth.signup === "closed"
+        ? el("div", { class: "card muted small" }, el("h2", {}, "New here?"), "Sign-up is closed. Ask the owner for an invite code.")
+        : el("div", { class: "card" }, el("h2", {}, first ? "Your account" : "Create an account"), signup),
     ),
   );
 }
@@ -769,6 +873,10 @@ function didYouMean(kind: Mode, suggestions: Ranked[]): HTMLElement | undefined 
 function likeButton(song: string, liked: boolean, after: () => void): HTMLElement {
   const button = el("button", { type: "button", class: liked ? "like on" : "like", "aria-pressed": String(liked) }, liked ? "♥ Liked" : "♡ Like");
   button.addEventListener("click", async () => {
+    if (!auth.user) {
+      location.hash = "#/account";
+      return;
+    }
     liked = !liked;
     await post("/api/like", { song, liked });
     button.className = liked ? "like on" : "like";
@@ -808,6 +916,9 @@ function songFacts(song: string, genre: string | undefined): HTMLElement {
 
 /** Your categories for this song, an "add to category" box, and "maybe part of" hints. */
 function categoriesCard(song: string, inCategories: string[], hints: { category: string; sets: number; of: number }[]): HTMLElement {
+  if (!auth.user) {
+    return el("div", { class: "card muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to like songs and sort them into your own categories.");
+  }
   const label = async (category: string, on: boolean) => {
     await post("/api/label", { song, category, on });
     await loadMe();

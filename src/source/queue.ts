@@ -12,7 +12,7 @@ import { triage } from "./ingest.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { Tracklist } from "../model.ts";
 import { canonicalUrl, dateFromUrl, parseTracklist, tracklistId } from "./parse.ts";
-import type { TracklistStore } from "./store.ts";
+import type { Catalog } from "../catalog/catalog.ts";
 
 export type QueueState = "idle" | "running" | "blocked";
 
@@ -58,7 +58,7 @@ export interface QueueOptions {
 }
 
 export class FetchQueue {
-  private readonly store: TracklistStore;
+  private readonly store: Catalog;
   private readonly source: HtmlSource;
   private readonly delayMs: number;
   private readonly saveFile: string | undefined;
@@ -74,7 +74,7 @@ export class FetchQueue {
   private pauseReason: PauseReason | undefined;
   private running: Promise<void> | undefined;
 
-  constructor(store: TracklistStore, source: HtmlSource, options: QueueOptions = {}) {
+  constructor(store: Catalog, source: HtmlSource, options: QueueOptions = {}) {
     this.store = store;
     this.source = source;
     this.delayMs = options.delayMs ?? MIN_DELAY_MS;
@@ -85,8 +85,8 @@ export class FetchQueue {
       // Older saves were one plain list of sets still to fetch.
       const { waiting, found, older = [] } = Array.isArray(saved) ? { waiting: [], found: saved } : (saved as Record<string, unknown>);
       if (!Array.isArray(waiting) || !Array.isArray(found) || !Array.isArray(older)) throw new Error(`Invalid saved queue file: ${this.saveFile}`);
-      const usable = (list: unknown[]) =>
-        list.filter((url): url is string => typeof url === "string" && isFetchAllowed(url) && !this.store.has(tracklistId(url) ?? ""));
+      // Sets cached meanwhile are skipped when their turn comes.
+      const usable = (list: unknown[]) => list.filter((url): url is string => typeof url === "string" && isFetchAllowed(url));
       this.waiting.push(...new Set(usable(waiting)));
       this.found.push(...new Set(usable(found).filter((url) => !this.waiting.includes(url))));
       sortNewestFirst(this.found);
@@ -109,8 +109,8 @@ export class FetchQueue {
    * Add URLs to the found list (duplicates, cached and too-old ones are dropped),
    * then start fetching the newest `take` of them.
    */
-  enqueue(urls: string[], since: string, take = Number.POSITIVE_INFINITY): EnqueueResult {
-    const { todo, alreadyCached, skippedOld, old } = triage(urls, this.store, since);
+  async enqueue(urls: string[], since: string, take = Number.POSITIVE_INFINITY): Promise<EnqueueResult> {
+    const { todo, alreadyCached, skippedOld, old } = await triage(urls, this.store, since);
     const known = new Set([...this.waiting, ...this.found, ...this.older, this.current]);
     const fresh = [...new Set(todo)].filter((url) => !known.has(url));
     this.older.push(...new Set(old.filter((url) => !known.has(url))));
@@ -175,10 +175,10 @@ export class FetchQueue {
    * A tracklist page you opened yourself (sent by the extension). Saves it and takes
    * it off the waiting list; when that empties a blocked queue, the queue is done.
    */
-  importPage(html: string, pageUrl: string): Tracklist {
+  async importPage(html: string, pageUrl: string): Promise<Tracklist> {
     const set = parseTracklist(html, canonicalUrl(html) ?? pageUrl);
     if (set.tracks.length === 0) throw new Error("No tracks found on that page.");
-    this.store.save(set, html);
+    await this.store.save(set, html);
     const index = this.waiting.findIndex((url) => tracklistId(url) === set.id);
     if (index !== -1) {
       this.waiting.splice(index, 1);
@@ -241,11 +241,11 @@ export class FetchQueue {
     while (this.waiting.length > 0) {
       const url = this.waiting.shift()!;
       const id = tracklistId(url);
-      if (id && this.store.has(id)) continue;
+      if (id && (await this.store.has(id))) continue;
       this.current = url;
       try {
         const html = await this.source.fetchHtml(url);
-        this.store.save(parseTracklist(html, url), html);
+        await this.store.save(parseTracklist(html, url), html);
         this.done++;
       } catch (error) {
         if (error instanceof BlockedError) {

@@ -1,14 +1,17 @@
-// Local cache. Each set is stored twice:
+// The file cache (used by tests, and the source for `npm run db:import`). The web app
+// and CLI use the shared Postgres catalog instead; both implement Catalog.
+// Each set is stored twice:
 //   data/html/<id>.html  the raw page, so a parser fix can re-read it without refetching
 //   data/sets/<id>.json  the parsed Tracklist, which the analysis reads
 // Once a set is here it is never fetched again.
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { Catalog } from "../catalog/catalog.ts";
 import type { Tracklist } from "../model.ts";
 import { parseTracklist } from "./parse.ts";
 
-export class TracklistStore {
+export class TracklistStore implements Catalog {
   private readonly htmlDir: string;
   private readonly setsDir: string;
 
@@ -19,16 +22,24 @@ export class TracklistStore {
     mkdirSync(this.setsDir, { recursive: true });
   }
 
-  has(id: string): boolean {
+  async has(id: string): Promise<boolean> {
     return existsSync(this.setPath(id));
   }
 
-  save(set: Tracklist, html: string): void {
+  async save(set: Tracklist, html: string): Promise<void> {
     writeFileSync(join(this.htmlDir, `${set.id}.html`), html);
     writeFileSync(this.setPath(set.id), JSON.stringify(set, null, 2));
   }
 
-  all(): Tracklist[] {
+  async all(): Promise<Tracklist[]> {
+    return this.allSync();
+  }
+
+  async count(): Promise<number> {
+    return this.allSync().length;
+  }
+
+  allSync(): Tracklist[] {
     return readdirSync(this.setsDir)
       .filter((f) => f.endsWith(".json"))
       .map((f) => JSON.parse(readFileSync(join(this.setsDir, f), "utf8")) as Tracklist);
@@ -37,7 +48,7 @@ export class TracklistStore {
   /** Re-parse every cached HTML page (after a parser change). No network. */
   reparseAll(): number {
     let count = 0;
-    for (const set of this.all()) {
+    for (const set of this.allSync()) {
       const htmlPath = join(this.htmlDir, `${set.id}.html`);
       if (!existsSync(htmlPath)) continue;
       const reparsed = parseTracklist(readFileSync(htmlPath, "utf8"), set.url);

@@ -7,6 +7,11 @@ export function filterSince(sets: Tracklist[], since: string): Tracklist[] {
   return sets.filter((s) => s.date >= since);
 }
 
+/** Newest set first; sets from the same day by id, so the order never depends on storage. */
+export function newestFirst(a: Tracklist, b: Tracklist): number {
+  return b.date.localeCompare(a.date) || a.id.localeCompare(b.id);
+}
+
 /** Keep sets played in [from, to). */
 export function filterBetween(sets: Tracklist[], from: string, to: string): Tracklist[] {
   return sets.filter((s) => s.date >= from && s.date < to);

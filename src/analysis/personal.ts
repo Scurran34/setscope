@@ -5,7 +5,7 @@
 import type { Ranked, SetSummary, Tracklist } from "../model.ts";
 import { summarize } from "../model.ts";
 import { displayName, isId, songKey } from "../normalize.ts";
-import { Counter, filterSince } from "./common.ts";
+import { Counter, filterSince, newestFirst } from "./common.ts";
 
 export interface SetForYou extends SetSummary {
   /** Your liked songs that this set plays. */
@@ -21,7 +21,7 @@ export function setsForYou(sets: Tracklist[], liked: Set<string>, since: string,
   return filterSince(sets, since)
     .map((set) => ({ set, liked: [...songKeys(set)].filter(([key]) => liked.has(key)).map(([, name]) => name) }))
     .filter((s) => s.liked.length > 0)
-    .sort((a, b) => b.liked.length - a.liked.length || b.set.date.localeCompare(a.set.date))
+    .sort((a, b) => b.liked.length - a.liked.length || newestFirst(a.set, b.set))
     .slice(0, limit)
     .map((s) => ({ ...summarize(s.set), liked: s.liked }));
 }

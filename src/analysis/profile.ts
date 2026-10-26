@@ -5,7 +5,7 @@
 import type { DjProfile, Ranked, SetSummary, Tracklist } from "../model.ts";
 import { summarize } from "../model.ts";
 import { creditsArtist, displayName, normalizeName, songKey, splitArtists } from "../normalize.ts";
-import { Counter, filterSince } from "./common.ts";
+import { Counter, filterSince, newestFirst } from "./common.ts";
 
 export interface ArtistSong {
   name: string;
@@ -37,7 +37,7 @@ export interface ArtistProfile {
 
 export function artistProfile(sets: Tracklist[], artist: string, since: string): ArtistProfile {
   const target = normalizeName(artist);
-  const inRange = filterSince(sets, since).sort((a, b) => b.date.localeCompare(a.date));
+  const inRange = filterSince(sets, since).sort(newestFirst);
   const spellings = new Counter();
   const isOwn = (set: Tracklist) => set.djs.some((dj) => normalizeName(dj) === target);
 

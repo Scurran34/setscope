@@ -85,7 +85,7 @@ describe("BackgroundCollector", () => {
   it("waits while your queue is fetching", async () => {
     const { collector, queue, calls } = setup(frontPage(url("c1", "2026-10-01")));
     collector.setEnabled(true);
-    queue.enqueue([url("q1", "2026-10-05")], "2025-01-01"); // starts running
+    await queue.enqueue([url("q1", "2026-10-05")], "2025-01-01"); // starts running
     expect(collector.status().state).toBe("waiting-for-queue");
     await collector.tick();
     expect(calls).toEqual([url("q1", "2026-10-05")]); // only the queue's request

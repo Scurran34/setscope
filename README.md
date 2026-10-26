@@ -1,7 +1,11 @@
 # setscope
 
-A personal web app (plus a command-line version) that analyzes DJ sets from [1001Tracklists](https://www.1001tracklists.com).
+A private, invite-only web app (plus a command-line version) that analyzes DJ sets from
+[1001Tracklists](https://www.1001tracklists.com), with a shared catalog that everyone signed in benefits from.
 Work in progress: a project I'm building for fun, not a finished product.
+
+> **Before any public launch:** the shared catalog republishes 1001Tracklists' tracklist data. Ask
+> 1001Tracklists for permission first. Until then setscope is meant for you and people you invite.
 
 **Song mode.** Give it a song, and it looks at recent sets containing that song:
 - the DJs who play it most
@@ -17,12 +21,55 @@ Sets older than the cutoff (default **18 months**) are ignored.
 
 ## Setup
 
-Needs Node 22.18 or newer. Node runs the TypeScript directly, so there's no build step.
+Needs Node 22.18 or newer (Node runs the TypeScript directly, so there's no build step) and
+PostgreSQL 17.
 
 ```bash
+brew install postgresql@17   # once
 npm install
-npm test
+npm run db:init              # creates a database inside this project (.postgres/), port 54329, local only
+npm run db:migrate           # creates the tables (safe to run any time)
+npm run db:import            # copies an existing file cache (data/) in; repeatable, files are kept
+npm test                     # unit tests; database tests run against setscope_test
+npm run web                  # http://127.0.0.1:7331
 ```
+
+After a restart, run `npm run db:start` before `npm run web` (and `npm run db:stop` when you're done).
+`npm run db:psql` opens a SQL prompt. `DATABASE_URL` points everything at another database (for example
+a hosted Postgres) instead of the local one.
+
+**Accounts.** The first account created on the site is the owner, and gets any likes and categories
+from before accounts existed. After that, sign-up needs the invite code in `SETSCOPE_INVITE_CODE` (with
+no code set, sign-up is closed). Anyone who can reach the site can browse reports; liking, categories
+and queue controls need an account; site-wide settings (GetSongBPM key, background collecting) are the
+owner's. Passwords are hashed with scrypt; sessions are random tokens in an HttpOnly, SameSite=Lax cookie,
+and the database only stores their SHA-256. Set `SETSCOPE_SECURE_COOKIES=1` when serving over HTTPS.
+
+**Backups and rollback.** Back up with
+`/opt/homebrew/opt/postgresql@17/bin/pg_dump -h 127.0.0.1 -p 54329 -U setscope setscope > backup.sql`
+and restore into an empty database with `psql ... < backup.sql`. The file cache in `data/` is never
+deleted by the import, so rolling back to the file version is just checking out the previous commit.
+
+### Data model
+
+| Shared catalog (everyone sees the same rows) | Personal (one account's rows, never shown to others) |
+|---|---|
+| `artists`: name, 1001Tracklists page, country, picture, links | `users`, `sessions` |
+| `tracks`: one row per recording, see identity rules below | `user_likes` |
+| `track_artists`: main artists and remixers | `collections`, `collection_tracks` (your categories) |
+| `sets`, `set_djs`, `set_tracks` (ordered, exactly as the source wrote each line, with its genre tag) | `followed_artists`, `vault_entries` (used in later stages) |
+| `set_pages`: the page each set was read from, for re-parsing | |
+| `track_metadata_history`: what changed when a set was re-read | |
+| `external_track_links`: links to recordings elsewhere (SoundCloud), with confidence and provenance | |
+| `collection_jobs`, `discovery_progress`, `source_refresh_history` (used by the collection system) | |
+
+**Track identity.** A tracklist line is matched to a track by 1001Tracklists' own track id when the
+page gives one, otherwise by the normalized "artists - title" (case, accents, periods and apostrophes
+ignored; "(Extended Mix)", "(Radio Edit)" and the like count as the same recording). Remixes, edits, VIPs,
+bootlegs, mashups and reworks are separate tracks linked to their original. Unidentified "ID - ID" lines
+without a 1001Tracklists id are never merged by name: each is its own placeholder, so two different
+unreleased songs can't be counted as one. Re-reading a set records any line that changed (an ID that got
+identified, a corrected title) in `track_metadata_history`.
 
 ## Web app
 
@@ -212,10 +259,20 @@ src/
     trending.ts       songs and artists rising in share of sets
     personal.ts       sets for you, songs you might like, "maybe part of" category hints
     profile.ts        artist profile pages (DJ card info, their songs, sets, labels)
+  catalog/            the shared catalog
+    catalog.ts        the Catalog interface (has / save / all / count)
+    pg-catalog.ts     Catalog on Postgres: saving sets, artists, tracks; history on refresh
+    identity.ts       which tracklist lines are the same recording; versions; IDs
+  db/                 database plumbing
+    pool.ts           connection (DATABASE_URL)
+    migrate.ts        applies db/migrations/*.sql once each, in order
+    import-legacy.ts  copies the old file cache into the catalog
+  auth/accounts.ts    sign-up (owner first, then invite-only), passwords, sessions
+  personal/user-data.ts   one account's likes and categories
   source/             data access: everything that touches the network or disk
     parse.ts          1001Tracklists HTML -> Tracklist
     fetcher.ts        polite HTTP fetcher (HtmlSource interface)
-    store.ts          local cache in data/
+    store.ts          the old file cache in data/ (tests, and the import source)
     ingest.ts         URLs -> fetch -> parse -> cache
     queue.ts          background fetching for the web app (found list, batches, older sets, pause on block)
     background.ts     background collecting of front-page sets (switch, slow, daily cap)
@@ -224,7 +281,7 @@ src/
   cli.ts              command line
   server.ts           local web server (node:http, no framework) + JSON API
   config.ts           defaults shared by both
-  user.ts             your likes and categories (data/user.json)
+  user.ts             the old single-user likes file format (imported into the first account)
 web/
   index.html          the page
   app.ts              browser code, served with types stripped by Node (no bundler)
@@ -232,7 +289,10 @@ extension/            Chrome extension (plain JS: Chrome can't run TypeScript)
   capture.js          on 1001Tracklists: collect set links, auto-open an exact search match
   background.js       decides which tabs are setscope's, posts links to the server, closes the tab
   app-bridge.js       on the setscope page: tells the extension a search popup is opening
-test/                 Vitest tests, fixture tracklists in test/fixtures/
+db/migrations/        SQL migrations (001_catalog.sql, ...)
+scripts/db.sh         start/stop the project-local Postgres
+test/                 Vitest tests, fixture tracklists in test/fixtures/; database tests use a
+                      throwaway schema per file in setscope_test, and skip (saying so) if Postgres isn't running
 ```
 
 `web/app.ts` imports the report types from `src/analysis/` with `import type`. Those lines are erased

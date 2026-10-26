@@ -12,7 +12,7 @@ import {
 } from "../normalize.ts";
 import { searchSongs } from "./catalog.ts";
 import type { CategoryHint } from "./personal.ts";
-import { Counter, filterSince } from "./common.ts";
+import { Counter, filterSince, newestFirst } from "./common.ts";
 
 export interface SongReport {
   song: string;
@@ -97,7 +97,7 @@ export function analyzeSong(sets: Tracklist[], query: SongQuery, options: SongOp
     topDjs: djs.top(top),
     recurringIds: ids.top(top, 2),
     coPlayed: others.top(top),
-    sets: [...withSong].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 10).map(summarize),
+    sets: [...withSong].sort(newestFirst).slice(0, 10).map(summarize),
   };
   const genre = genres.top(1)[0]?.name;
   if (genre) report.genre = genre;

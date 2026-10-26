@@ -11,13 +11,21 @@
     "web": "node --disable-warning=ExperimentalWarning src/server.ts",
     "setscope": "node src/cli.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "db:init": "scripts/db.sh init",
+    "db:start": "scripts/db.sh start",
+    "db:stop": "scripts/db.sh stop",
+    "db:migrate": "node src/db/migrate.ts",
+    "db:psql": "scripts/db.sh psql",
+    "db:import": "node --disable-warning=ExperimentalWarning src/db/import-legacy.ts"
   },
   "dependencies": {
-    "cheerio": "^1.2.0"
+    "cheerio": "^1.2.0",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
   }
