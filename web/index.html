@@ -349,6 +349,30 @@
     .field input { width: 100%; }
     .empty { padding: 28px; text-align: center; color: var(--muted); }
 
+    /* set collection: header pill and its panel */
+    .collector { gap: 7px; }
+    .collector .c-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+    .collector[data-tone="active"] .c-dot { background: var(--accent2); box-shadow: 0 0 0 0 rgba(167,139,250,0.7); animation: pulse 1.6s ease-out infinite; }
+    .collector[data-tone="wait"] .c-dot { background: var(--accent2); }
+    .collector[data-tone="warn"] { border-color: var(--warn-line); background: var(--warn-bg); }
+    .collector[data-tone="warn"] .c-dot { background: var(--flat); }
+    .collector[data-tone="done"] .c-dot { background: var(--up); }
+    .collector[data-tone="bad"] .c-dot { background: var(--down); }
+    @keyframes pulse { 70% { box-shadow: 0 0 0 7px rgba(167,139,250,0); } 100% { box-shadow: 0 0 0 0 rgba(167,139,250,0); } }
+    @media (prefers-reduced-motion: reduce) { .collector .c-dot { animation: none !important; } }
+    .collector-pop { position: fixed; top: 58px; right: 16px; z-index: 65; width: min(360px, calc(100vw - 24px)); max-height: calc(100vh - 140px); overflow-y: auto;
+      background: var(--card2); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); padding: 16px; animation: fade 0.15s ease-out; }
+    .collector-pop h2 { font-size: 15px; margin: 0; }
+    .collector-pop dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 10px 0; font-size: 13px; }
+    .collector-pop dt { color: var(--muted); }
+    .collector-pop dd { margin: 0; }
+    .collector-pop .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 6px 0 10px; }
+    .collector-pop .bar div { height: 100%; background: var(--accent); transition: width 0.4s; }
+    .collector-pop .settings { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; padding-top: 10px; margin-top: 10px; border-top: 1px solid var(--line); font-size: 13px; }
+    .collector-pop .others { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+    .collector-pop .warn-box { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 10px; padding: 10px 12px; font-size: 13px; margin: 10px 0; }
+    @media (max-width: 860px) { .collector-pop { top: 104px; right: 12px; } }
+
     /* queue button and drawer */
     .queue-btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; font-size: 13px; position: relative; white-space: nowrap; }
     .q-badge { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent); color: #fff; font-size: 11px; font-weight: 700; display: inline-grid; place-items: center; }
@@ -519,9 +543,10 @@
         <a href="#/djs" data-nav="djs">DJs</a>
         <a href="#/library" data-nav="library">Library</a>
       </nav>
-      <button id="queueBtn" class="queue-btn" type="button" aria-controls="queueDrawer" aria-expanded="false" title="Collecting sets">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M17 15v6m-3-3 3 3 3-3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        <span class="label">Queue</span><span id="queueBadge" class="q-badge" hidden></span>
+      <!-- Set collection status: always visible, opens the collection panel. -->
+      <button id="queueBtn" class="queue-btn collector" type="button" aria-controls="collectorPop" aria-expanded="false" aria-haspopup="dialog" title="Set collection">
+        <span class="c-dot" aria-hidden="true"></span>
+        <span id="collectorLabel" class="label">Collect</span><span id="queueBadge" class="q-badge" hidden></span>
       </button>
       <a class="me" href="#/account" data-nav="account" title="Account"><span class="dot" id="meDot">?</span><span id="meName" class="small">Sign in</span></a>
       <span id="cacheInfo" class="cache-info"></span>
@@ -593,6 +618,9 @@
   </aside>
 
   <div id="toast" class="toast" role="status" hidden></div>
+
+  <!-- The collection panel, opened from the header pill. Filled in by renderCollector(). -->
+  <section id="collectorPop" class="collector-pop" role="dialog" aria-label="Set collection" hidden></section>
 
   <!-- The full queue card, put into the queue drawer at startup. -->
   <template id="queueTemplate">

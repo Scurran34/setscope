@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { BlockedError, FRONT_PAGE, MIN_DELAY_MS, PoliteFetcher, USER_AGENT, type HtmlSource } from "../src/source/fetcher.ts";
+import { BlockedError, CancelledError, EmptyTracklistError, FRONT_PAGE, LayoutError, MIN_DELAY_MS, PoliteFetcher, retryAfterSeconds, USER_AGENT, type HtmlSource } from "../src/source/fetcher.ts";
 import { importSavedTracklist, ingestUrls } from "../src/source/ingest.ts";
 import {
   canonicalUrl,
@@ -205,14 +205,50 @@ describe("PoliteFetcher", () => {
     await expect(fetcher.fetchHtml("https://www.1001tracklists.com/dj/x/index.html")).rejects.toThrow(/Refusing/);
   });
 
-  it("treats 401/403 and pages without a tracklist as a block", async () => {
+  it("says how the site refused: login, rate limit, refusal, unavailable, or a verification page", async () => {
     const { fn } = fakeFetch([
       { status: 401, body: "We need to validate your are real human!" },
       { status: 200, body: "Please wait, you will be forwarded" },
+      { status: 429, body: "slow down" },
+      { status: 403, body: "no" },
+      { status: 503, body: "busy" },
     ]);
     const fetcher = new PoliteFetcher({ fetchFn: fn, sleep: async () => {} });
-    await expect(fetcher.fetchHtml(pageUrl)).rejects.toBeInstanceOf(BlockedError);
-    await expect(fetcher.fetchHtml(pageUrl)).rejects.toBeInstanceOf(BlockedError);
+    const kinds = [];
+    for (let i = 0; i < 5; i++) kinds.push(await fetcher.fetchHtml(pageUrl).catch((e: BlockedError) => e.kind));
+    expect(kinds).toEqual(["auth", "challenge", "rate_limit", "forbidden", "unavailable"]);
+  });
+
+  it("keeps the site's Retry-After, as seconds or a date", async () => {
+    const fn = (async () => new Response("slow down", { status: 429, headers: { "Retry-After": "600" } })) as typeof fetch;
+    const error = await new PoliteFetcher({ fetchFn: fn, sleep: async () => {} }).fetchHtml(pageUrl).catch((e: BlockedError) => e);
+    expect(error).toMatchObject({ kind: "rate_limit", retryAfterSeconds: 600 });
+    expect(retryAfterSeconds("Wed, 21 Oct 2026 07:28:00 GMT", Date.parse("Wed, 21 Oct 2026 07:18:00 GMT"))).toBe(600);
+    expect(retryAfterSeconds(null)).toBeUndefined();
+  });
+
+  it("tells an empty tracklist and an unrecognized page apart from a block", async () => {
+    const { fn } = fakeFetch([
+      { status: 200, body: '<html><head><link rel="canonical" href="https://www.1001tracklists.com/tracklist/abc/x.html"></head><body>No tracks yet</body></html>' },
+      { status: 200, body: "<html><body>Something completely different</body></html>" },
+    ]);
+    const fetcher = new PoliteFetcher({ fetchFn: fn, sleep: async () => {} });
+    await expect(fetcher.fetchHtml(pageUrl)).rejects.toBeInstanceOf(EmptyTracklistError);
+    await expect(fetcher.fetchHtml(pageUrl)).rejects.toBeInstanceOf(LayoutError);
+  });
+
+  it("lets Stop cancel a request that's waiting its turn, without sending it", async () => {
+    const { fn, calls } = fakeFetch([]);
+    let release: () => void = () => {};
+    const fetcher = new PoliteFetcher({ fetchFn: fn, sleep: () => new Promise((r) => (release = r)), now: () => 0 });
+    await fetcher.fetchHtml(pageUrl, undefined).catch(() => {}); // first request: no wait
+    const stop = new AbortController();
+    const waiting = fetcher.fetchHtml(pageUrl, stop.signal);
+    await new Promise((r) => setTimeout(r, 10));
+    stop.abort();
+    await expect(waiting).rejects.toBeInstanceOf(CancelledError);
+    release();
+    expect(calls).toHaveLength(1);
   });
 });
 

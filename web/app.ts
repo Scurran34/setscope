@@ -25,6 +25,7 @@ import type { Ranked, SetSummary } from "../src/model.ts";
 import type { BackgroundStatus } from "../src/source/background.ts";
 import type { DiscoveryRecord } from "../src/collect/discovery.ts";
 import type { QueueStatus } from "../src/collect/jobs.ts";
+import type { CollectPrefs, SessionView } from "../src/collect/sessions.ts";
 import type { SongInfoResult } from "../src/source/songinfo.ts";
 import type { ArtistRow, Paged, Period, SetCard, SetLine, SongRow } from "../src/catalog/browse.ts";
 import { mountPlayerBar, PlayerCore, SoundCloudProvider, type Playable } from "./player.ts";
@@ -54,6 +55,8 @@ interface Status {
   since: string;
   queue: QueueStatus;
   background?: BackgroundStatus;
+  /** Your collection sessions (most relevant first) and collecting preferences. */
+  collector?: { sessions: SessionView[]; prefs: CollectPrefs };
 }
 
 /** Your likes and categories, refreshed whenever you change them. */
@@ -1436,9 +1439,9 @@ function pagedSection<T>(title: string, load: (page: number) => Promise<Paged<T>
 
 /** Gather their sets: choose how many of the newest, see what's waiting, stop. */
 function gatherCard(p: DjProfileData): HTMLElement {
-  const gather = gatherControl("dj", (limit) => {
-    if (p.page) openPage(p.page, p.name, limit);
-    else openOnSite(p.name, "artist", limit);
+  const gather = gatherControl("dj", (target) => {
+    if (p.page) openPage(p.page, p.name, undefined, target);
+    else openOnSite(p.name, "artist", undefined, target);
   });
   const status = el("span", { class: "small muted" });
   const stop = el("button", { type: "button" }, "Stop gathering");
@@ -2289,7 +2292,7 @@ async function artistPage(name: string, exact: boolean): Promise<HTMLElement> {
       el(
         "div",
         { class: "btns", style: "margin-top:14px" },
-        gatherControl("dj", (limit) => openOnSite(p.name, "artist", limit), true),
+        gatherControl("dj", (target) => openOnSite(p.name, "artist", undefined, target), true),
         el("a", { class: "act-link", href: listHash("sets", new URLSearchParams(), { dj: p.name }) }, "Their sets →"),
       ),
       links.length ? el("div", { class: "chips", style: "margin-top:12px" }, ...links.map((l) => externalLink(l.url, l.label, "chip"))) : "",
@@ -2459,7 +2462,7 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
         playSlot,
         none ? "" : likeButton(name, r.liked ?? false, () => void render()),
         none ? "" : addToPlaylistButton(name, "＋ Playlist"),
-        gatherControl("song", (limit) => openOnSite(name, "song", limit), none),
+        gatherControl("song", (target) => openOnSite(name, "song", undefined, target), none),
       ),
     ),
   );
@@ -2488,8 +2491,8 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
         action: (dj) => {
           if (!dj.url) return undefined;
           const n = gatherAmount();
-          const button = el("button", { type: "button", class: "act", title: `Gather ${dj.name}'s last ${n} sets from their 1001Tracklists page (change the number with any Gather menu)` }, `Get last ${n}`);
-          button.addEventListener("click", () => openPage(dj.url!, dj.name, gatherAmount()));
+          const button = el("button", { type: "button", class: "act", title: `Collect ${n} sets of ${dj.name}'s that Rabbithole doesn't have yet (change the number with any Collect menu)` }, `Collect ${n} new`);
+          button.addEventListener("click", () => openPage(dj.url!, dj.name, undefined, gatherAmount()));
           return button;
         },
       }),
@@ -2581,45 +2584,48 @@ function alongsideSection(song: string): HTMLElement {
 }
 
 function findButton(label: string, query: string, kind: Mode, primary: boolean): HTMLElement {
-  const button = el("button", { type: "button", class: primary ? "primary" : "", title: `Collects the last ${gatherAmount()} sets from the page you pick` }, label);
-  button.addEventListener("click", () => openOnSite(query, kind, gatherAmount()));
+  const button = el("button", { type: "button", class: primary ? "primary" : "", title: `Collects ${gatherAmount()} new sets from the page you pick` }, label);
+  button.addEventListener("click", () => openOnSite(query, kind, undefined, gatherAmount()));
   return button;
 }
 
-/** How many sets a gather takes: 10, 20, 30 or 40, remembered between visits. */
-const GATHER_SIZES = [10, 20, 30, 40];
+/** How many NEW sets a collection asks for: 10, 25, 50 or 100 (sets already here don't count). */
+const GATHER_SIZES = [10, 25, 50, 100];
 
+/** Your last choice, else your default (25). */
 function gatherAmount(): number {
   try {
-    const saved = Number(localStorage.getItem("setscope.gather"));
+    const saved = Number(localStorage.getItem("setscope.collect"));
     if (GATHER_SIZES.includes(saved)) return saved;
   } catch {
     // private window: use the default
   }
-  return 20;
+  const fallback = lastStatus?.collector?.prefs.defaultTarget ?? 25;
+  return GATHER_SIZES.includes(fallback) ? fallback : 25;
 }
 
 /**
- * [Gather] [their last 20 sets ▾]: always says exactly how many of the newest sets it
- * takes. Sets already in Rabbithole are skipped, not swapped for older ones.
+ * [Collect] [25 new sets ▾]: starts a collection session for that many sets Rabbithole
+ * doesn't have yet (newest first, going further back past ones it has). Progress, Stop and
+ * checkpoints live in the header pill.
  */
-function gatherControl(kind: "dj" | "song", run: (limit: number) => void, primary = true): HTMLElement {
-  const words = (n: number) => (kind === "song" ? `the last ${n} sets that played it` : `their last ${n} sets`);
+function gatherControl(kind: "dj" | "song", run: (target: number) => void, primary = true): HTMLElement {
+  const words = (n: number) => (kind === "song" ? `${n} new sets that played it` : `${n} new sets`);
   const amount = el(
     "select",
-    { "aria-label": "How many sets to gather" },
+    { "aria-label": "How many new sets to collect" },
     ...GATHER_SIZES.map((n) => el("option", n === gatherAmount() ? { value: String(n), selected: "" } : { value: String(n) }, words(n))),
   ) as HTMLSelectElement;
   amount.addEventListener("change", () => {
     try {
-      localStorage.setItem("setscope.gather", amount.value);
+      localStorage.setItem("setscope.collect", amount.value);
     } catch {
       // not remembered: fine
     }
   });
-  const go = el("button", { type: "button", class: primary ? "primary" : "" }, "Gather");
+  const go = el("button", { type: "button", class: primary ? "primary" : "" }, "Collect");
   go.addEventListener("click", () => run(Number(amount.value)));
-  return el("span", { class: "gather", title: "Opens their 1001Tracklists page; the extension collects that many of the newest sets. Ones already in Rabbithole are skipped." }, go, amount);
+  return el("span", { class: "gather", title: "Opens their 1001Tracklists page; the extension finds that many sets Rabbithole doesn't have yet, newest first. Follow progress in the header." }, go, amount);
 }
 
 /** "Showing results for X · Search for <typed> instead" when the server auto-corrected. */
@@ -2652,7 +2658,7 @@ function likeButton(song: string, liked: boolean, after: () => void): HTMLElemen
   return button;
 }
 
-/** "Tech House · F#m (4m) · 126 BPM · Find on SoundCloud", with key/BPM filled in when they arrive. */
+/** "Tech House · F#m (11A) · 128 BPM · data: SoundCloud", with key/BPM filled in when they arrive. */
 function songFacts(song: string, genre: string | undefined): HTMLElement {
   const info = el("span", { class: "muted" }, "looking up key & BPM…");
   const line = el("div", { class: "small facts" }, genre ? el("b", {}, genre) : "", genre ? " · " : "", info, " · ", externalLink(soundcloudSearch(song), "SoundCloud search ↗"));
@@ -2666,11 +2672,15 @@ function songFacts(song: string, genre: string | undefined): HTMLElement {
     }
     if (r.status === "ok") {
       const parts = [r.info.key && (r.info.openKey ? `${r.info.key} (${r.info.openKey})` : r.info.key), r.info.bpm && `${r.info.bpm} BPM`].filter(Boolean);
-      info.replaceChildren(el("b", {}, parts.join(" · ") || "no key/BPM listed"), " ", externalLink(r.info.url ?? "https://getsongbpm.com", "data: GetSongBPM.com", "link credit"));
+      const credit =
+        r.info.source === "soundcloud"
+          ? externalLink(r.info.url ?? "https://soundcloud.com", "data: SoundCloud", "link credit")
+          : externalLink(r.info.url ?? "https://getsongbpm.com", "data: GetSongBPM.com", "link credit");
+      info.replaceChildren(el("b", {}, parts.join(" · ") || "no key/BPM listed"), " ", credit);
     } else if (r.status === "not-found") {
-      info.replaceChildren("not on ", externalLink("https://getsongbpm.com", "GetSongBPM.com"));
+      info.replaceChildren(r.info.source === "soundcloud" ? "key & BPM not listed on SoundCloud" : el("span", {}, "not on ", externalLink("https://getsongbpm.com", "GetSongBPM.com")));
     } else if (r.status === "no-key") {
-      info.replaceChildren("key & BPM: ", el("a", { class: "link", href: "#/account" }, "add a GetSongBPM key"));
+      info.replaceChildren("key & BPM: ", el("a", { class: "link", href: "#/account" }, auth.user?.owner ? "connect SoundCloud" : "not available yet"));
     } else {
       info.textContent = r.message;
     }
@@ -3198,8 +3208,8 @@ const POPUP_FEATURES = "popup,width=1100,height=900";
  * sends. The extension opens the matching result (or you click it), collects every
  * set on that page, sends the links here, and closes the popup.
  */
-function openOnSite(query: string, kind: Mode, limit?: number): void {
-  if (!armExtension(query, kind, limit)) return;
+function openOnSite(query: string, kind: Mode, limit?: number, target?: number): void {
+  if (!armExtension(query, kind, limit, target)) return;
   window.open("about:blank", POPUP, POPUP_FEATURES);
   const form = el("form", { method: "post", action: "https://www.1001tracklists.com/search/result.php", target: POPUP }) as HTMLFormElement;
   form.append(
@@ -3215,12 +3225,12 @@ function openOnSite(query: string, kind: Mode, limit?: number): void {
  * Opens a 1001Tracklists page in the popup: a set the app couldn't fetch (the
  * extension saves it), or a DJ's page (the extension collects their set links).
  */
-function openPage(url: string, who = "", limit?: number): void {
-  if (armExtension(who, limit ? "artist" : "set", limit)) window.open(url, POPUP, POPUP_FEATURES);
+function openPage(url: string, who = "", limit?: number, target?: number): void {
+  if (armExtension(who, limit || target ? "artist" : "set", limit, target)) window.open(url, POPUP, POPUP_FEATURES);
 }
 
 /** Tell the extension the next 1001Tracklists tab is ours to read and close. False if it isn't installed. */
-function armExtension(query: string, kind: Mode | "set", limit?: number): boolean {
+function armExtension(query: string, kind: Mode | "set", limit?: number, target?: number): boolean {
   if (!extensionInstalled()) {
     const error = $("formError");
     error.textContent =
@@ -3235,7 +3245,7 @@ function armExtension(query: string, kind: Mode | "set", limit?: number): boolea
     showExtensionNotices();
     window.scrollTo({ top: 0 });
   }
-  window.postMessage({ source: "setscope-app", type: "arm", query, kind, ...(limit ? { limit } : {}), ...(captureKey ? { token: captureKey.token } : {}) }, location.origin);
+  window.postMessage({ source: "setscope-app", type: "arm", query, kind, ...(limit ? { limit } : {}), ...(target ? { target } : {}), ...(captureKey ? { token: captureKey.token } : {}) }, location.origin);
   return true;
 }
 
@@ -3320,6 +3330,7 @@ function renderStatus(status: Status): void {
   lastStatus = status;
   $("cacheInfo").textContent = `${plural(status.sets, "set")} cached`;
   renderStrip(status.queue);
+  renderCollector(status);
   renderQueueCard(status.queue);
   if (status.background) renderBackground(status.background);
 }
@@ -3331,7 +3342,6 @@ function renderStrip(q: QueueStatus): void {
   const active = q.state === "running" || paused || q.waiting.length > 0 || q.older > 0;
   $("stripRefresh").hidden = !refreshWaiting;
   strip.hidden = (!active && !refreshWaiting) || !$("queueDrawer").hidden;
-  renderQueueBadge(q);
   if (strip.hidden) return;
   if (!active) {
     strip.classList.remove("paused");
@@ -3441,20 +3451,216 @@ function renderWaiting(urls: string[], paused: boolean, blockedBySite: boolean):
   $("qList").replaceChildren(...parts);
 }
 
-/** The Queue button's badge: sets waiting (amber while paused), hidden when nothing is. */
-function renderQueueBadge(q: QueueStatus): void {
-  const badge = $("queueBadge");
-  const waiting = q.waiting.length + (q.state === "running" ? 1 : 0);
-  badge.hidden = waiting === 0;
-  badge.textContent = waiting > 99 ? "99+" : String(waiting);
-  badge.classList.toggle("paused", q.state === "blocked");
-  $("queueBtn").title = waiting ? `Collecting sets: ${plural(waiting, "set")} to go${q.state === "blocked" ? " (paused)" : ""}` : "Collecting sets";
+// ---- set collection: the header pill and its panel ----
+
+/** The session the header shows: an open one, else one that ended in the last 10 minutes. */
+function mainSession(status: Status): SessionView | undefined {
+  const sessions = status.collector?.sessions ?? [];
+  const open = sessions.find((x) => !["stopped", "completed", "failed"].includes(x.state));
+  if (open) return open;
+  const recent = sessions[0];
+  return recent && Date.now() - Date.parse(recent.updatedAt) < 10 * 60_000 ? recent : undefined;
 }
+
+/** "18s" until a checkpoint (or a site's wait) ends. */
+function secondsLeft(iso: string | null | undefined): number {
+  return iso ? Math.max(0, Math.ceil((Date.parse(iso) - Date.now()) / 1000)) : 0;
+}
+
+/** The site's refusal in plain words: verification, or a request to slow down. */
+function blockWords(q: QueueStatus): { title: string; text: string } {
+  const verification = q.blockKind === "challenge" || q.blockKind === "forbidden" || q.blockKind === "auth";
+  return verification
+    ? { title: "Verification Required", text: "1001Tracklists is requesting verification. Your collected sets are saved." }
+    : { title: "Paused · site limit", text: "1001Tracklists asked Rabbithole to slow down. Your collected sets are saved." };
+}
+
+let collectorShown = "";
+
+/** The header pill: one short state, updated with every status check. */
+function renderCollector(status: Status): void {
+  const button = $("queueBtn");
+  const label = $("collectorLabel");
+  const q = status.queue;
+  const s = mainSession(status);
+  const siteBlocked = q.pauseReason === "site";
+  let tone = "idle";
+  let text = "Collect";
+  if (siteBlocked && (!s || s.state === "access_required" || s.state === "running")) {
+    tone = "warn";
+    text = blockWords(q).title;
+  } else if (s) {
+    const progress = `${s.collected}/${s.target}`;
+    const looks: Record<SessionView["state"], { tone: string; text: string }> = {
+      running: { tone: "active", text: `Collecting · ${progress}` },
+      queued: { tone: "active", text: `Collecting · ${progress}` },
+      checkpoint: { tone: "wait", text: secondsLeft(s.checkpointEndsAt) ? `Checkpoint · ${secondsLeft(s.checkpointEndsAt)}s` : "Checkpoint · resuming…" },
+      paused: { tone: "wait", text: `Paused · ${progress}` },
+      access_required: { tone: "warn", text: "Verification Required" },
+      stopping: { tone: "wait", text: "Stopping…" },
+      stopped: { tone: "idle", text: `Stopped · ${s.collected} collected` },
+      completed: { tone: "done", text: `Done · ${s.collected} new` },
+      failed: { tone: "bad", text: "Collection failed" },
+    };
+    ({ tone, text } = looks[s.state]);
+  } else if (q.state === "running") {
+    tone = "active";
+    text = `Queue · ${q.waiting.length}`;
+  }
+  button.dataset.tone = tone;
+  label.textContent = text;
+  if (s?.state === "checkpoint") label.dataset.until = s.checkpointEndsAt ?? "";
+  else delete label.dataset.until;
+  button.title = `Set collection: ${text}`;
+  $("queueBadge").hidden = true;
+  // Redraw the open panel only when something in it changed (countdowns tick on their own).
+  const key = JSON.stringify([status.collector, q.state, q.pauseReason, q.pausedUntil, q.blockKind, auth.user?.id]);
+  if (!$("collectorPop").hidden && key !== collectorShown) drawCollectorPanel(status);
+  collectorShown = key;
+}
+
+function setCollectorOpen(open: boolean): void {
+  const pop = $("collectorPop");
+  pop.hidden = !open;
+  $("queueBtn").setAttribute("aria-expanded", String(open));
+  if (open && lastStatus) {
+    drawCollectorPanel(lastStatus);
+    pop.querySelector<HTMLElement>("button, a, input, select")?.focus();
+  }
+}
+
+/** The collection panel: what's happening, and the controls for it. */
+function drawCollectorPanel(status: Status): void {
+  const pop = $("collectorPop");
+  const q = status.queue;
+  const s = mainSession(status);
+  const prefs = status.collector?.prefs;
+  const act = (label: string, run: () => Promise<unknown>, primary = false) => {
+    const b = el("button", { type: "button", class: primary ? "act primary" : "act" }, label);
+    b.addEventListener("click", async () => {
+      b.toggleAttribute("disabled", true);
+      try {
+        await run();
+      } catch (e) {
+        toast((e as Error).message);
+      }
+      await poll();
+      b.toggleAttribute("disabled", false);
+    });
+    return b;
+  };
+  const close = el("button", { type: "button", class: "chip-x", "aria-label": "Close" }, "✕");
+  close.addEventListener("click", () => setCollectorOpen(false));
+  const viewQueue = el("button", { type: "button", class: "act" }, "View queue");
+  viewQueue.addEventListener("click", () => {
+    setCollectorOpen(false);
+    setQueueOpen(true);
+  });
+
+  const parts: (Node | string)[] = [el("div", { class: "section-head" }, el("h2", {}, "Set collection"), close)];
+  if (q.pauseReason === "site") {
+    const words = blockWords(q);
+    const tryAgain = act("Try again", () => post("/api/resume"));
+    parts.push(
+      el(
+        "div",
+        { class: "warn-box", role: "alert" },
+        el("b", {}, `Collection paused — ${words.title.replace("Paused · ", "")}`),
+        el("div", {}, words.text),
+        q.pausedUntil ? el("div", { class: "small" }, `They asked us to wait until ${new Date(q.pausedUntil).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}.`) : "",
+        el("div", { class: "small muted" }, "Passing a check in your browser doesn't unblock Rabbithole's own requests; Try again checks whether they're allowed again."),
+        el("div", { class: "btns", style: "margin-top:8px" }, externalLink("https://www.1001tracklists.com/", "Open 1001Tracklists", "act-link"), auth.user ? tryAgain : ""),
+      ),
+    );
+  }
+  if (!s) {
+    parts.push(
+      el("p", { class: "small muted" }, "Nothing collecting right now. Open a DJ and use ", el("b", {}, "Collect"), " to fetch their newest sets you don't have yet."),
+      el("div", { class: "btns" }, el("a", { class: "act-link", href: "#/djs" }, "Browse DJs →"), viewQueue),
+    );
+  } else {
+    const stateWords: Record<SessionView["state"], string> = {
+      queued: "Starting",
+      running: "Collecting",
+      checkpoint: "Checkpoint",
+      paused: s.pauseReason === "auto_off" ? "Paused (Auto-Collect is off)" : "Paused at a checkpoint",
+      access_required: "Waiting for 1001Tracklists",
+      stopping: "Stopping…",
+      stopped: "Stopped",
+      completed: s.collected < s.target ? "Done: no more new sets on the page" : "Done",
+      failed: "Failed",
+    };
+    const open = !["stopped", "completed", "failed"].includes(s.state);
+    const countdown = el("span", { "data-until": s.checkpointEndsAt ?? "" }, `${secondsLeft(s.checkpointEndsAt)}s`);
+    parts.push(
+      el(
+        "dl",
+        {},
+        el("dt", {}, "Artist"),
+        el("dd", {}, el("a", { class: "link", href: artistHash(s.label) }, s.label)),
+        el("dt", {}, "Status"),
+        el("dd", {}, stateWords[s.state], s.state === "checkpoint" ? el("span", { class: "muted" }, " · continues in ", countdown) : ""),
+        el("dt", {}, "Progress"),
+        el("dd", {}, `${s.collected} / ${s.target} new sets`),
+        el("dt", {}, "Already in"),
+        el("dd", {}, plural(s.cached, "set"), " (not counted)"),
+        ...(open && s.nextCheckpointAt ? [el("dt", {}, "Next checkpoint"), el("dd", {}, `after ${s.nextCheckpointAt} sets`)] : []),
+        ...(s.remaining && open ? [el("dt", {}, "Waiting"), el("dd", {}, plural(s.remaining, "set"))] : []),
+        ...(s.lastError && s.state !== "completed" ? [el("dt", {}, "Last issue"), el("dd", { class: "small muted" }, s.lastError)] : []),
+      ),
+      el("div", { class: "bar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": String(s.target), "aria-valuenow": String(s.collected) }, el("div", { style: `width:${Math.min(100, (s.collected / s.target) * 100)}%` })),
+    );
+    const buttons: (Node | string)[] = [];
+    if (auth.user) {
+      if (s.state === "paused" || s.state === "checkpoint") buttons.push(act("Continue", () => post("/api/collect/resume", { session: s.id }), true));
+      if (s.state === "stopped" && s.remaining > 0) buttons.push(act("Resume", () => post("/api/collect/resume", { session: s.id }), true));
+      if (open && s.state !== "stopping") buttons.push(act("Stop gathering", () => post("/api/collect/stop", { session: s.id })));
+      if (!open) buttons.push(el("a", { class: "act-link", href: artistHash(s.label) }, "Collect more →"));
+    } else buttons.push(el("span", { class: "small muted" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to control collecting."));
+    buttons.push(viewQueue);
+    parts.push(el("div", { class: "btns" }, ...buttons));
+    const others = (status.collector?.sessions ?? []).filter((x) => x.id !== s.id && !["stopped", "completed", "failed"].includes(x.state));
+    if (others.length) parts.push(el("div", { class: "others" }, `Also: ${others.map((x) => `${x.label} (${x.collected}/${x.target}, ${x.state})`).join(" · ")}`));
+  }
+  if (auth.user && prefs) {
+    const auto = el("input", { type: "checkbox", ...(prefs.autoCollect ? { checked: "" } : {}), "aria-label": "Auto-Collect" }) as HTMLInputElement;
+    auto.addEventListener("change", async () => {
+      await post("/api/collect/prefs", { autoCollect: auto.checked });
+      await poll();
+    });
+    const every = el(
+      "select",
+      { "aria-label": "Checkpoint every" },
+      ...[5, 10].map((n) => el("option", n === prefs.checkpointEvery ? { value: String(n), selected: "" } : { value: String(n) }, `every ${n} sets`)),
+    ) as HTMLSelectElement;
+    every.addEventListener("change", async () => {
+      await post("/api/collect/prefs", { checkpointEvery: Number(every.value) });
+      await poll();
+    });
+    parts.push(
+      el(
+        "div",
+        { class: "settings" },
+        el("label", { class: "switch", title: "On: after each checkpoint, collecting carries on by itself. Off: it waits for Continue." }, auto, " ", el("b", {}, "Auto-Collect")),
+        el("label", { class: "small" }, "Checkpoint ", every),
+      ),
+    );
+  }
+  pop.replaceChildren(...parts);
+}
+
+// Countdowns (checkpoints) tick every second between status checks.
+setInterval(() => {
+  for (const node of document.querySelectorAll<HTMLElement>("[data-until]")) {
+    if (!node.dataset.until) continue;
+    const left = secondsLeft(node.dataset.until);
+    node.textContent = node.id === "collectorLabel" ? (left ? `Checkpoint · ${left}s` : "Checkpoint · resuming…") : left ? `${left}s` : "a moment";
+  }
+}, 1000);
 
 function setQueueOpen(open: boolean): void {
   $("queueDrawer").hidden = !open;
   $("drawerShade").hidden = !open;
-  $("queueBtn").setAttribute("aria-expanded", String(open));
   $("bgCard").hidden = !auth.user?.owner;
   if (lastStatus) renderStatus(lastStatus);
 }
@@ -3614,6 +3820,7 @@ $("query").addEventListener("blur", hideSuggest);
 
 window.addEventListener("hashchange", () => {
   setQueueOpen(false);
+  setCollectorOpen(false);
   closeMenu();
   void showRoute();
 });
@@ -3621,13 +3828,21 @@ $("stripRefresh").addEventListener("click", () => void render());
 
 // The queue drawer: from the top bar's Queue button, or "Open queue" in the strip.
 mountQueueCard();
-$("queueBtn").addEventListener("click", () => setQueueOpen($("queueDrawer").hidden === true));
+$("queueBtn").addEventListener("click", (event) => {
+  event.stopPropagation();
+  setCollectorOpen($("collectorPop").hidden === true);
+});
+document.addEventListener("click", (event) => {
+  const pop = $("collectorPop");
+  if (!pop.hidden && !pop.contains(event.target as Node) && !$("queueBtn").contains(event.target as Node)) setCollectorOpen(false);
+});
 $("stripDetails").addEventListener("click", () => setQueueOpen(true));
 $("queueClose").addEventListener("click", () => setQueueOpen(false));
 $("drawerShade").addEventListener("click", () => setQueueOpen(false));
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     setQueueOpen(false);
+    setCollectorOpen(false);
     closeMenu();
   }
 });
@@ -3648,4 +3863,9 @@ $("addLinksBtn").addEventListener("click", async () => {
 setTimeout(showExtensionNotices, 800);
 
 void poll().then(() => showRoute());
-setInterval(() => void poll(), 1500);
+// Status checks: every 3 s while something is collecting or counting down, every 10 s otherwise.
+(function schedulePoll() {
+  const s = lastStatus;
+  const busy = s && (s.queue.state === "running" || (s.collector?.sessions ?? []).some((x) => ["running", "checkpoint", "stopping"].includes(x.state)));
+  setTimeout(() => void poll().finally(schedulePoll), busy ? 3000 : 10_000);
+})();

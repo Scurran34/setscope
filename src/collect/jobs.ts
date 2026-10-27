@@ -17,7 +17,8 @@
 import type pg from "pg";
 import type { PgCatalog } from "../catalog/pg-catalog.ts";
 import type { Tracklist } from "../model.ts";
-import { BlockedError, isFetchAllowed, MIN_DELAY_MS, type HtmlSource } from "../source/fetcher.ts";
+import { BlockedError, CancelledError, EmptyTracklistError, isFetchAllowed, LayoutError, MIN_DELAY_MS, type BlockKind, type HtmlSource } from "../source/fetcher.ts";
+import { CollectionSessions, type JobOutcome, type SessionView } from "./sessions.ts";
 import { canonicalUrl, dateFromUrl, parseTracklist, tracklistId } from "../source/parse.ts";
 
 export type JobKind = "fetch_set" | "refresh_set";
@@ -49,6 +50,10 @@ export interface QueueStatus {
   found: string[];
   /** Sets older than the window, held until someone includes them. */
   older: number;
+  /** When the site asked us to come back (Retry-After), while paused by it. */
+  pausedUntil?: string;
+  /** How the site said no, while paused by it. */
+  blockKind?: BlockKind;
 }
 
 export interface EnqueueResult {
@@ -70,13 +75,19 @@ interface JobRow {
   kind: JobKind;
   target: string;
   attempts: number;
+  session_id: number | null;
 }
+
+/** Jobs the worker may take: on their own, or in a session that's collecting right now. */
+const CLAIMABLE = `(j.session_id is null or exists (select 1 from collection_sessions cs where cs.id = j.session_id and cs.state = 'running'))`;
 
 export interface JobQueueOptions {
   /** Only used for the time estimate; the fetcher enforces the real delay. */
   delayMs?: number;
   /** For tests: how a retry is scheduled (default: a timer). */
   schedule?: (ms: number, run: () => void) => void;
+  /** How long a checkpoint pauses a session (default 10 s). */
+  checkpointMs?: number;
 }
 
 export class PgJobQueue {
@@ -87,6 +98,10 @@ export class PgJobQueue {
   private readonly schedule: (ms: number, run: () => void) => void;
   private running: Promise<void> | undefined;
   private current: string | undefined;
+  /** The session whose set is being fetched right now, and how to cancel that fetch. */
+  private currentSession: number | null = null;
+  private abort: AbortController | undefined;
+  readonly sessions: CollectionSessions;
 
   constructor(pool: pg.Pool, catalog: PgCatalog, source: HtmlSource, options: JobQueueOptions = {}) {
     this.pool = pool;
@@ -94,6 +109,7 @@ export class PgJobQueue {
     this.source = source;
     this.delayMs = options.delayMs ?? MIN_DELAY_MS;
     this.schedule = options.schedule ?? ((ms, run) => setTimeout(run, ms).unref());
+    this.sessions = new CollectionSessions(pool, options.checkpointMs === undefined ? {} : { checkpointMs: options.checkpointMs });
   }
 
   /**
@@ -102,6 +118,7 @@ export class PgJobQueue {
    */
   async recover(): Promise<void> {
     await this.pool.query("update collection_jobs set status = 'queued', updated_at = now() where status = 'running'");
+    await this.sessions.recover();
     const waiting = await this.count("status in ('queued', 'blocked')");
     const state = await this.state();
     if (waiting > 0 && !state.paused_reason) {
@@ -116,7 +133,7 @@ export class PgJobQueue {
   async enqueue(
     urls: string[],
     since: string,
-    options: { requestedBy?: number; priority?: number; start?: boolean; page?: string; limit?: number } = {},
+    options: { requestedBy?: number; priority?: number; start?: boolean; page?: string; limit?: number; sessionId?: number; newLimit?: number } = {},
   ): Promise<EnqueueResult> {
     // Newest first. A limit means "their last N sets": the newest N on the page, whether or
     // not some of them are already here (those are skipped, not swapped for older ones).
@@ -127,6 +144,7 @@ export class PgJobQueue {
     let queued = 0;
     let alreadyCached = 0;
     let skippedOld = 0;
+    let newOnes = 0;
     for (const url of unique) {
       const id = tracklistId(url);
       if (!id) continue;
@@ -134,19 +152,47 @@ export class PgJobQueue {
         alreadyCached++;
         continue;
       }
+      // A session asks for N *new* sets: indexed ones don't count, older ones fill in.
+      if (options.newLimit !== undefined && newOnes >= options.newLimit) continue;
+      newOnes++;
       const date = dateFromUrl(url);
       const held = date !== undefined && date < since;
       const r = await this.pool.query(
-        `insert into collection_jobs (kind, target, status, priority, performed_on, requested_by, discovery_page)
-         values ('fetch_set', $1, $2, $3, $4, $5, $6) on conflict do nothing`,
-        [url, held ? "held" : "queued", options.priority ?? 0, date ?? null, options.requestedBy ?? null, options.page ?? null],
+        `insert into collection_jobs (kind, target, status, priority, performed_on, requested_by, discovery_page, session_id)
+         values ('fetch_set', $1, $2, $3, $4, $5, $6, $7) on conflict do nothing`,
+        [url, held ? "held" : "queued", options.priority ?? 0, date ?? null, options.requestedBy ?? null, options.page ?? null, options.sessionId ?? null],
       );
-      if (r.rowCount === 0) continue; // already waiting
+      if (r.rowCount === 0) {
+        // Already in line (someone else asked for it): this session counts it too, once.
+        if (options.sessionId) {
+          const joined = await this.pool.query(
+            `update collection_jobs set session_id = $2 where kind = 'fetch_set' and target = $1 and session_id is null and status in ('queued', 'blocked', 'held')`,
+            [url, options.sessionId],
+          );
+          if (joined.rowCount) queued++;
+        }
+        continue;
+      }
       if (held) skippedOld++;
       else queued++;
     }
     if (options.start !== false) this.kick();
     return { queued, fetchingNow: queued, alreadyCached, skippedOld, overLimit };
+  }
+
+  /** Stop a session: nothing more starts, a fetch in flight for it is cancelled, saved sets stay. */
+  async stopSession(id: number): Promise<SessionView | undefined> {
+    const busy = this.currentSession === id;
+    const view = await this.sessions.stop(id, busy);
+    if (busy) this.abort?.abort();
+    return view;
+  }
+
+  /** Continue a session (after a checkpoint, a pause, or a Stop). Someone has to press it. */
+  async resumeSession(id: number): Promise<SessionView | undefined> {
+    const view = await this.sessions.resume(id);
+    this.kick();
+    return view;
   }
 
   /** "Stop gathering": cancel the not-yet-fetched sets that came from these pages. Returns how many. */
@@ -234,11 +280,18 @@ export class PgJobQueue {
     return { waiting: r.rowCount ?? 0, found: 0 };
   }
 
-  /** After a pause: try again with everything waiting. */
-  async resume(): Promise<void> {
+  /**
+   * After a pause: try again with everything waiting. Not before the time the site gave
+   * (Retry-After): then it says when, and nothing is requested.
+   */
+  async resume(): Promise<{ resumed: boolean; waitUntil?: string }> {
+    const state = await this.state();
+    if (state.paused_until && state.paused_until.getTime() > Date.now()) return { resumed: false, waitUntil: state.paused_until.toISOString() };
     await this.pool.query("update collection_jobs set status = 'queued', next_attempt_at = now(), updated_at = now() where status = 'blocked'");
     await this.unpause();
+    await this.sessions.accessRestored();
     this.kick();
+    return { resumed: true };
   }
 
   /** Put this batch's failed jobs back in line. */
@@ -263,13 +316,15 @@ export class PgJobQueue {
       )
     ).rows;
     const n = (status: string) => counts.find((c) => c.status === status)?.n ?? 0;
+    // Sets of a paused or stopped session aren't "waiting": they go only when it continues.
     const waiting = (
       await this.pool.query<{ target: string }>(
-        `select target from collection_jobs where status in ('queued', 'running', 'blocked')
+        `select target from collection_jobs j where (status = 'running' or (status in ('queued', 'blocked') and ${CLAIMABLE}))
           order by (status = 'running') desc, priority desc, performed_on desc nulls last, id limit 300`,
       )
     ).rows.map((r) => r.target);
-    const remaining = n("queued") + n("running") + n("blocked");
+    const onHold = (await this.pool.query<{ n: number }>(`select count(*)::int n from collection_jobs j where status in ('queued', 'blocked') and not ${CLAIMABLE}`)).rows[0]!.n;
+    const remaining = n("queued") + n("running") + n("blocked") - onHold;
     const status: QueueStatus = {
       state: state.paused_reason ? "blocked" : remaining > 0 ? "running" : "idle",
       done: n("done"),
@@ -285,6 +340,8 @@ export class PgJobQueue {
     if (state.paused_reason) {
       status.pauseReason = state.paused_reason;
       if (state.paused_detail) status.blocked = state.paused_detail;
+      if (state.paused_until && state.paused_until.getTime() > Date.now()) status.pausedUntil = state.paused_until.toISOString();
+      if (state.block_kind) status.blockKind = state.block_kind;
     }
     return status;
   }
@@ -312,17 +369,25 @@ export class PgJobQueue {
   private async work(): Promise<void> {
     for (;;) {
       if ((await this.state()).paused_reason) return;
+      const nextCheckpoint = await this.sessions.advanceCheckpoints();
       const job = await this.claim();
       if (!job) {
-        await this.scheduleNextRetry();
+        await this.scheduleNextRetry(nextCheckpoint);
         return;
       }
       this.current = job.target;
+      this.currentSession = job.session_id;
+      this.abort = new AbortController();
+      let outcome: JobOutcome | undefined;
+      let error: string | undefined;
       try {
-        await this.process(job);
+        [outcome, error] = await this.process(job, this.abort.signal);
       } finally {
         this.current = undefined;
+        this.currentSession = null;
+        this.abort = undefined;
       }
+      if (job.session_id && outcome) await this.sessions.afterJob(job.session_id, outcome, error);
     }
   }
 
@@ -330,28 +395,49 @@ export class PgJobQueue {
   private async claim(): Promise<JobRow | undefined> {
     const r = await this.pool.query<JobRow>(
       `update collection_jobs set status = 'running', attempts = attempts + 1, updated_at = now()
-        where id = (select id from collection_jobs where status = 'queued' and next_attempt_at <= now()
-                     order by priority desc, performed_on desc nulls last, id
+        where id = (select j.id from collection_jobs j where j.status = 'queued' and j.next_attempt_at <= now() and ${CLAIMABLE}
+                     order by j.priority desc, j.performed_on desc nulls last, j.id
                      for update skip locked limit 1)
-        returning id, kind, target, attempts`,
+        returning id, kind, target, attempts, session_id`,
     );
     return r.rows[0];
   }
 
-  private async process(job: JobRow): Promise<void> {
+  /** Fetch and save one set. Says what happened, for its session (if it has one). */
+  private async process(job: JobRow, signal: AbortSignal): Promise<[JobOutcome, string?]> {
     const sourceId = tracklistId(job.target) ?? "";
-    if (job.kind === "fetch_set" && (await this.catalog.has(sourceId))) return this.finish(job.id, "done");
+    if (job.kind === "fetch_set" && (await this.catalog.has(sourceId))) {
+      await this.finish(job.id, "done");
+      return ["cached"];
+    }
 
     let html: string;
     try {
-      html = await this.source.fetchHtml(job.target);
+      html = await this.source.fetchHtml(job.target, signal);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof CancelledError) {
+        // Stopped by the person: the set goes back in line for a later Resume, not "failed".
+        await this.pool.query("update collection_jobs set status = 'queued', attempts = greatest(attempts - 1, 0), updated_at = now() where id = $1", [job.id]);
+        return ["cancelled"];
+      }
       if (error instanceof BlockedError) {
         await this.finish(job.id, "blocked", message);
         if (job.kind === "refresh_set") await this.recordRefresh(sourceId, "blocked", 0, message);
-        await this.pause("site", message);
-        return;
+        await this.pause("site", message, error.kind, error.retryAfterSeconds);
+        await this.sessions.accessRequired(message);
+        return ["failed", message];
+      }
+      if (error instanceof EmptyTracklistError) {
+        // A real answer: nothing listed yet. Not saved, not counted, not a failure.
+        await this.finish(job.id, "done", message);
+        if (job.kind === "refresh_set") await this.recordRefresh(sourceId, "unchanged", 0);
+        return ["empty", message];
+      }
+      if (error instanceof LayoutError) {
+        await this.finish(job.id, "failed", message);
+        if (job.kind === "refresh_set") await this.recordRefresh(sourceId, "failed", 0, message);
+        return ["failed", message];
       }
       // A passing problem: try again later, a few times.
       const delay = RETRY_DELAYS_MS[job.attempts - 1];
@@ -360,22 +446,25 @@ export class PgJobQueue {
           `update collection_jobs set status = 'queued', next_attempt_at = now() + make_interval(secs => $2), last_error = $3, updated_at = now() where id = $1`,
           [job.id, delay / 1000, message],
         );
+        return ["failed", message]; // trying again later: not counted yet
       } else {
         await this.finish(job.id, "failed", message);
         if (job.kind === "refresh_set") await this.recordRefresh(sourceId, "failed", 0, message);
       }
-      return;
+      return ["failed", message];
     }
 
-    // Reading and saving the page: a failure here won't fix itself by retrying.
+    // Reading and saving the page (one transaction): a failure here won't fix itself by retrying.
     try {
       const changed = await this.catalog.save(parseTracklist(html, job.target), html);
       if (job.kind === "refresh_set") await this.recordRefresh(sourceId, changed > 0 ? "updated" : "unchanged", changed);
       await this.finish(job.id, "done");
+      return [job.kind === "fetch_set" ? "saved" : "cached"];
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.finish(job.id, "failed", message);
       if (job.kind === "refresh_set") await this.recordRefresh(sourceId, "failed", 0, message);
+      return ["failed", message];
     }
   }
 
@@ -391,29 +480,36 @@ export class PgJobQueue {
     );
   }
 
-  /** If a job is waiting to retry, wake up when it's due. */
-  private async scheduleNextRetry(): Promise<void> {
+  /** Wake up when a job is due to retry, or a checkpoint's countdown ends. */
+  private async scheduleNextRetry(nextCheckpoint?: Date): Promise<void> {
     const r = await this.pool.query<{ ms: number }>(
       `select greatest(0, extract(epoch from min(next_attempt_at) - now()) * 1000)::int as ms
-         from collection_jobs where status = 'queued'`,
+         from collection_jobs j where status = 'queued' and next_attempt_at > now() and ${CLAIMABLE}`,
     );
-    const ms = r.rows[0]?.ms;
-    if (ms !== null && ms !== undefined) this.schedule(ms + 50, () => this.kick());
+    const retry = r.rows[0]?.ms;
+    const checkpoint = nextCheckpoint ? Math.max(0, nextCheckpoint.getTime() - Date.now()) : undefined;
+    const ms = [retry, checkpoint].filter((x): x is number => x !== null && x !== undefined);
+    if (ms.length) this.schedule(Math.min(...ms) + 50, () => this.kick());
   }
 
   // ---------- shared state ----------
 
-  private async state(): Promise<{ paused_reason: PauseReason | null; paused_detail: string | null; batch_started_at: Date }> {
-    const r = await this.pool.query("select paused_reason, paused_detail, batch_started_at from collector_state where id = 1");
+  private async state(): Promise<{ paused_reason: PauseReason | null; paused_detail: string | null; batch_started_at: Date; paused_until: Date | null; block_kind: BlockKind | null }> {
+    const r = await this.pool.query("select paused_reason, paused_detail, batch_started_at, paused_until, block_kind from collector_state where id = 1");
     return r.rows[0];
   }
 
-  private async pause(reason: PauseReason, detail: string): Promise<void> {
-    await this.pool.query("update collector_state set paused_reason = $1, paused_detail = $2, paused_at = now() where id = 1", [reason, detail]);
+  private async pause(reason: PauseReason, detail: string, kind?: BlockKind, retryAfterSeconds?: number): Promise<void> {
+    await this.pool.query(
+      `update collector_state set paused_reason = $1, paused_detail = $2, paused_at = now(), block_kind = $3,
+              paused_until = case when $4::int is null then null else now() + make_interval(secs => $4::int) end
+        where id = 1`,
+      [reason, detail, kind ?? null, retryAfterSeconds ?? null],
+    );
   }
 
   private async unpause(): Promise<void> {
-    await this.pool.query("update collector_state set paused_reason = null, paused_detail = null, paused_at = null where id = 1");
+    await this.pool.query("update collector_state set paused_reason = null, paused_detail = null, paused_at = null, paused_until = null, block_kind = null where id = 1");
   }
 
   private async startBatch(): Promise<void> {

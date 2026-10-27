@@ -38,6 +38,10 @@ export interface ScTrack {
   artwork?: string;
   createdAt?: string;
   label?: string;
+  /** Tempo and key as SoundCloud lists them (filled in by the uploader or SoundCloud; sometimes missing). */
+  bpm?: number;
+  /** e.g. "Gb:min" */
+  keySignature?: string;
 }
 
 export interface ScUser {
@@ -98,6 +102,8 @@ type RawTrack = {
   artwork_url?: string | null;
   created_at?: string;
   label_name?: string | null;
+  bpm?: number | null;
+  key_signature?: string | null;
   kind?: string;
 };
 
@@ -160,6 +166,12 @@ export class SoundCloudClient {
     if (raw.kind === "user") return { kind: "user", user: toUser(raw as unknown as Record<string, unknown>) };
     if (raw.kind === "track") return { kind: "track", track: toTrack(raw) };
     throw new ScError("That link isn't a SoundCloud track or profile.");
+  }
+
+  /** One track by SoundCloud's id for it ("soundcloud:tracks:123"). */
+  async track(urn: string): Promise<ScTrack> {
+    if (!/^soundcloud:tracks:\d+$/.test(urn)) throw new ScError("Not a SoundCloud track.");
+    return toTrack((await this.get(`${API}/tracks/${encodeURIComponent(urn)}`)) as RawTrack);
   }
 
   /** A user by profile name, e.g. "chrisstussy" (from soundcloud.com/chrisstussy). */
@@ -307,6 +319,8 @@ export function toTrack(raw: RawTrack): ScTrack {
   if (raw.artwork_url) track.artwork = raw.artwork_url;
   if (raw.created_at) track.createdAt = raw.created_at;
   if (raw.label_name) track.label = raw.label_name;
+  if (typeof raw.bpm === "number" && raw.bpm > 0) track.bpm = Math.round(raw.bpm);
+  if (raw.key_signature?.trim()) track.keySignature = raw.key_signature.trim();
   return track;
 }
 

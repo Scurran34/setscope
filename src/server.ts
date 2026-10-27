@@ -53,6 +53,7 @@ import { AccountError, Accounts, SESSION_DAYS, type User } from "./auth/accounts
 import { RateLimiter } from "./auth/rate-limit.ts";
 import { canonicalPage, discoveryForArtist, recordDiscovery } from "./collect/discovery.ts";
 import { PgJobQueue } from "./collect/jobs.ts";
+import type { CollectPrefs } from "./collect/sessions.ts";
 import type { Catalog } from "./catalog/catalog.ts";
 import { PgCatalog } from "./catalog/pg-catalog.ts";
 import { DEFAULT_MONTHS, dataDir, sinceMonths } from "./config.ts";
@@ -63,8 +64,9 @@ import { normalizeName, parseSongQuery, songKey, splitArtists, trackFromName } f
 import { findTrackId, PgUserData, UserDataError } from "./personal/user-data.ts";
 import { BackgroundCollector } from "./source/background.ts";
 import { isFetchAllowed, PoliteFetcher } from "./source/fetcher.ts";
-import { extractTracklistUrls } from "./source/parse.ts";
-import { SongInfoService, SongInfoStore } from "./source/songinfo.ts";
+import { extractTracklistUrls, tracklistId } from "./source/parse.ts";
+import { SongInfoService, SongInfoStore, type SongInfo, type SongInfoResult } from "./source/songinfo.ts";
+import { musicalKey } from "./soundcloud/key.ts";
 import { ScError, ScRateLimited, SoundCloudClient, type ScTrack } from "./soundcloud/client.ts";
 import { isTrackLink, LinkStore } from "./soundcloud/links.ts";
 import { classify, remixesOf, songCandidates, type Candidate } from "./soundcloud/match.ts";
@@ -112,6 +114,8 @@ export interface App {
   likesLimit: RateLimiter;
   /** Tracks SoundCloud had no match for, and until when not to search again. */
   noMatch: Map<number, number>;
+  /** Key and BPM read from SoundCloud: track id -> result, until when (memory only). */
+  keyBpm: Map<number, { result: SongInfoResult; expires: number }>;
   /** Capture keys handed to the extension: key -> whose, until when. */
   captureTokens: Map<string, { userId: number; expires: number }>;
 }
@@ -170,6 +174,7 @@ export function createApp({ pool, catalog, queue, accounts, userData }: AppDeps,
     likesLimit: options.likesLimit ?? new RateLimiter(400, 24 * 60 * 60_000),
     noMatch: new Map(),
     captureTokens: new Map(),
+    keyBpm: new Map(),
   };
   return createServer((req, res) => {
     if (req.url?.startsWith("/api/") && req.url !== "/api/status") {
@@ -325,9 +330,15 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       return sendJson(res, 200, trending(await app.catalog.all(), { since, today: today(), recentDays: intParam(params, "days", 30), top: 5 }));
     }
     case "GET /api/song-info": {
+      // Key and BPM: from the song's SoundCloud upload when there is one, otherwise GetSongBPM
+      // (if a key for it is set up).
       const song = required(params, "song");
       if (!song.includes(" - ")) throw new BadRequest('Expected "Artist - Title"');
-      return sendJson(res, 200, await app.songInfo.info(song));
+      const fromSoundCloud = await keyAndBpmFromSoundCloud(app, req, user, song);
+      if (fromSoundCloud) return sendJson(res, 200, fromSoundCloud);
+      const backup = await app.songInfo.info(song);
+      if (backup.status === "no-key" && app.soundcloud.configured()) return sendJson(res, 200, { status: "not-found", info: { found: false, source: "soundcloud", fetchedAt: new Date().toISOString() } });
+      return sendJson(res, 200, backup);
     }
 
     // ---- discovery: what DJs are playing ----
@@ -658,23 +669,11 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
         throw error;
       }
       const known = await app.links.playable(trackId);
-      if (known) return sendJson(res, 200, known);
+      if (known) return sendJson(res, 200, { url: known.url, auto: known.auto, confidence: known.confidence });
       if (!app.soundcloud.configured()) return sendJson(res, 404, { error: "Connect SoundCloud (Account → SoundCloud app) to play songs that haven't been linked yet." });
-      const missUntil = app.noMatch.get(trackId);
-      if (missUntil && missUntil > Date.now()) return sendJson(res, 404, { error: `Couldn't find “${song}” on SoundCloud.` });
-      if (!app.soundcloudLimit.take(user ? `user:${user.id}` : `addr:${req.socket.remoteAddress ?? "?"}`)) {
-        throw new NotAllowed("That's a lot of SoundCloud searches in a short time. Wait a few minutes and try again.", 429);
-      }
-      const track = trackFromName(song);
-      const page = await app.soundcloud.searchTracks({ q: searchWords(`${track.artist} ${track.title}`), limit: 30 });
-      const usable = songCandidates(track, page.items).filter((c) => c.kind === "this" && c.confidence >= 0.75 && c.track.embeddable && c.track.access !== "blocked");
-      const best = usable.find((c) => c.track.access === "playable") ?? usable[0];
-      if (!best) {
-        app.noMatch.set(trackId, Date.now() + 24 * 60 * 60_000);
-        return sendJson(res, 404, { error: `Couldn't find a playable upload of “${song}” on SoundCloud.` });
-      }
-      await app.links.saveAutoMatch(trackId, { url: best.track.permalink, externalId: best.track.urn, confidence: best.confidence });
-      return sendJson(res, 200, { url: best.track.permalink, auto: true, confidence: best.confidence, preview: best.track.access === "preview" });
+      const found = await matchOnSoundCloud(app, req, user, trackId, song);
+      if (!found) return sendJson(res, 404, { error: `Couldn't find a playable upload of “${song}” on SoundCloud.` });
+      return sendJson(res, 200, { url: found.url, auto: true, confidence: found.confidence, preview: found.preview });
     }
     case "POST /api/song-links": {
       requireOwnHeader(req);
@@ -771,13 +770,72 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
     }
 
     // ---- collecting ----
-    case "GET /api/status":
+    case "GET /api/status": {
+      // Also your collecting sessions and preferences, for the header indicator. Checkpoints
+      // whose countdown is over move on here too, so the header never sits at "0s".
+      await app.queue.sessions.advanceCheckpoints();
+      app.queue.kick();
+      const owner = user ? await app.accounts.isOwner(user.id) : false;
       return sendJson(res, 200, {
         sets: await app.catalog.count(),
         since: app.since,
         queue: await app.queue.status(),
         background: await app.background?.status(),
+        collector: user
+          ? { sessions: await app.queue.sessions.forUser(user.id, owner), prefs: await app.queue.sessions.prefs(user.id) }
+          : fromThisComputer(req)
+            ? { sessions: await app.queue.sessions.forUser(null, true), prefs: await app.queue.sessions.prefs(null) }
+            : { sessions: [], prefs: await app.queue.sessions.prefs(null) },
       });
+    }
+    case "GET /api/collect/prefs": {
+      const u = needUser("change collecting settings");
+      return sendJson(res, 200, await app.queue.sessions.prefs(u.id));
+    }
+    case "POST /api/collect/prefs": {
+      requireOwnHeader(req);
+      const u = needUser("change collecting settings");
+      const body = (await readJson(req)) as { autoCollect?: unknown; checkpointEvery?: unknown; defaultTarget?: unknown };
+      const changes: Partial<CollectPrefs> = {};
+      if (typeof body.autoCollect === "boolean") changes.autoCollect = body.autoCollect;
+      if (body.checkpointEvery === 5 || body.checkpointEvery === 10) changes.checkpointEvery = body.checkpointEvery;
+      else if (body.checkpointEvery !== undefined) throw new BadRequest("Checkpoints are every 5 or 10 sets.");
+      if (body.defaultTarget !== undefined) {
+        if (!Number.isInteger(body.defaultTarget) || (body.defaultTarget as number) < 1 || (body.defaultTarget as number) > 1000) throw new BadRequest("A target is 1 to 1000 sets.");
+        changes.defaultTarget = body.defaultTarget as number;
+      }
+      const prefs = await app.queue.sessions.setPrefs(u.id, changes);
+      app.queue.kick();
+      return sendJson(res, 200, prefs);
+    }
+    case "POST /api/collect/stop":
+    case "POST /api/collect/resume": {
+      requireOwnHeader(req);
+      const u = needUser("control collecting");
+      const body = (await readJson(req)) as { session?: unknown };
+      if (!Number.isInteger(body.session)) throw new BadRequest("Expected { session }");
+      const session = await app.queue.sessions.get(body.session as number);
+      if (!session) throw new NotAllowed("No such collecting session.", 404);
+      if (session.requestedBy !== u.id && !(await app.accounts.isOwner(u.id))) throw new NotAllowed("That's someone else's collecting session.", 403);
+      const view = route.endsWith("stop") ? await app.queue.stopSession(session.id) : await app.queue.resumeSession(session.id);
+      return sendJson(res, 200, view);
+    }
+    case "POST /api/collect/known": {
+      // Which of these set links are already indexed or waiting: lets the extension keep
+      // scrolling a DJ page until it has found enough *new* sets.
+      requireOwnHeader(req);
+      const body = (await readJson(req, 2_000_000)) as { urls?: unknown; token?: unknown };
+      await captureUser(app, req, user, body.token);
+      if (!Array.isArray(body.urls) || body.urls.length > 5000) throw new BadRequest("Expected { urls } (up to 5000)");
+      const ids = body.urls.filter((u): u is string => typeof u === "string").map((u) => tracklistId(u)).filter((id): id is string => Boolean(id));
+      const known = await app.pool.query<{ source_id: string }>(
+        `select source_id from sets where source_id = any($1)
+         union select substring(target from '/tracklist/([a-z0-9]+)/') from collection_jobs
+          where kind = 'fetch_set' and status in ('queued', 'running', 'blocked', 'held') and substring(target from '/tracklist/([a-z0-9]+)/') = any($1)`,
+        [ids],
+      );
+      return sendJson(res, 200, { known: known.rows.map((r) => r.source_id) });
+    }
     case "POST /api/capture-token": {
       // A short-lived key the page hands the extension, so a capture sent from someone
       // else's computer (through a shared link) counts as theirs.
@@ -795,7 +853,7 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       // every set on the page is queued, newest first. From anyone else (a shared link),
       // it needs their capture key, and a friend's gather is capped.
       requireOwnHeader(req);
-      const body = (await readJson(req, 5_000_000)) as { pageUrl?: unknown; urls?: unknown; complete?: unknown; limit?: unknown; token?: unknown };
+      const body = (await readJson(req, 5_000_000)) as { pageUrl?: unknown; urls?: unknown; complete?: unknown; limit?: unknown; token?: unknown; target?: unknown; label?: unknown };
       const who = await captureUser(app, req, user, body.token);
       if (!Array.isArray(body.urls)) throw new BadRequest("Expected { urls: string[] }");
       if (body.urls.length > 20_000) throw new BadRequest("Too many links in one capture.");
@@ -805,14 +863,25 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       // "Gather the newest N" from a DJ page: a bound you chose; without one, every set is queued.
       let limit = typeof body.limit === "number" && Number.isInteger(body.limit) && body.limit > 0 ? body.limit : undefined;
       if (!who.trusted) limit = Math.min(limit ?? FRIEND_GATHER_MAX, FRIEND_GATHER_MAX);
-      const options: { requestedBy?: number; page?: string; limit?: number } = {};
+      const options: { requestedBy?: number; page?: string; limit?: number; sessionId?: number; newLimit?: number } = {};
       if (who.user) options.requestedBy = who.user.id;
       if (page) options.page = canonicalPage(page);
-      if (limit) options.limit = limit;
+      // "Collect 25 new sets": a session with that target. Indexed sets don't count toward it.
+      let target = typeof body.target === "number" && Number.isInteger(body.target) && body.target > 0 ? Math.min(body.target, 1000) : undefined;
+      if (target !== undefined && !who.trusted) target = Math.min(target, 100);
+      if (target !== undefined) {
+        const label = typeof body.label === "string" && body.label.trim() ? body.label.trim().slice(0, 120) : page ? pageLabel(page) : "Pasted links";
+        options.sessionId = await app.queue.sessions.open({ userId: who.user?.id ?? null, label, sourcePage: page ? canonicalPage(page) : null, target, pagesScanned: urls.length });
+        options.newLimit = target;
+      } else if (limit) options.limit = limit;
       const result = await app.queue.enqueue(urls, ALL_TIME, options);
+      if (options.sessionId) {
+        await app.queue.sessions.addCached(options.sessionId, result.alreadyCached);
+        await app.queue.sessions.settleIfEmpty(options.sessionId);
+      }
       const discovery = page ? await recordDiscovery(app.pool, page, { found: urls.length, ...result, complete: body.complete === true }) : undefined;
       console.log(`Captured ${urls.length} sets from ${page ? canonicalPage(page) : "a page"}${who.user ? ` for ${who.user.displayName}` : ""}: ${result.queued} new, ${result.alreadyCached} already in setscope.`);
-      return sendJson(res, 200, { found: urls.length, ...result, discovery });
+      return sendJson(res, 200, { found: urls.length, ...result, discovery, session: options.sessionId ? await app.queue.sessions.get(options.sessionId) : undefined });
     }
     case "POST /api/capture-set": {
       // A set page someone opened themselves: no limit from this computer; from a shared
@@ -865,11 +934,15 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       requireOwnHeader(req);
       await needOwner("clear everyone's queue");
       return sendJson(res, 200, await app.queue.clearQueue());
-    case "POST /api/resume":
+    case "POST /api/resume": {
       requireOwnHeader(req);
       needUser("control the queue");
-      await app.queue.resume();
+      const r = await app.queue.resume();
+      if (!r.resumed) {
+        throw new NotAllowed(`1001Tracklists asked us to wait until ${new Date(r.waitUntil!).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}. Collecting will be possible again then.`, 409);
+      }
       return sendJson(res, 200, await app.queue.status());
+    }
     default:
       return sendJson(res, 404, { error: `No route for ${route}` });
   }
@@ -1018,6 +1091,71 @@ async function captureUser(app: App, req: IncomingMessage, cookieUser: User | un
   if (!user) throw new NotAllowed("Sign in on setscope (and reload the page) before gathering sets, so they're added under your account.", 401);
   limitCaptures(app, req, user);
   return { user, trusted: await app.accounts.isOwner(user.id) };
+}
+
+/**
+ * The best "this song" upload on SoundCloud for a song nobody has linked: searched once,
+ * remembered as an automatic match (or as "no match" for a day).
+ */
+async function matchOnSoundCloud(app: App, req: IncomingMessage, user: User | undefined, trackId: number, song: string): Promise<{ url: string; externalId: string; confidence: number; preview: boolean } | undefined> {
+  const missUntil = app.noMatch.get(trackId);
+  if (missUntil && missUntil > Date.now()) return undefined;
+  if (!app.soundcloudLimit.take(user ? `user:${user.id}` : `addr:${req.socket.remoteAddress ?? "?"}`)) {
+    throw new NotAllowed("That's a lot of SoundCloud searches in a short time. Wait a few minutes and try again.", 429);
+  }
+  const track = trackFromName(song);
+  const page = await app.soundcloud.searchTracks({ q: searchWords(`${track.artist} ${track.title}`), limit: 30 });
+  const usable = songCandidates(track, page.items).filter((c) => c.kind === "this" && c.confidence >= 0.75 && c.track.embeddable && c.track.access !== "blocked");
+  const best = usable.find((c) => c.track.access === "playable") ?? usable[0];
+  if (!best) {
+    app.noMatch.set(trackId, Date.now() + 24 * 60 * 60_000);
+    return undefined;
+  }
+  await app.links.saveAutoMatch(trackId, { url: best.track.permalink, externalId: best.track.urn, confidence: best.confidence });
+  return { url: best.track.permalink, externalId: best.track.urn, confidence: best.confidence, preview: best.track.access === "preview" };
+}
+
+/**
+ * Key and BPM from the song's SoundCloud upload (its link, or the automatic match play uses).
+ * Kept in memory for 6 hours, never in the database (SoundCloud's terms allow references,
+ * not copies of their data). undefined when SoundCloud has nothing for it.
+ */
+async function keyAndBpmFromSoundCloud(app: App, req: IncomingMessage, user: User | undefined, song: string): Promise<SongInfoResult | undefined> {
+  if (!app.soundcloud.configured()) return undefined;
+  let trackId: number;
+  try {
+    trackId = await findTrackId(app.pool, song);
+  } catch {
+    return undefined;
+  }
+  const cached = app.keyBpm.get(trackId);
+  if (cached && cached.expires > Date.now()) return cached.result;
+  try {
+    const link = (await app.links.playable(trackId)) ?? (await matchOnSoundCloud(app, req, user, trackId, song));
+    if (!link) return undefined;
+    const upload = link.externalId ? await app.soundcloud.track(link.externalId) : ((await app.soundcloud.resolve(link.url)) as { kind: "track"; track: ScTrack }).track;
+    const key = musicalKey(upload?.keySignature);
+    if (!upload || (!upload.bpm && !key)) return undefined;
+    const info: SongInfo = { found: true, source: "soundcloud", url: upload.permalink || link.url, fetchedAt: new Date().toISOString() };
+    if (upload.bpm) info.bpm = upload.bpm;
+    if (key) {
+      info.key = key.key;
+      info.openKey = key.camelot;
+    }
+    const result: SongInfoResult = { status: "ok", info };
+    app.keyBpm.set(trackId, { result, expires: Date.now() + 6 * 60 * 60_000 });
+    return result;
+  } catch (error) {
+    // Rate limits or a removed upload: fall back to GetSongBPM rather than failing the page.
+    if (error instanceof ScError || error instanceof ScRateLimited || error instanceof NotAllowed) return undefined;
+    throw error;
+  }
+}
+
+/** "https://www.1001tracklists.com/dj/fisher/index.html" -> "fisher": a name when the page didn't say. */
+function pageLabel(page: string): string {
+  const slug = page.match(/\/(?:dj|artist|track|source)\/([^/]+)/)?.[1] ?? "a 1001Tracklists page";
+  return decodeURIComponent(slug).replace(/[-_]+/g, " ");
 }
 
 /** "Artist - Title" from ?song=. */

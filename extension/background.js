@@ -36,7 +36,14 @@ async function sendToServer(server, message, token) {
   const [path, payload] =
     message.type === "captureSet"
       ? ["/api/capture-set", { pageUrl: message.pageUrl, html: message.html, ...(token ? { token } : {}) }]
-      : ["/api/capture", { pageUrl: message.pageUrl, urls: message.urls, complete: message.complete === true, ...(message.limit ? { limit: message.limit } : {}), ...(token ? { token } : {}) }];
+      : message.type === "known"
+        ? ["/api/collect/known", { urls: message.urls, ...(token ? { token } : {}) }]
+        : ["/api/capture", {
+            pageUrl: message.pageUrl, urls: message.urls, complete: message.complete === true,
+            ...(message.limit ? { limit: message.limit } : {}),
+            ...(message.target ? { target: message.target, label: message.label } : {}),
+            ...(token ? { token } : {}),
+          }];
   const response = await fetch(`${server}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Setscope": "1" },
@@ -53,7 +60,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "arm") {
     // limit: "gather the newest N sets" from setscope's DJ page (null: all of them).
-    const search = { query: message.query, kind: message.kind, limit: message.limit ?? null, token: message.token ?? null };
+    const search = { query: message.query, kind: message.kind, limit: message.limit ?? null, target: message.target ?? null, token: message.token ?? null };
     // Send captures back to the same address the setscope page is open on.
     const server = new URL(sender.url ?? DEFAULT_SERVER).origin;
     chrome.storage.session.set({ armedAt: Date.now(), appTabId: tab.id, search, server }).then(() => sendResponse({ ok: true }));
@@ -64,6 +71,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     Promise.all([isCaptureTab(tab), getState()]).then(([capture, state]) =>
       sendResponse({ capture, search: capture ? state.search : null }),
     );
+    return true;
+  }
+
+  // While scrolling a DJ page: which of these sets are already in Rabbithole?
+  if (message.type === "known") {
+    getState()
+      .then(async (state) => {
+        if (!state.captureTabs.includes(tab.id)) throw new Error("Not a Rabbithole tab");
+        sendResponse({ ok: true, result: await sendToServer(state.server, message, state.search?.token ?? null) });
+      })
+      .catch((error) => sendResponse({ ok: false, error: String(error.message ?? error) }));
     return true;
   }
 

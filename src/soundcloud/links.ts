@@ -92,9 +92,9 @@ export class LinkStore {
   }
 
   /** The link to play for a track: a confirmed one first, then an automatic match. */
-  async playable(trackId: number): Promise<{ url: string; auto: boolean; confidence: number } | undefined> {
-    const r = await this.pool.query<{ url: string; auto: boolean; confidence: number }>(
-      `select url, (added_by is null and provenance = 'search_match') auto, confidence from external_track_links
+  async playable(trackId: number): Promise<{ url: string; auto: boolean; confidence: number; externalId: string | null } | undefined> {
+    const r = await this.pool.query<{ url: string; auto: boolean; confidence: number; externalId: string | null }>(
+      `select url, (added_by is null and provenance = 'search_match') auto, confidence, external_id "externalId" from external_track_links
         where track_id = $1 and provider = 'soundcloud'
         order by (added_by is null and provenance = 'search_match'), confidence desc, created_at limit 1`,
       [trackId],

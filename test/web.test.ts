@@ -282,6 +282,39 @@ describe.skipIf(!available)("server", () => {
     expect((await postAs(owner, "/api/clear-queue", {})).status).toBe(200);
   });
 
+  it("collects a target of new sets in the background, shown in status and controlled by its owner", async () => {
+    const owner = await signUp();
+    const friend = await signUp("friend@example.com", "invite");
+    const { token } = await (await postAs(owner, "/api/capture-token", {})).json();
+    const page = "https://www.1001tracklists.com/dj/dj-alpha/index.html";
+    // Preferences: Auto-Collect starts off, and saves.
+    expect(await (await getAs(owner, "/api/collect/prefs")).json()).toEqual({ autoCollect: false, checkpointEvery: 5, defaultTarget: 25 });
+    expect(await (await postAs(owner, "/api/collect/prefs", { autoCollect: true })).json()).toMatchObject({ autoCollect: true });
+    expect((await postAs(owner, "/api/collect/prefs", { checkpointEvery: 7 })).status).toBe(400);
+    // The extension asks which links are already here, then starts "collect 3 new sets".
+    await capture([url("c1")]);
+    await queue.settled();
+    const links = [url("c1"), url("n1", "2026-09-20"), url("n2", "2026-09-19"), url("n3", "2026-09-18"), url("n4", "2026-09-17")];
+    expect(await (await postJson("/api/collect/known", { urls: links })).json()).toEqual({ known: ["c1"] });
+    const res = await postJson("/api/capture", { pageUrl: page, urls: links, target: 3, label: "DJ Alpha", token });
+    const body = await res.json();
+    expect(body).toMatchObject({ queued: 3, alreadyCached: 1, session: { label: "DJ Alpha", target: 3, cached: 1, state: "running" } });
+    // Nobody has to keep a page open: the server collects them.
+    await queue.settled();
+    const status = await (await getAs(owner, "/api/status")).json();
+    expect(status.collector.sessions[0]).toMatchObject({ id: body.session.id, state: "completed", collected: 3, target: 3 });
+    expect(status.collector.prefs).toMatchObject({ autoCollect: true });
+    // Someone else's session isn't theirs to stop; and it isn't in their status.
+    expect((await postAs(friend, "/api/collect/stop", { session: body.session.id })).status).toBe(403);
+    expect((await (await getAs(friend, "/api/status")).json()).collector.sessions).toEqual([]);
+    expect((await postAs(owner, "/api/collect/resume", { session: 999 })).status).toBe(404);
+    // Through a shared link, a friend's target is capped at 100.
+    const friendKey = (await (await postAs(friend, "/api/capture-token", {})).json()).token;
+    const many = Array.from({ length: 150 }, (_, i) => url(`f${i}`, `2025-01-${String((i % 28) + 1).padStart(2, "0")}`));
+    const remote = await postJson("/api/capture", { pageUrl: "https://www.1001tracklists.com/dj/x/index.html", urls: many, target: 500, token: friendKey }, { "X-Setscope": "1", "X-Forwarded-For": "203.0.113.9" });
+    expect((await remote.json()).session).toMatchObject({ target: 100 });
+  });
+
   it("serves trending and clears the queue", async () => {
     const report = await (await fetch(`${base}/api/trending?days=14`)).json();
     expect(report).toMatchObject({ enoughData: false, songs: [], artists: [] });

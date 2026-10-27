@@ -63,15 +63,30 @@ const MAX_SETS_PER_PAGE = 10_000;
  * the bottom. Scroll the way you would, pausing between loads, until nothing new
  * appears (or the cap). Only on a page you opened from setscope.
  */
-async function loadAllSets(limit) {
+/** How many of these links aren't in Rabbithole yet (asks the app; on failure, assumes all are new). */
+async function countNew(urls) {
+  const reply = await chrome.runtime.sendMessage({ type: "known", urls });
+  if (!reply?.ok) return urls.length;
+  const known = new Set(reply.result.known);
+  return urls.filter((u) => !known.has(u.match(/\/tracklist\/([a-z0-9]+)\//i)?.[1])).length;
+}
+
+async function loadAllSets(limit, target) {
   // With a limit ("their last 20 sets") the newest sets are at the top, so stop scrolling
   // once there are that many (plus a few, in case the page mixes in other links).
+  // With a target ("25 new sets") keep going past sets Rabbithole already has, to older
+  // ones, until that many new ones are on screen (or the page ends).
   const enough = limit ? Math.min(MAX_SETS_PER_PAGE, limit + 5) : MAX_SETS_PER_PAGE;
   let urls = await waitForLinks();
   let complete = false;
   let stalls = 0;
-  while (urls.length < enough && stalls < 2) {
-    banner(limit ? `Rabbithole: gathering their last ${limit} sets… ${Math.min(urls.length, limit)} so far` : `Rabbithole: loading more sets… ${urls.length} so far`);
+  let fresh = target ? await countNew(urls) : 0;
+  while (urls.length < enough && stalls < 2 && !(target && fresh >= target)) {
+    banner(
+      target ? `Rabbithole: finding ${target} new sets… ${Math.min(fresh, target)} so far (${urls.length - fresh} already in Rabbithole)`
+      : limit ? `Rabbithole: gathering their last ${limit} sets… ${Math.min(urls.length, limit)} so far`
+      : `Rabbithole: loading more sets… ${urls.length} so far`,
+    );
     window.scrollTo(0, document.documentElement.scrollHeight);
     let grew = false;
     for (let i = 0; i < 8 && !grew; i++) {
@@ -85,6 +100,7 @@ async function loadAllSets(limit) {
       stalls++;
     }
     urls = tracklistLinks();
+    if (target && grew) fresh = await countNew(urls);
   }
   // Stopped because nothing new appeared (the page's end), not because of the cap.
   complete = stalls >= 2;
@@ -133,17 +149,20 @@ async function main() {
     return;
   }
 
-  banner(search?.limit ? `Rabbithole: gathering the last ${search.limit} sets…` : "Rabbithole: collecting sets…");
-  const { urls, complete } = await loadAllSets(search?.limit ?? null);
+  banner(search?.target ? `Rabbithole: finding ${search.target} new sets…` : search?.limit ? `Rabbithole: gathering the last ${search.limit} sets…` : "Rabbithole: collecting sets…");
+  const { urls, complete } = await loadAllSets(search?.limit ?? null, search?.target ?? null);
   if (urls.length === 0) {
     banner("Rabbithole: no sets on this page");
     return;
   }
-  const reply = await chrome.runtime.sendMessage({ type: "capture", pageUrl: location.href, urls, complete, limit: search?.limit ?? null });
+  const reply = await chrome.runtime.sendMessage({ type: "capture", pageUrl: location.href, urls, complete, limit: search?.limit ?? null, target: search?.target ?? null, label: search?.query ?? null });
   if (reply?.ok) {
     const { queued, alreadyCached, skippedOld } = reply.result;
     const older = skippedOld ? ` · ${skippedOld} older than your window` : "";
-    if (search?.limit) {
+    if (search?.target) {
+      const more = queued < search.target ? ` (only ${queued} new on this page)` : "";
+      banner(`Rabbithole: collecting ${queued} new sets${more} · ${alreadyCached} already in Rabbithole. Follow it in Rabbithole's header. Closing…`);
+    } else if (search?.limit) {
       const taken = Math.min(urls.length, search.limit);
       banner(`Rabbithole: the last ${taken} sets · ${queued} new · ${alreadyCached} already in Rabbithole${older}. Closing…`);
     } else {

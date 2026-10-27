@@ -20,8 +20,10 @@ export interface SongInfo {
   key?: string;
   /** Open Key / Camelot-style notation, e.g. "4m" */
   openKey?: string;
-  /** The song's page on GetSongBPM, for the credit link. */
+  /** The song's page on the source (GetSongBPM, or its SoundCloud upload), for the credit link. */
   url?: string;
+  /** Where it came from; GetSongBPM when unset. */
+  source?: "soundcloud" | "getsongbpm";
   fetchedAt: string;
 }
 

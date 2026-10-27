@@ -149,9 +149,14 @@ export function canonicalUrl(html: string): string | undefined {
   return url ? absolute(url) : undefined;
 }
 
+/** True if a page is a tracklist page at all (it may list no tracks yet). */
+export function isTracklistShell(html: string): boolean {
+  return isTracklistPage(html) || /\/tracklist\/[a-z0-9]+\//i.test(canonicalUrl(html) ?? "");
+}
+
 /** True if a saved page is the bot check rather than the page you meant to save. */
 export function isChallengePage(html: string): boolean {
-  return /validate your are real human|validate you are (a )?real human|you will be forwarded/i.test(html);
+  return /validate your are real human|validate you are (a )?real human|you will be forwarded|cf-chl|challenge-platform|just a moment\.\.\.|attention required|are you a robot/i.test(html);
 }
 
 function absolute(urlOrPath: string): string {

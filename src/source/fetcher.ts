@@ -6,10 +6,13 @@
 // - Only /tracklist/ pages, plus the front page for the background collector. Track and DJ
 //   pages sit behind a human check, and we leave those alone.
 // - One request at a time, even when the queue and the background collector both want one.
-// - Any sign of a bot check stops the whole run. No retries, no workarounds.
+// - Any sign of a bot check or refusal stops the whole run, says which kind it was, and
+//   keeps the site's Retry-After. No retries, no workarounds.
+// - A page that isn't a tracklist and isn't a bot check either (the layout changed, or
+//   the tracklist is empty) is reported as such, not mistaken for a block.
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { isTracklistPage } from "./parse.ts";
+import { isChallengePage, isTracklistPage, isTracklistShell } from "./parse.ts";
 
 export const USER_AGENT = "setscope/0.1 (personal non-commercial project; respects robots.txt)";
 export const MIN_DELAY_MS = 8_000;
@@ -17,18 +20,66 @@ export const FRONT_PAGE = "https://www.1001tracklists.com/";
 
 /** Anything that can hand us the HTML for a URL. Tests pass a fake one. */
 export interface HtmlSource {
-  fetchHtml(url: string): Promise<string>;
+  /** `signal` lets a Stop cancel a request that's waiting its turn or in flight. */
+  fetchHtml(url: string, signal?: AbortSignal): Promise<string>;
 }
+
+/** How the site said no: each is a reason to stop asking, explained differently. */
+export type BlockKind = "rate_limit" | "auth" | "forbidden" | "challenge" | "unavailable";
 
 /** The site asked us to prove we're human, or refused us. Stop, don't retry. */
 export class BlockedError extends Error {
   readonly status: number;
+  readonly kind: BlockKind;
+  /** From the site's Retry-After header, when it sent one. */
+  readonly retryAfterSeconds: number | undefined;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, kind?: BlockKind, retryAfterSeconds?: number) {
     super(message);
     this.name = "BlockedError";
     this.status = status;
+    this.kind = kind ?? blockKind(status);
+    this.retryAfterSeconds = retryAfterSeconds;
   }
+}
+
+/** A tracklist page with no tracks listed yet: a real answer, not an error. */
+export class EmptyTracklistError extends Error {
+  constructor(url: string) {
+    super(`${url} has no tracks listed yet.`);
+    this.name = "EmptyTracklistError";
+  }
+}
+
+/** A page that isn't a tracklist or a bot check: probably a site layout change. */
+export class LayoutError extends Error {
+  constructor(url: string) {
+    super(`${url} didn't look like a tracklist page (the site's layout may have changed).`);
+    this.name = "LayoutError";
+  }
+}
+
+/** The person stopped collecting while this request waited or ran. */
+export class CancelledError extends Error {
+  constructor() {
+    super("Stopped.");
+    this.name = "CancelledError";
+  }
+}
+
+export function blockKind(status: number): BlockKind {
+  if (status === 429) return "rate_limit";
+  if (status === 401) return "auth";
+  if (status === 503) return "unavailable";
+  return status === 403 ? "forbidden" : "challenge";
+}
+
+/** Retry-After as seconds: a number of seconds, or an HTTP date. */
+export function retryAfterSeconds(header: string | null, now = Date.now()): number | undefined {
+  if (!header) return undefined;
+  if (/^\d+$/.test(header.trim())) return Number(header.trim());
+  const at = Date.parse(header);
+  return Number.isNaN(at) ? undefined : Math.max(0, Math.round((at - now) / 1000));
 }
 
 export interface FetcherOptions {
@@ -64,12 +115,18 @@ export class PoliteFetcher implements HtmlSource {
     }
   }
 
-  /** A set page. Anything that isn't a tracklist is treated as a bot check. */
-  fetchHtml(url: string): Promise<string> {
+  /** A set page: its tracklist, or a clear reason why not (blocked, empty, unrecognized). */
+  fetchHtml(url: string, signal?: AbortSignal): Promise<string> {
     if (!isFetchAllowed(url)) {
       return Promise.reject(new Error(`Refusing to fetch ${url}: only 1001Tracklists /tracklist/ pages are fetched automatically.`));
     }
-    return this.lineUp(() => this.request(url, isTracklistPage, "a page without a tracklist"));
+    return this.lineUp(async () => {
+      const body = await this.request(url, () => true, "", signal);
+      if (isTracklistPage(body)) return body;
+      if (isChallengePage(body)) throw new BlockedError(`${url} returned a verification page instead of the tracklist.`, 200, "challenge");
+      if (isTracklistShell(body)) throw new EmptyTracklistError(url);
+      throw new LayoutError(url);
+    }, signal);
   }
 
   /** The 1001Tracklists front page, for finding new sets. It should link to some sets. */
@@ -77,15 +134,19 @@ export class PoliteFetcher implements HtmlSource {
     return this.lineUp(() => this.request(FRONT_PAGE, (body) => body.includes("/tracklist/"), "a front page with no sets"));
   }
 
-  private lineUp<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(task);
+  private lineUp<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const run = this.chain.then(() => {
+      if (signal?.aborted) throw new CancelledError();
+      return task();
+    });
     this.chain = run.catch(() => {});
     return run;
   }
 
-  private async request(url: string, looksRight: (body: string) => boolean, wrongPage: string): Promise<string> {
+  private async request(url: string, looksRight: (body: string) => boolean, wrongPage: string, signal?: AbortSignal): Promise<string> {
     const wait = this.lastRequestAt + this.delayMs - this.now();
-    if (wait > 0) await this.sleep(wait);
+    if (wait > 0) await abortable(this.sleep(wait), signal);
+    if (signal?.aborted) throw new CancelledError();
 
     // Record before connecting: a timeout or TLS failure still counts as a request
     // and must not let the next one go out sooner than the delay allows.
@@ -96,8 +157,10 @@ export class PoliteFetcher implements HtmlSource {
       response = await this.fetchFn(url, {
         headers: { "User-Agent": USER_AGENT, Accept: "text/html" },
         redirect: "follow",
+        ...(signal ? { signal } : {}),
       });
     } catch (error) {
+      if (signal?.aborted) throw new CancelledError();
       throw new Error(`Network failure while fetching ${url}: ${error instanceof Error ? error.message : String(error)}`);
     }
     const retryAfter = response.headers.get("retry-after");
@@ -105,7 +168,7 @@ export class PoliteFetcher implements HtmlSource {
 
     if (BLOCK_STATUSES.has(response.status)) {
       const hint = retryAfter ? ` Retry-After: ${retryAfter}.` : "";
-      throw new BlockedError(`HTTP ${response.status} from ${url}: the site is refusing automated requests right now.${hint}`, response.status);
+      throw new BlockedError(`HTTP ${response.status} from ${url}: the site is refusing automated requests right now.${hint}`, response.status, undefined, retryAfterSeconds(retryAfter, this.now()));
     }
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} from ${url}`);
@@ -120,4 +183,24 @@ export class PoliteFetcher implements HtmlSource {
 
 export function isFetchAllowed(url: string): boolean {
   return /^https:\/\/www\.1001tracklists\.com\/tracklist\/[a-z0-9]+\//i.test(url);
+}
+
+/** Wait for `promise`, but give up (with CancelledError) as soon as `signal` aborts. */
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new CancelledError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new CancelledError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }

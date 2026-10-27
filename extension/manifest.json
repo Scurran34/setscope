@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Rabbithole capture",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Sends the set links from a 1001Tracklists page you opened from Rabbithole to the Rabbithole app you opened it from (on this computer, or a shared link), then closes that tab.",
   "permissions": [
     "storage"

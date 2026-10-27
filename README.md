@@ -178,6 +178,48 @@ The player has three layers in `web/player.ts`: `PlayerCore` (state, no page cod
 `PlaybackProvider` per service (`SoundCloudProvider` today), and the bar. Adding another service means
 writing another provider.
 
+### Collecting sets: sessions, Auto-Collect, checkpoints, Stop
+
+**Start:** on a DJ (or song) page, **Collect [25 new sets ▾]** (10 / 25 / 50 / 100; default 25). "New" means sets
+Rabbithole doesn't have yet: indexed ones are skipped and don't count, and the extension keeps scrolling the DJ's
+1001Tracklists page (asking Rabbithole which sets it already has) until it has found that many new ones or the page
+ends. You open that one page and pass any check yourself; the extension never opens pages on its own.
+
+**Then the server collects** them on its own, one tracklist every 8 seconds, as a **session**: you can browse
+anywhere in Rabbithole (or close it) and it carries on. Gathering the same DJ while their session is open asks it
+for more instead of starting a second one, and a set already in line for someone else is never fetched twice.
+
+**The header pill** shows the session in a few words (*Collecting · 18/25*, *Checkpoint · 8s*, *Paused · 20/25*,
+*Verification Required*, *Stopping…*, *Stopped · 18 collected*, *Done · 25 new*). Click it for the panel: artist, status,
+progress, sets already here, next checkpoint, **Stop gathering**, **Continue** / **Resume**, **Collect more**,
+**View queue**, and your settings. The page checks every 3 s while something is collecting, every 10 s otherwise.
+
+- **Checkpoints** (every 5 or every 10 saved sets; default 5): the set in hand is saved, then the session pauses for
+  about 10 seconds. It goes on only if **Auto-Collect** is on and nothing stopped or blocked it; otherwise it waits for
+  **Continue**. Checkpoints are for your control, not a way around the site's limits: those are separate and win.
+- **Auto-Collect** (off for new accounts, saved with your account): on, sessions carry on through checkpoints by
+  themselves. Off, they pause after the set in hand (not a failure; Continue picks up). Switching it back on continues
+  paused sessions, but never stopped ones.
+- **Stop gathering** ends the session: nothing more starts, a fetch in flight is cancelled (its set goes back in line,
+  not marked failed), everything saved stays, and the panel shows how many were collected. A stopped session only
+  starts again when someone presses **Resume**: not after a refresh, a restart, or Auto-Collect switching on.
+- **Counting:** a set counts once it's saved. An empty tracklist ("no tracks yet") or an unrecognized page doesn't
+  count and doesn't pause anything; a set already indexed counts as "already here".
+- Sessions, their jobs and your preferences live in Postgres (`collection_sessions`, `collection_jobs.session_id`,
+  `collect_prefs`, migration 006), so they survive restarts; a Stop that was mid-fetch when the server stopped is
+  finished on startup.
+
+**When 1001Tracklists says no**, the fetcher says how: rate limit (429), login required (401), refused (403),
+unavailable (503), or a verification page. Any of them pauses *all* collecting, marks sessions "Verification Required",
+and keeps the site's **Retry-After**: **Try again** won't send a request before that time. The pill and panel show the
+warning with **Open 1001Tracklists** (for you to look, or pass a check in your browser) and Stop. Passing a check in
+your browser doesn't unblock the server's own requests, and Rabbithole never solves checks, rotates addresses or
+disguises itself; it only resumes when a real request is allowed again.
+
+**Not automated, on purpose:** opening set pages in browser tabs to read them. The server fetches tracklists with
+its own honest, rate-limited requests; when the site refuses those, a browser loop doing the same work would be
+routing around that refusal.
+
 ### How collecting works
 
 Every set to fetch is a job in the database (`collection_jobs`), shared by everyone and kept across

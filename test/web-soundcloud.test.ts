@@ -34,7 +34,7 @@ const upload = (id: number, title: string, uploader: string, genre = "House") =>
 });
 
 const UPLOADS = [
-  upload(1, "Nova - Pulse", "Label"),
+  { ...upload(1, "Nova - Pulse", "Label"), bpm: 127.9, key_signature: "Gb:min" },
   upload(2, "Nova - Pulse (Reed Remix)", "Reed", "Techno"),
   upload(3, "Pulse (Mara Edit)", "Mara", ""),
   upload(4, "Something Else", "Nobody"),
@@ -55,6 +55,10 @@ function fakeSoundCloud() {
       return found ? json(found) : json({}, 404);
     }
     if (url.pathname.endsWith("/likes/tracks")) return json({ collection: [UPLOADS[1]], next_href: null });
+    if (url.pathname.startsWith("/tracks/")) {
+      const found = UPLOADS.find((u) => u.urn === decodeURIComponent(url.pathname.slice("/tracks/".length)));
+      return found ? json(found) : json({}, 404);
+    }
     return json({}, 404);
   }) as typeof fetch;
   return { fetchFn, requests };
@@ -172,6 +176,19 @@ describe.skipIf(!available)("SoundCloud endpoints", () => {
     expect((await get(undefined, `/api/play?song=${other}`)).status).toBe(404);
     expect(sc.requests.length).toBe(before);
     expect((await get(undefined, "/api/play?song=Nobody%20-%20Nothing")).status).toBe(400);
+  });
+
+  it("gets key and BPM from the song's SoundCloud upload", async () => {
+    const owner = await signUp("owner@example.com");
+    expect(await (await get(undefined, `/api/song-info?song=${song}`)).json()).toEqual({ status: "no-key" }); // not connected, no GetSongBPM key
+    await connect(owner);
+    expect(await (await get(undefined, `/api/song-info?song=${song}`)).json()).toEqual({
+      status: "ok",
+      info: { found: true, source: "soundcloud", url: "https://soundcloud.com/test/track-1", bpm: 128, key: "F#m", openKey: "11A", fetchedAt: expect.any(String) },
+    });
+    // A song whose upload lists neither: said plainly, no request for a GetSongBPM key.
+    const other = encodeURIComponent("Roland Clark & Amy Alexander - Feel It");
+    expect(await (await get(undefined, `/api/song-info?song=${other}`)).json()).toMatchObject({ status: "not-found", info: { source: "soundcloud" } });
   });
 
   it("lets only whoever added a link, or the owner, remove it", async () => {

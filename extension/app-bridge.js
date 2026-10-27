@@ -10,8 +10,10 @@ window.addEventListener("message", (event) => {
   if (event.source !== window || event.data?.source !== "setscope-app") return;
   if (event.data.type === "arm") {
     const limit = Number.isInteger(event.data.limit) && event.data.limit > 0 ? event.data.limit : null;
+    // target: "collect 25 new sets" (sets already in Rabbithole don't count).
+    const target = Number.isInteger(event.data.target) && event.data.target > 0 ? event.data.target : null;
     // The page's capture key: says whose gather this is when setscope runs on someone else's computer.
     const token = typeof event.data.token === "string" ? event.data.token : null;
-    chrome.runtime.sendMessage({ type: "arm", query: String(event.data.query ?? ""), kind: String(event.data.kind ?? ""), limit, token });
+    chrome.runtime.sendMessage({ type: "arm", query: String(event.data.query ?? ""), kind: String(event.data.kind ?? ""), limit, target, token });
   }
 });
