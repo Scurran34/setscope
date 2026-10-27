@@ -7,69 +7,22 @@ Work in progress: a project I'm building for fun, not a finished product.
 > **Before any public launch:** the shared catalog republishes 1001Tracklists' tracklist data. Ask
 > 1001Tracklists for permission first. Until then setscope is meant for you and people you invite.
 
-**Song mode.** Give it a song, and it looks at recent sets containing that song:
-- the DJs who play it most
-- unreleased **ID** tracks that keep showing up in those same sets
-- the songs most often played alongside it
+**Streams can be bought. Genuine DJ support is harder to manufacture.** setscope shows which tracks
+DJs actually play in their sets, made by *other* artists, so you can find what the DJs you trust are
+supporting instead of relying only on streaming popularity. The evidence is plain: track appearances
+across indexed DJ sets, by the date each set was performed. It doesn't claim to know whether support is
+organic, paid or independent; it shows what was played and how often.
 
-**Artist mode.** Give it an artist, and it reports:
-- whether other DJs are playing them more or less: recent window vs. earlier window, plus a month-by-month view
-- their most-played tracks recently (collabs and remixes count)
-- the artists whose tracks *they* play most in their own sets
+- **Discover** (the landing page): **Playing Now**, **Most Played** and **Deep Cuts**, plus the set moments
+  **Intros** (what DJs open with) and **90 + 5** (the closers they finish on), for all DJs, the DJs you follow,
+  or DJs you pick, filtered by genre and time.
+- **DJs**: search DJs, follow them, and open a DJ's page to see what they play (other artists' tracks first),
+  their own productions, the IDs they've played, and their sets.
+- **Library**: liked tracks, playlists, and the **Unreleased Vault** (saved IDs that update themselves when a
+  tracklist names them).
 
-Sets older than the cutoff (default **18 months**) are ignored.
-
-## Setup
-
-Needs Node 22.18 or newer (Node runs the TypeScript directly, so there's no build step) and
-PostgreSQL 17.
-
-```bash
-brew install postgresql@17   # once
-npm install
-npm run db:init              # creates a database inside this project (.postgres/), port 54329, local only
-npm run db:migrate           # creates the tables (safe to run any time)
-npm run db:import            # copies an existing file cache (data/) in; repeatable, files are kept
-npm test                     # unit tests; database tests run against setscope_test
-npm run web                  # http://127.0.0.1:7331
-```
-
-After a restart, run `npm run db:start` before `npm run web` (and `npm run db:stop` when you're done).
-`npm run db:psql` opens a SQL prompt. `DATABASE_URL` points everything at another database (for example
-a hosted Postgres) instead of the local one.
-
-**Accounts.** The first account created on the site is the owner, and gets any likes and categories
-from before accounts existed. After that, sign-up needs the invite code in `SETSCOPE_INVITE_CODE` (with
-no code set, sign-up is closed). Anyone who can reach the site can browse reports; liking, categories
-and queue controls need an account; site-wide settings (GetSongBPM key, background collecting) are the
-owner's. Passwords are hashed with scrypt; sessions are random tokens in an HttpOnly, SameSite=Lax cookie,
-and the database only stores their SHA-256. Set `SETSCOPE_SECURE_COOKIES=1` when serving over HTTPS.
-
-**Backups and rollback.** Back up with
-`/opt/homebrew/opt/postgresql@17/bin/pg_dump -h 127.0.0.1 -p 54329 -U setscope setscope > backup.sql`
-and restore into an empty database with `psql ... < backup.sql`. The file cache in `data/` is never
-deleted by the import, so rolling back to the file version is just checking out the previous commit.
-
-### Data model
-
-| Shared catalog (everyone sees the same rows) | Personal (one account's rows, never shown to others) |
-|---|---|
-| `artists`: name, 1001Tracklists page, country, picture, links | `users`, `sessions` |
-| `tracks`: one row per recording, see identity rules below | `user_likes` |
-| `track_artists`: main artists and remixers | `collections`, `collection_tracks`, `collection_links` (your categories, and SoundCloud uploads saved in them) |
-| `sets`, `set_djs`, `set_tracks` (ordered, exactly as the source wrote each line, with its genre tag) | `followed_artists`, `vault_entries` (used in later stages) |
-| `set_pages`: the page each set was read from, for re-parsing | |
-| `track_metadata_history`: what changed when a set was re-read | |
-| `external_track_links`: links to recordings elsewhere (SoundCloud), with confidence and provenance | |
-| `collection_jobs`, `discovery_progress`, `source_refresh_history` (used by the collection system) | |
-
-**Track identity.** A tracklist line is matched to a track by 1001Tracklists' own track id when the
-page gives one, otherwise by the normalized "artists - title" (case, accents, periods and apostrophes
-ignored; "(Extended Mix)", "(Radio Edit)" and the like count as the same recording). Remixes, edits, VIPs,
-bootlegs, mashups and reworks are separate tracks linked to their original. Unidentified "ID - ID" lines
-without a 1001Tracklists id are never merged by name: each is its own placeholder, so two different
-unreleased songs can't be counted as one. Re-reading a set records any line that changed (an ID that got
-identified, a corrected title) in `track_metadata_history`.
+Song pages, set pages, remixes, playback and the collector are all still there, reached from where they
+make sense rather than from the main menu.
 
 ## Web app
 
@@ -86,43 +39,93 @@ until it's installed):
 
 Then:
 
-The app has real pages, each with its own address, so links, Back and Forward work. The look follows
-the design wireframe: dark, with artist photos where 1001Tracklists has them. Where there's no photo
-(and there's never song cover art), a plain colored tile with initials stands in; nothing pretends to
-be a real cover. The top bar (Home · Explore · Songs · Artists · Sets · Library, the search box, and your
-account) is on every page. On a phone it becomes a tab bar at the bottom.
+The app has real pages, each with its own address (filters and page numbers included), so links,
+Back and Forward work. The top bar has **Discover · DJs · Library**, a search box (artists, songs and sets),
+**Queue** (collecting sets) and your account; on a phone it becomes a tab bar at the bottom. Artist photos
+come from 1001Tracklists; songs have no cover art, so a plain tile with initials stands in, never a fake cover.
 
-- **Home**: a search hero, then **Trending Songs** (This Week / This Month / Last 3 Months / Last 12
-  Months / All Time, plus a genre filter), **Trending Artists**, **Popular Artists to Explore**, **Recent DJ
-  Sets**, a SoundCloud discovery entry, **Your Music** (a few likes and your categories), and an
-  **Unreleased Vault · Coming soon** spot next to it.
-- **Songs** (`#/songs?period=&genre=&q=&page=`): most played songs, 25 per page with numbered pages,
-  filters that live in the address (so a filtered page can be bookmarked), sets, unique DJs, trend, and
-  ▶ when the song has a confirmed SoundCloud link. **Rising** (`#/trending`) is linked from here.
-- **Artists** (`#/artists`): the same filters, ranked by how many sets played their tracks.
-- **Sets** (`#/sets`): cards for every indexed set, newest performance first, filtered by text, DJ and
-  year. A **set page** (`#/set/<id>`) has the full tracklist in order, with IDs marked and every song and
-  artist linked, ▶ for the recording, and **Re-read this set**.
-- **Search results** (`#/find/<text>`): songs, artists and sets together, from the top-bar box (which
-  also suggests all three as you type).
-- **Artist pages** (`#/artist/<name>`): a photo header with country, genres, labels and their links, a
-  stats strip, **their songs** (click one to open its numbers in place), recent sets, trend, and who they
-  play.
-- **Song pages** (`#/artist/<name>/song/<song>`): a header with the artist's photo, genre, key & BPM, ▶ (once
-  a SoundCloud link is confirmed), ♡ Like and Gather more sets; a stats strip (sets, unique DJs, share
-  of indexed sets, last played); your categories; SoundCloud links and remixes; who plays it; IDs; what
-  it's played alongside; and every set that played it.
-- **Library**: liked songs, your categories, sets with the most of your liked songs, and songs you might
-  like. **Account**: collecting controls, settings and keys.
+- **Discover** (`#/?mode=now|most|deep&scope=all|followed|custom&djs=&genre=&period=&page=`): the three modes
+  as big tabs, then which DJs (**All DJs**, **DJs I follow**, or **Choose DJs** with a picker), the time period and
+  genre. 15 tracks per page. Each row shows the track (its title opens its page), its artists, a few of the
+  DJs who played it, the counts (qualifying sets and supporting DJs, always separately), and ♡ Like, ＋ Playlist
+  and ▶ Play buttons that don't navigate. Signed in and following DJs, Discover starts with them. When the
+  data is thin (fewer than 5 sets in the scope, or too small a catalog for Deep Cuts) the page says so above
+  the results. "How this is ranked" and a coverage line (how many sets, DJs and dates the numbers cover)
+  sit under every list.
+- **DJs** (`#/djs`): DJs you follow, then every DJ with indexed sets (search, 24 per page, Follow buttons).
+  Only people who *performed* indexed sets are listed, so singers whose vocals producers use (Rihanna) or
+  bands whose songs get remixed (The Temper Trap) never show up as DJs.
+- **A DJ's page** (`#/artist/<name>`): photo, other names they're listed under (with the evidence), Follow, and
+  then, in order:
+  1. **What they play**: other artists' tracks in their sets, with the same three modes, period and genre
+     filters, 15 per page (in the address, so paging keeps the filters).
+  2. **Their sets** (signed in): **Gather** *their last 10 / 20 / 30 / 40 sets* (the newest that many on their 1001Tracklists page;
+     ones already here are skipped, not swapped for older ones; the same menu is on every Gather button and
+     remembers your choice), how many of
+     their sets are still waiting to be read, and **Stop gathering**, which cancels this DJ's sets that haven't been
+     fetched yet (the one being read finishes).
+  3. **Own productions**: tracks they made, featured on or remixed, most supported by *other* DJs first. A mashup
+     that merely uses one of their songs isn't theirs and isn't listed.
+  4. **IDs they've played**: each unidentified line on its own (two "ID - ID" lines are never assumed to be the same
+     track), with **Save to Vault**.
+  5. **Recent sets**, linking to each set's full tracklist.
+  The older statistics view (trend chart, who they play) is at `#/artist/<name>/stats`.
+- **Library**: a recommended set, playlists (covers built from artist photos, **Play all**), liked tracks, and the
+  **Unreleased Vault**: every saved ID with where it was heard; identified ones come first, showing what the line
+  says now and when it changed.
+- Still reachable in context: song pages (`#/artist/<a>/song/<s>`: who plays it, **Played alongside it** with every
+  song that shared 2+ sets, 15 a page, ranked by *Goes with it* (of the sets that play the other song, how many also
+  play this one: shared ÷ (its sets + 3)) or *Most shared sets*, playlists, SoundCloud links and remixes), set pages (`#/set/<id>`), the song/artist/set charts (`#/songs`, `#/artists`, `#/sets`), search results
+  (`#/find/<text>`), and SoundCloud curator likes (`#/discover/<profile>`).
 
-**How charts count.** A song's number is how many *different* indexed sets played it, by the date each
-set was **performed** (a set played in July counts for July, even if setscope collected it in
-October; sets without a date only count toward All Time). Unidentified IDs never enter the song chart.
-**Trend** compares the song's *share* of sets with the window just before (so collecting more sets one
-week doesn't make everything look like it's rising), and only shows when both windows have at least 5
-sets and the song had at least 3 earlier plays; a song with none before and 3+ now is **NEW**. All of
-this reflects sets indexed by setscope, not every set in existence. The queries are in
-`src/catalog/browse.ts` and run in Postgres, one page at a time.
+### How the discovery rankings work
+
+All three use `src/catalog/discover.ts`, computed in Postgres for the selected DJs and period:
+
+- **A qualifying appearance** is one indexed set (performed in the period, by at least one selected DJ) that
+  played the track. A track played twice in one set counts once. It counts only if **none of that set's DJs is
+  credited on the recording** in any role (artist, featured artist, remixer, or mashup source), with verified
+  aliases applied. So Chris Lorenzo playing his own track, or a mashup built on it, never counts as a pick,
+  while another DJ playing it does. Unidentified IDs never enter these rankings.
+- **Playing Now**: the sum over qualifying appearances of `0.5 ^ (days since the set / 14)`: a set from today counts
+  1, from two weeks ago 0.5, from a month ago about 0.23. Ties: more sets, then more DJs. Default period: this month.
+- **Most Played**: the number of distinct qualifying sets. Ties: more supporting DJs, then most recently played.
+  Default period: last 3 months.
+- **Deep Cuts**: tracks played by **at least 2 of the selected DJs** (or in **2+ sets** when one DJ is selected) that
+  appear in **no more than 2%** of all indexed sets (at least 3), any DJ, any date. Ranked by supporting DJs, then by
+  the share of the track's indexed appearances that come from the selected DJs, then by how rare it is overall.
+  With fewer than 50 sets indexed in total the page warns that "rare" can't be judged yet. Default period: 12 months.
+- **Intros** and **90 + 5**: tracks in the first (or last) 2 lines of sets with at least 10 tracks listed. A track needs
+  2+ such sets (by **2+ DJs** when several are selected), and at least **20%** of its plays by these DJs must be at
+  that moment, so a hit that happens to open or end one set doesn't count. Ranked by DJs, then sets, then that share.
+  Default period: 12 months. Discover shows the top 5 of each under the main list.
+- **Supporting DJs** counts distinct selected DJs (aliases merged) who played it in a qualifying set; in a B2B set
+  each selected DJ on it counts. The names shown are the ones who played it most.
+- Original songs, remixes, edits and mashups are separate tracks (see Track identity), so a remix's support never
+  inflates the original's.
+
+### Who made a track (attribution)
+
+Credits come from how 1001Tracklists writes each line (`credits()` in `src/catalog/identity.ts`):
+
+| Line | Credited as |
+|---|---|
+| `A & B - Title` | A, B: **main** (the track's artists) |
+| `A ft. B - Title` | B: **featured** (1001Tracklists writes vocalists this way too) |
+| `A - Title (C Remix)`, `(C Edit)`, `(C VIP)`, `(C Bootleg)` | C: **remixer** (made this version) |
+| `A vs. B - X vs. Y (C Edit)` | A, B: **mashup component** (their songs are in it); C: remixer |
+| `A vs. B - Title` | a collaboration: A, B main (a mashup has "vs." in the title too) |
+
+`&`, `,`, `x`, `vs.`, `ft.`, ` / ` and `pres.` separate names, except names that have their own 1001Tracklists page
+(Cause & Affect, Lucas & Steve…), which stay whole. **Samples aren't marked in tracklists and vocalists only
+when written "ft.", so setscope never guesses those.** Performing DJs come from the set page, separately from
+track credits. Credits are re-derived for every stored track once whenever the rules change.
+
+**Aliases.** `artist_aliases` maps an alternate name to the canonical artist, with the evidence, and everything
+(rankings, the DJ list, a DJ's sets and profile, following, the third-party check, gathering) treats them as one.
+Only pairs with evidence go in. The first is **Lorenzo → Chris Lorenzo**: 1001Tracklists' own URLs for "Lorenzo @ …"
+sets use the slug `chris-lorenzo`, and Chris Lorenzo's profile links to Beatport and Traxsource pages named
+"Lorenzo". Names that merely look alike (Lorenzo De Blanck) are left apart.
 
 **Searching:** the top-bar box suggests artists, songs and sets as you type; Enter shows all
 results. For a song, a title alone or `Artist - Title` works. Matching ignores case, accents, periods and apostrophes, and tolerates typos. If a search
@@ -279,6 +282,40 @@ Their API docs were behind a bot check when this was written, so the address and
 Why not Beatport: Beatport's pages put scripts through a bot check (HTTP 403), and its API is for
 approved partners only.
 
+## Testing with friends
+
+For a test run from your Mac (it only works while your Mac is on and the tunnel runs):
+
+```bash
+brew install cloudflared                                   # once
+cd ~/Documents/setscope && SETSCOPE_INVITE_CODE=pick-a-code SETSCOPE_SECURE_COOKIES=1 npm run web
+cloudflared tunnel --url http://127.0.0.1:7331            # in a second tab: prints https://….trycloudflare.com
+caffeinate -dims                                            # in a third tab: keeps the Mac awake
+```
+
+Send friends the trycloudflare link and the invite code; they create accounts under **Sign in**. Everyone
+browses, follows, likes and plays through that link (you too, while testing).
+
+**Friends adding sets:**
+- **Paste links:** Queue → **Add sets by link** works for any signed-in account.
+- **Gather a DJ's sets:** they need the Chrome extension too. Zip the `extension/` folder, send it, and have them
+  load it unpacked (`chrome://extensions` → Developer mode → Load unpacked). It works on `*.trycloudflare.com`
+  links as well as your own Mac.
+- Through the link, every capture needs the sender's **capture key**: the page fetches one when you're signed
+  in (valid 12 hours) and hands it to the extension, so their sets are queued under their account. Without
+  one, the capture is refused. Captures straight from your Mac work as before, with no key and no cap.
+- A friend's gather queues at most **200** sets (the newest), and is rate-limited like other requests. The
+  queue still fetches one set every 8 seconds from your Mac's connection, so friends gathering a lot makes
+  1001Tracklists' slow-downs more likely.
+- **Clear queue** (everyone's sets) is yours alone; a friend's **Stop gathering** only cancels sets they queued.
+- Keep the link among friends: ask 1001Tracklists for permission before anything public.
+
+## Deploying
+
+setscope isn't deployed anywhere. When you want to, follow [docs/DEPLOY.md](docs/DEPLOY.md): one always-on
+Node process plus Postgres behind HTTPS (the collector and refresh schedule run inside that process, so
+serverless hosting won't work), with every environment variable, the service file, backups and logs.
+
 ## Command line
 
 Everything the web app does is also available from the terminal:
@@ -367,13 +404,15 @@ src/
     catalog.ts        the Catalog interface (has / save / all / count)
     pg-catalog.ts     Catalog on Postgres: saving sets, artists, tracks; history on refresh
     browse.ts         song/artist charts by performance date, set list and set pages, paged in SQL
+    discover.ts       Playing Now / Most Played / Deep Cuts, DJ list, profiles, own tracks, ID lines
     identity.ts       which tracklist lines are the same recording; versions; IDs
   db/                 database plumbing
     pool.ts           connection (DATABASE_URL)
     migrate.ts        applies db/migrations/*.sql once each, in order
     import-legacy.ts  copies the old file cache into the catalog
   auth/accounts.ts    sign-up (owner first, then invite-only), passwords, sessions
-  personal/user-data.ts   one account's likes and categories
+  personal/user-data.ts   one account's likes and playlists
+  personal/vault.ts       the Unreleased Vault (IDs saved by the set line they were heard on)
   soundcloud/
     client.ts         SoundCloud API: token reuse/refresh, search, resolve, likes, 429s
     match.ts          is an upload this song, another version, or just related?
@@ -433,7 +472,12 @@ module, without touching `analysis/`.
 
 - **B2B sets:** every DJ on a set gets credit for every track. (The page marks "X played:" sections,
   which a later version could parse.)
-- **Artist names containing "&"** (e.g. "Butch & Santos") get split into two artists.
+- **Artist names containing "&"** stay whole only when 1001Tracklists gives that name its own page; a duo
+  that has never had a page of its own in the indexed data still gets split.
+- **Samples and uncredited vocalists** aren't in tracklists, so they're never credited.
+- **Aliases** are added by hand with evidence (one so far). Other alternate names stay separate until verified.
+- **Deep Cuts depend on coverage**: "rare" means rare among the sets indexed here, so a small or lopsided
+  collection makes some popular tracks look rare. The page warns below 50 indexed sets.
 - **The extension hasn't been run in Chrome yet.** The server, page, queue and capture endpoint are
   tested, and the search-match logic was checked against a real results page, but the full
   popup → capture → auto-close loop needs a first real run.

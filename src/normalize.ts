@@ -48,9 +48,10 @@ export function songKey(track: Track): string {
   return `${normalizeName(track.artist)} - ${normalizeName(track.title)}`;
 }
 
-// " & ", ", ", " x ", " vs. ", " ft. " all separate collaborators.
-// Word separators need spaces on both sides so "Malcolm X" stays one artist.
-const ARTIST_SEPARATOR = /\s*[,&]\s*|\s+(?:x|vs\.?|ft\.)\s+/i;
+// " & ", ", ", " x ", " vs. ", " ft. ", " / " and " pres. " all separate collaborators
+// ("Chris Lake & Chris Lorenzo pres. Anti Up" is three names).
+// Word separators need spaces on both sides so "Malcolm X" and "AC/DC" stay one artist.
+const ARTIST_SEPARATOR = /\s*[,&]\s*|\s+(?:x|vs\.?|ft\.|pres\.?|\/)\s+/i;
 
 /** "A & B ft. C" -> ["A", "B", "C"]. */
 export function splitArtists(artist: string): string[] {

@@ -51,10 +51,28 @@ describe.skipIf(!available)("PgJobQueue", () => {
   const jobs = async () =>
     (await pool.query("select kind, target, status, attempts, last_error from collection_jobs order by id")).rows;
 
+  it("gathers only the newest N when asked, and stops a DJ's gathering on request", async () => {
+    const page = "https://www.1001tracklists.com/artist/dj-x/tracklists.html";
+    const urls = ["2026-01-01", "2026-05-01", "2026-09-01", "2026-03-01", "2026-07-01"].map((d, i) => url(`g${i}`, d));
+    // Not started, so the jobs stay waiting for this test.
+    const result = await queue.enqueue(urls, "0001-01-01", { page, limit: 2, start: false });
+    expect(result).toMatchObject({ queued: 2, overLimit: 3 }); // their last 2 sets
+    // "Last 3" when the newest is already here: 2 new, 1 skipped, nothing older swapped in.
+    await catalog.save({ id: "g2", url: url("g2", "2026-09-01"), title: "t", djs: [], date: "2026-09-01", tracks: [] }, "");
+    expect(await queue.enqueue(urls, "0001-01-01", { page, limit: 3, start: false })).toMatchObject({ queued: 1, alreadyCached: 1, overLimit: 2 });
+    await pool.query("delete from collection_jobs where target = $1", [url("g1", "2026-05-01")]);
+    expect((await jobs()).map((j) => j.target)).toEqual([url("g2", "2026-09-01"), url("g4", "2026-07-01")]);
+    expect(await queue.waitingFrom([page])).toBe(2);
+    expect(await queue.waitingFrom(["https://www.1001tracklists.com/artist/other/tracklists.html"])).toBe(0);
+    expect(await queue.stopGathering([page], 999)).toBe(0); // someone else's gather isn't theirs to stop
+    expect(await queue.stopGathering([page])).toBe(2);
+    expect(await jobs()).toEqual([]);
+  });
+
   it("fetches each new set once, newest first, and skips sets already in the catalog", async () => {
     await catalog.save({ id: "have1", url: url("have1"), title: "t", djs: [], date: "2026-09-01", tracks: [] }, "");
     const result = await queue.enqueue([url("old1", "2026-01-01"), url("new1", "2026-09-20"), url("new1", "2026-09-20"), url("have1")], "2025-01-01");
-    expect(result).toEqual({ queued: 2, fetchingNow: 2, alreadyCached: 1, skippedOld: 0 });
+    expect(result).toEqual({ queued: 2, fetchingNow: 2, alreadyCached: 1, skippedOld: 0, overLimit: 0 });
     await queue.settled();
     expect(site.requested).toEqual([url("new1", "2026-09-20"), url("old1", "2026-01-01")]);
     expect(await queue.status()).toMatchObject({ state: "idle", done: 2, total: 2, waiting: [] });

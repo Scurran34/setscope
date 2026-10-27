@@ -96,7 +96,7 @@ describe.skipIf(!available)("server", () => {
   };
 
   it("serves the page and the browser script with types stripped", async () => {
-    expect(await (await fetch(`${base}/`)).text()).toContain("<title>setscope</title>");
+    expect(await (await fetch(`${base}/`)).text()).toContain("<title>Rabbithole</title>");
     const js = await (await fetch(`${base}/app.js`)).text();
     expect(js).not.toMatch(/^import type/m);
     expect(js).toContain("function showRoute");
@@ -128,6 +128,40 @@ describe.skipIf(!available)("server", () => {
     expect(await (await fetch(`${base}/api/vault-preview`)).json()).toEqual({ lines: expect.any(Number), sets: expect.any(Number) });
   });
 
+  it("serves discovery, DJs, follows and the Vault", async () => {
+    await capture([url("c1")]);
+    await queue.settled();
+    const now = await (await fetch(`${base}/api/discovery?mode=most&period=all`)).json();
+    expect(now).toMatchObject({ mode: "most", scope: "all", pageSize: 15, coverage: { sets: 1, djs: 2 } });
+    expect(now.items[0]).toMatchObject({ rank: 1, sets: 1, djs: 2 });
+    expect((await fetch(`${base}/api/discovery?mode=loudest`)).status).toBe(400);
+    const followed = await (await fetch(`${base}/api/discovery?scope=followed`)).json();
+    expect(followed).toMatchObject({ scope: "all", notice: expect.stringMatching(/Sign in/) });
+    const custom = await (await fetch(`${base}/api/discovery?mode=most&period=all&scope=custom&djs=${encodeURIComponent("DJ Alpha,Nobody")}`)).json();
+    expect(custom).toMatchObject({ scope: "custom", coverage: { djs: 1 } });
+    expect((await (await fetch(`${base}/api/djs`)).json()).items.map((d: { name: string }) => d.name).sort()).toEqual(["DJ Alpha", "DJ Beta"]);
+
+    const owner = await signUp();
+    expect((await postAs(owner, "/api/follow", { dj: "dj alpha", on: true })).status).toBe(200);
+    expect((await (await getAs(owner, "/api/djs?following=1")).json()).items).toEqual([expect.objectContaining({ name: "DJ Alpha", following: true })]);
+    expect(await (await getAs(owner, "/api/discovery?scope=followed&mode=most&period=all")).json()).toMatchObject({ scope: "followed", coverage: { djs: 1 } });
+    const profile = await (await getAs(owner, "/api/dj?name=DJ%20Alpha")).json();
+    expect(profile).toMatchObject({ name: "DJ Alpha", sets: 1, following: true, waiting: 0 });
+    expect((await fetch(`${base}/api/dj?name=Nobody`)).status).toBe(404);
+    expect((await (await fetch(`${base}/api/dj/selections?name=DJ%20Alpha&mode=most&period=all`)).json()).pageSize).toBe(15);
+    const ids = await (await getAs(owner, "/api/dj/ids?name=DJ%20Alpha")).json();
+    expect(ids.items.length).toBeGreaterThan(0);
+    const id = ids.items[0];
+    expect((await postAs(owner, "/api/vault", { set: id.setId, position: id.position, on: true })).status).toBe(200);
+    expect(await (await getAs(owner, "/api/vault")).json()).toEqual([expect.objectContaining({ setId: "c1", position: id.position, status: "unidentified" })]);
+    expect((await postJson("/api/vault", { set: "c1", position: 0, on: true })).status).toBe(401);
+    expect(await (await postAs(owner, "/api/gather/stop", { dj: "DJ Alpha" })).json()).toEqual({ stopped: 0 });
+    const alongside = await (await fetch(`${base}/api/song/alongside?song=${encodeURIComponent("Nova - Pulse")}`)).json();
+    expect(alongside).toMatchObject({ page: 1, pageSize: 15, sort: "specific", total: 0 }); // one set: nothing shares 2+
+    expect((await fetch(`${base}/api/song/alongside?song=nodash`)).status).toBe(400);
+    expect(await (await fetch(`${base}/api/discovery?mode=closer&period=all`)).json()).toMatchObject({ mode: "closer", items: [] });
+  });
+
   it("signs up the owner (importing old likes), keeps them signed in, and signs out", async () => {
     await capture([url("c1")]);
     await queue.settled();
@@ -138,7 +172,7 @@ describe.skipIf(!available)("server", () => {
     expect(setCookie).toMatch(/^setscope_session=[\w-]+; HttpOnly; SameSite=Lax; Path=\/; Max-Age=\d+$/);
     const cookie = setCookie.split(";")[0]!;
     expect(await (await getAs(cookie, "/api/auth/me")).json()).toMatchObject({ user: { displayName: "Owner", owner: true }, signup: "invite" });
-    expect(await (await getAs(cookie, "/api/me")).json()).toEqual({ likes: ["Nova - Pulse"], categories: [] });
+    expect(await (await getAs(cookie, "/api/me")).json()).toEqual({ likes: ["Nova - Pulse"], categories: [], following: 0 });
 
     const login = await postJson("/api/auth/login", { email: "owner@example.com", password: "wrong password" });
     expect(login.status).toBe(400);
@@ -225,6 +259,29 @@ describe.skipIf(!available)("server", () => {
     expect(artist).toMatchObject({ artist: "Roland Clark", correctedFrom: "roland clrak" });
   });
 
+  it("lets friends gather through a shared link with their own capture key, within limits", async () => {
+    const owner = await signUp();
+    const friend = await signUp("friend@example.com", "invite");
+    // Through a tunnel, requests carry forwarding headers: no key, no capture.
+    const remote = { "X-Setscope": "1", "X-Forwarded-For": "203.0.113.9" };
+    const urls = Array.from({ length: 250 }, (_, i) => url(`r${i}`, `2025-${String((i % 12) + 1).padStart(2, "0")}-${String((i % 28) + 1).padStart(2, "0")}`));
+    const page = "https://www.1001tracklists.com/artist/dj-x/tracklists.html";
+    expect((await postJson("/api/capture", { pageUrl: page, urls }, remote)).status).toBe(401);
+    expect((await postJson("/api/capture-token", {})).status).toBe(401);
+    const { token } = await (await postAs(friend, "/api/capture-token", {})).json();
+    expect(typeof token).toBe("string");
+    const res = await postJson("/api/capture", { pageUrl: page, urls, token }, remote);
+    expect(await res.json()).toMatchObject({ found: 250, queued: 200, overLimit: 50 }); // a friend's gather is capped
+    const requesters = await pool.query("select distinct requested_by from collection_jobs where status = 'queued'");
+    expect(requesters.rows).toEqual([{ requested_by: expect.any(Number) }]);
+    expect((await postJson("/api/capture", { urls: [], token: "made-up" }, remote)).status).toBe(401);
+    // From this computer nothing changes: no key needed, no cap.
+    expect((await capture([url("local1")])).status).toBe(200);
+    // Only the owner clears everyone's queue; a friend stops only their own gathering.
+    expect((await postAs(friend, "/api/clear-queue", {})).status).toBe(403);
+    expect((await postAs(owner, "/api/clear-queue", {})).status).toBe(200);
+  });
+
   it("serves trending and clears the queue", async () => {
     const report = await (await fetch(`${base}/api/trending?days=14`)).json();
     expect(report).toMatchObject({ enoughData: false, songs: [], artists: [] });
@@ -251,9 +308,9 @@ describe.skipIf(!available)("server", () => {
     const song = await (await getAs(friend, `/api/song?q=${encodeURIComponent("Nova - Pulse")}&months=24`)).json();
     expect(song).toMatchObject({ liked: true, categories: ["Party"], genre: "Tech House", sets: [{ id: "c1", soundcloud: "https://api.soundcloud.com/tracks/2423741796" }] });
 
-    expect(await (await getAs(friend, "/api/me")).json()).toEqual({ likes: ["Nova - Pulse"], categories: [{ name: "Party", songs: ["Nova - Pulse"] }] });
+    expect(await (await getAs(friend, "/api/me")).json()).toEqual({ likes: ["Nova - Pulse"], categories: [{ name: "Party", songs: ["Nova - Pulse"] }], following: 0 });
     // The owner's likes came from the old file; the friend's Party category isn't theirs.
-    expect(await (await getAs(owner, "/api/me")).json()).toEqual({ likes: ["Nova - Pulse"], categories: [] });
+    expect(await (await getAs(owner, "/api/me")).json()).toEqual({ likes: ["Nova - Pulse"], categories: [], following: 0 });
     const forYou = await (await getAs(friend, "/api/for-you?months=24")).json();
     expect(forYou).toMatchObject({ likes: ["Nova - Pulse"], sets: [{ id: "c1", liked: ["Nova - Pulse"] }] });
     expect(await (await getAs(friend, "/api/category?name=party&months=24")).json()).toMatchObject({ name: "Party", songs: ["Nova - Pulse"] });

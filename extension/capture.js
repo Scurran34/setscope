@@ -63,12 +63,15 @@ const MAX_SETS_PER_PAGE = 10_000;
  * the bottom. Scroll the way you would, pausing between loads, until nothing new
  * appears (or the cap). Only on a page you opened from setscope.
  */
-async function loadAllSets() {
+async function loadAllSets(limit) {
+  // With a limit ("their last 20 sets") the newest sets are at the top, so stop scrolling
+  // once there are that many (plus a few, in case the page mixes in other links).
+  const enough = limit ? Math.min(MAX_SETS_PER_PAGE, limit + 5) : MAX_SETS_PER_PAGE;
   let urls = await waitForLinks();
   let complete = false;
   let stalls = 0;
-  while (urls.length < MAX_SETS_PER_PAGE && stalls < 2) {
-    banner(`setscope: loading more sets… ${urls.length} so far`);
+  while (urls.length < enough && stalls < 2) {
+    banner(limit ? `Rabbithole: gathering their last ${limit} sets… ${Math.min(urls.length, limit)} so far` : `Rabbithole: loading more sets… ${urls.length} so far`);
     window.scrollTo(0, document.documentElement.scrollHeight);
     let grew = false;
     for (let i = 0; i < 8 && !grew; i++) {
@@ -108,7 +111,7 @@ function openExactMatch(search) {
   }
   if (matches.size !== 1) return false;
   const [href, link] = [...matches][0];
-  banner(`setscope: opening ${link.textContent.trim()}…`);
+  banner(`Rabbithole: opening ${link.textContent.trim()}…`);
   location.assign(new URL(href, location.origin).href);
   return true;
 }
@@ -118,7 +121,7 @@ async function main() {
   if (!capture || isChallenge()) return;
 
   if (location.pathname.startsWith("/search/")) {
-    if (!openExactMatch(search)) banner("setscope: click the right result");
+    if (!openExactMatch(search)) banner("Rabbithole: click the right result");
     return;
   }
   if (location.pathname.startsWith("/tracklist/")) {
@@ -126,35 +129,40 @@ async function main() {
     return;
   }
   if (!CAPTURE_PAGES.test(location.pathname)) {
-    banner("setscope: open the track or DJ page you want");
+    banner("Rabbithole: open the track or DJ page you want");
     return;
   }
 
-  banner("setscope: collecting sets…");
-  const { urls, complete } = await loadAllSets();
+  banner(search?.limit ? `Rabbithole: gathering the last ${search.limit} sets…` : "Rabbithole: collecting sets…");
+  const { urls, complete } = await loadAllSets(search?.limit ?? null);
   if (urls.length === 0) {
-    banner("setscope: no sets on this page");
+    banner("Rabbithole: no sets on this page");
     return;
   }
-  const reply = await chrome.runtime.sendMessage({ type: "capture", pageUrl: location.href, urls, complete });
+  const reply = await chrome.runtime.sendMessage({ type: "capture", pageUrl: location.href, urls, complete, limit: search?.limit ?? null });
   if (reply?.ok) {
     const { queued, alreadyCached, skippedOld } = reply.result;
     const older = skippedOld ? ` · ${skippedOld} older than your window` : "";
-    const more = complete ? "" : " · stopped early, gather again for more";
-    banner(`setscope: ${urls.length} sets on this page · ${alreadyCached} already in setscope · ${queued} new${older}${more}. Closing…`);
+    if (search?.limit) {
+      const taken = Math.min(urls.length, search.limit);
+      banner(`Rabbithole: the last ${taken} sets · ${queued} new · ${alreadyCached} already in Rabbithole${older}. Closing…`);
+    } else {
+      const more = complete ? "" : " · stopped early, gather again for more";
+      banner(`Rabbithole: ${urls.length} sets on this page · ${alreadyCached} already in Rabbithole · ${queued} new${older}${more}. Closing…`);
+    }
   } else {
-    banner(`setscope: couldn't reach the app (${reply?.error ?? "unknown error"}). Is npm run web running?`);
+    banner(`Rabbithole: couldn't reach the app (${reply?.error ?? "unknown error"}). Is npm run web running?`);
   }
 }
 
 /** Wait for the track rows to render, then send the whole page to setscope. */
 async function captureSet() {
-  banner("setscope: reading this set…");
+  banner("Rabbithole: reading this set…");
   for (let i = 0; i < 20 && document.querySelectorAll(".tlpItem").length === 0; i++) {
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   if (document.querySelectorAll(".tlpItem").length === 0) {
-    banner("setscope: no tracks on this page");
+    banner("Rabbithole: no tracks on this page");
     return;
   }
   const reply = await chrome.runtime.sendMessage({

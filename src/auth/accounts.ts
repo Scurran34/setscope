@@ -129,6 +129,12 @@ export class Accounts {
     return row && { id: row.id, email: row.email, displayName: row.display_name };
   }
 
+  async userById(id: number): Promise<User | undefined> {
+    const r = await this.pool.query<{ id: number; email: string; display_name: string }>("select id, email, display_name from users where id = $1", [id]);
+    const row = r.rows[0];
+    return row && { id: row.id, email: row.email, displayName: row.display_name };
+  }
+
   async endSession(token: string | undefined): Promise<void> {
     if (token) await this.pool.query("delete from sessions where token_hash = $1", [tokenHash(token)]);
   }

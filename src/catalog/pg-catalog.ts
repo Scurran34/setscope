@@ -11,9 +11,19 @@ import { displayName, normalizeName } from "../normalize.ts";
 import { transaction, type Db } from "../db/pool.ts";
 import type { Catalog } from "./catalog.ts";
 import { PARSER_VERSION, parseTracklist } from "../source/parse.ts";
-import { identify } from "./identity.ts";
+import { credits, identify } from "./identity.ts";
 
 const SOURCE = "1001tracklists";
+/** Bump when credits() changes, so stored credits are re-derived once at startup. */
+export const CREDITS_VERSION = 3;
+
+/** Names with "&", "x", "/"... that have their own 1001Tracklists page: one act, never split. */
+async function oneActNames(db: Db): Promise<string[]> {
+  const r = await db.query<{ name: string }>(
+    `select name from artists where tl_page is not null and (name ~* '\\s(&|x|vs\\.?|pres\\.?|/)\\s' or name like '%, %')`,
+  );
+  return r.rows.map((row) => row.name);
+}
 
 export class PgCatalog implements Catalog {
   private readonly pool: pg.Pool;
@@ -66,6 +76,47 @@ export class PgCatalog implements Catalog {
     );
     for (const row of r.rows) await this.save(parseTracklist(row.html, row.url), row.html);
     return r.rows.length;
+  }
+
+  /**
+   * Re-derive every track's credits with the current rules (credits() in identity.ts),
+   * once per CREDITS_VERSION. Returns how many tracks were redone (0 if already current).
+   */
+  async rebuildCreditsIfOutdated(): Promise<number> {
+    const done = await this.pool.query<{ value: string }>("select value from app_meta where key = 'credits_version'");
+    if (Number(done.rows[0]?.value ?? 0) >= CREDITS_VERSION) return 0;
+    const tracks = (await this.pool.query<{ id: number; artist_text: string; title: string }>("select id, artist_text, title from tracks")).rows;
+    await transaction(this.pool, async (db) => {
+      const ids = new Map((await db.query<{ id: number; name_key: string }>("select id, name_key from artists")).rows.map((r) => [r.name_key, r.id]));
+      const oneAct = await oneActNames(db);
+      const rows: [number, number, string, number][] = [];
+      for (const t of tracks) {
+        for (const [i, credit] of credits({ artist: t.artist_text, title: t.title }, oneAct).entries()) {
+          const key = normalizeName(credit.name);
+          let artistId = ids.get(key);
+          if (artistId === undefined) {
+            artistId = await upsertArtist(db, credit.name);
+            ids.set(key, artistId);
+          }
+          rows.push([t.id, artistId, credit.role, i]);
+        }
+      }
+      await db.query("delete from track_artists");
+      for (let start = 0; start < rows.length; start += 5000) {
+        const chunk = rows.slice(start, start + 5000);
+        await db.query(
+          `insert into track_artists (track_id, artist_id, role, position)
+           select * from unnest($1::bigint[], $2::bigint[], $3::text[], $4::int[]) on conflict do nothing`,
+          [chunk.map((r) => r[0]), chunk.map((r) => r[1]), chunk.map((r) => r[2]), chunk.map((r) => r[3])],
+        );
+      }
+      await db.query(
+        "insert into app_meta (key, value) values ('credits_version', $1) on conflict (key) do update set value = excluded.value",
+        [String(CREDITS_VERSION)],
+      );
+    });
+    this.cache = undefined;
+    return tracks.length;
   }
 
   /** Forget the in-memory copy (after changes made outside this object, e.g. an import). */
@@ -224,15 +275,15 @@ async function resolveTrack(db: Db, track: Track): Promise<number> {
     );
   }
 
-  // Credits: main artists and remixers, with their 1001Tracklists pages when known.
-  for (const [role, names] of [["main", id.mainArtists], ["remixer", id.remixers]] as const) {
-    for (const [i, name] of names.entries()) {
-      const artistId = await upsertArtist(db, name, track.artistPages?.[name]);
-      await db.query(
-        "insert into track_artists (track_id, artist_id, role, position) values ($1, $2, $3, $4) on conflict do nothing",
-        [trackId, artistId, role, i],
-      );
-    }
+  // Credits (main, featured, remixer, mashup component), with 1001Tracklists pages when known.
+  // Rewritten each time, so a corrected line or improved rules replace the old credits.
+  await db.query("delete from track_artists where track_id = $1", [trackId]);
+  for (const [i, credit] of credits(track, await oneActNames(db)).entries()) {
+    const artistId = await upsertArtist(db, credit.name, track.artistPages?.[credit.name]);
+    await db.query(
+      "insert into track_artists (track_id, artist_id, role, position) values ($1, $2, $3, $4) on conflict do nothing",
+      [trackId, artistId, credit.role, i],
+    );
   }
   return trackId;
 }

@@ -28,6 +28,9 @@ describe("normalize", () => {
     expect(splitArtists("Glovibes ft. Lana Parrilla")).toEqual(["Glovibes", "Lana Parrilla"]);
     expect(splitArtists("A x B vs. C, D")).toEqual(["A", "B", "C", "D"]);
     expect(splitArtists("Malcolm X")).toEqual(["Malcolm X"]);
+    expect(splitArtists("Chris Lake & Chris Lorenzo pres. Anti Up")).toEqual(["Chris Lake", "Chris Lorenzo", "Anti Up"]);
+    expect(splitArtists("Chris Lake / Chris Lorenzo")).toEqual(["Chris Lake", "Chris Lorenzo"]);
+    expect(splitArtists("AC/DC")).toEqual(["AC/DC"]);
   });
 
   it("credits remixers", () => {

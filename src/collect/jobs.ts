@@ -58,6 +58,8 @@ export interface EnqueueResult {
   alreadyCached: number;
   /** Sets older than the window, held. */
   skippedOld: number;
+  /** Sets on the page older than the requested "last N" (left for another time). */
+  overLimit: number;
 }
 
 /** Waits before retrying a job that failed for a passing reason: 30s, 2m, 8m. */
@@ -111,8 +113,16 @@ export class PgJobQueue {
    * Add set URLs: duplicates, sets already cached, and sets already queued are skipped;
    * sets older than `since` are held. Starts fetching unless collecting is paused.
    */
-  async enqueue(urls: string[], since: string, options: { requestedBy?: number; priority?: number; start?: boolean } = {}): Promise<EnqueueResult> {
-    const unique = [...new Set(urls.filter(isFetchAllowed))];
+  async enqueue(
+    urls: string[],
+    since: string,
+    options: { requestedBy?: number; priority?: number; start?: boolean; page?: string; limit?: number } = {},
+  ): Promise<EnqueueResult> {
+    // Newest first. A limit means "their last N sets": the newest N on the page, whether or
+    // not some of them are already here (those are skipped, not swapped for older ones).
+    const newestFirst = [...new Set(urls.filter(isFetchAllowed))].sort((a, b) => (dateFromUrl(b) ?? "").localeCompare(dateFromUrl(a) ?? ""));
+    const unique = options.limit !== undefined ? newestFirst.slice(0, options.limit) : newestFirst;
+    const overLimit = newestFirst.length - unique.length;
     if ((await this.count("status in ('queued', 'running', 'blocked')")) === 0) await this.startBatch();
     let queued = 0;
     let alreadyCached = 0;
@@ -127,16 +137,37 @@ export class PgJobQueue {
       const date = dateFromUrl(url);
       const held = date !== undefined && date < since;
       const r = await this.pool.query(
-        `insert into collection_jobs (kind, target, status, priority, performed_on, requested_by)
-         values ('fetch_set', $1, $2, $3, $4, $5) on conflict do nothing`,
-        [url, held ? "held" : "queued", options.priority ?? 0, date ?? null, options.requestedBy ?? null],
+        `insert into collection_jobs (kind, target, status, priority, performed_on, requested_by, discovery_page)
+         values ('fetch_set', $1, $2, $3, $4, $5, $6) on conflict do nothing`,
+        [url, held ? "held" : "queued", options.priority ?? 0, date ?? null, options.requestedBy ?? null, options.page ?? null],
       );
       if (r.rowCount === 0) continue; // already waiting
       if (held) skippedOld++;
       else queued++;
     }
     if (options.start !== false) this.kick();
-    return { queued, fetchingNow: queued, alreadyCached, skippedOld };
+    return { queued, fetchingNow: queued, alreadyCached, skippedOld, overLimit };
+  }
+
+  /** "Stop gathering": cancel the not-yet-fetched sets that came from these pages. Returns how many. */
+  async stopGathering(pages: string[], requestedBy?: number): Promise<number> {
+    if (!pages.length) return 0;
+    const r = await this.pool.query(
+      `delete from collection_jobs where kind = 'fetch_set' and status in ('queued', 'held', 'blocked') and discovery_page = any($1)
+          and ($2::bigint is null or requested_by = $2)`,
+      [pages, requestedBy ?? null],
+    );
+    return r.rowCount ?? 0;
+  }
+
+  /** Sets from these pages still waiting to be fetched. */
+  async waitingFrom(pages: string[]): Promise<number> {
+    if (!pages.length) return 0;
+    const r = await this.pool.query<{ n: number }>(
+      `select count(*)::int n from collection_jobs where kind = 'fetch_set' and status in ('queued', 'running', 'held', 'blocked') and discovery_page = any($1)`,
+      [pages],
+    );
+    return r.rows[0]!.n;
   }
 
   /** Re-read sets already in the catalog (to catch IDs getting identified). */

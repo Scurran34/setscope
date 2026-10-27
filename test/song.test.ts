@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { analyzeSong } from "../src/analysis/song.ts";
+import { analyzeSong, playedAlongside } from "../src/analysis/song.ts";
 import { parseSongQuery } from "../src/normalize.ts";
-import { SINCE, songSets } from "./fixtures/sets.ts";
+import { makeSet, SINCE, songSets } from "./fixtures/sets.ts";
 
 describe("analyzeSong", () => {
   const report = analyzeSong(songSets, parseSongQuery("Nova - Pulse"), { since: SINCE });
@@ -65,5 +65,24 @@ describe("analyzeSong", () => {
     expect(none.setsWithSong).toBe(0);
     expect(none.topDjs).toEqual([]);
     expect(none.coPlayed).toEqual([]);
+  });
+});
+
+describe("playedAlongside", () => {
+  // "Big - Hit" shares the most sets with Mine, but it's in every set; "Pair - Up" is
+  // almost only ever played with Mine.
+  const sets = [
+    ...Array.from({ length: 4 }, (_, i) => makeSet(`w${i}`, "2026-09-01", [`DJ ${i}`], ["Mine - Song", "Big - Hit", "Pair - Up"])),
+    makeSet("w4", "2026-09-01", ["DJ 4"], ["Mine - Song", "Big - Hit"]),
+    ...Array.from({ length: 10 }, (_, i) => makeSet(`x${i}`, "2026-09-02", [`DJ x${i}`], ["Big - Hit", "Other - Thing"])),
+  ];
+  it("lists every song that shared 2+ sets, ranked by how much of its play is with this song", () => {
+    expect(playedAlongside(sets, parseSongQuery("Mine - Song"), SINCE).map((r) => [r.name, r.together, r.everywhere])).toEqual([
+      ["Pair - Up", 4, 4],
+      ["Big - Hit", 5, 15],
+    ]);
+  });
+  it("can rank by shared sets alone", () => {
+    expect(playedAlongside(sets, parseSongQuery("Mine - Song"), SINCE, "count").map((r) => r.name)).toEqual(["Big - Hit", "Pair - Up"]);
   });
 });

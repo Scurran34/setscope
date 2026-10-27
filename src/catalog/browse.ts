@@ -226,7 +226,7 @@ async function artistPlays(pool: pg.Pool, from: string | null, to: string | null
   const out = new Map<number, ArtistPlays & { row: PlayRow; seen: Set<string> }>();
   for (const row of r.rows) {
     const a = out.get(row.artist_id) ?? { row, sets: new Map(), songs: new Map(), seen: new Set() };
-    const featured = row.role === "main" && isFeatured(row.artist_text, row.name);
+    const featured = row.role === "featured" || row.role === "mashup_component" || (row.role === "main" && isFeatured(row.artist_text, row.name));
     a.sets.set(row.set_id, (a.sets.get(row.set_id) ?? true) && featured);
     const pair = `${row.set_id}:${row.track_id}`;
     if (!a.seen.has(pair)) {
@@ -317,7 +317,11 @@ export async function listSets(pool: pg.Pool, query: SetQuery, normalize: (s: st
        from sets s
       where ($1::date is null or s.performed_on >= $1) and ($2::date is null or s.performed_on < $2)
         and ($3::text is null or lower(s.title) like $3)
-        and ($4::text is null or exists (select 1 from set_djs sd join artists a on a.id = sd.artist_id where sd.set_id = s.id and a.name_key = $4))
+        -- a DJ by any of their names (verified aliases included)
+        and ($4::text is null or exists (
+              select 1 from set_djs sd join artists a on a.id = sd.artist_id left join artist_aliases al on al.artist_id = a.id
+               where sd.set_id = s.id and coalesce(al.canonical_id, a.id) = (
+                 select coalesce(al2.canonical_id, a2.id) from artists a2 left join artist_aliases al2 on al2.artist_id = a2.id where a2.name_key = $4)))
       order by s.performed_on desc nulls last, s.id desc
       limit $5 offset $6`,
     [from, to, like(query.q), query.dj?.trim() ? normalize(query.dj) : null, query.pageSize, (query.page - 1) * query.pageSize],

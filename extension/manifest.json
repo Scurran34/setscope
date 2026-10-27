@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "setscope capture",
-  "version": "0.4.0",
-  "description": "Sends the set links from a 1001Tracklists page you opened from setscope to your local setscope app, then closes that tab.",
+  "name": "Rabbithole capture",
+  "version": "0.6.2",
+  "description": "Sends the set links from a 1001Tracklists page you opened from Rabbithole to the Rabbithole app you opened it from (on this computer, or a shared link), then closes that tab.",
   "permissions": [
     "storage"
   ],
   "host_permissions": [
     "http://127.0.0.1:7331/*",
-    "http://localhost:7331/*"
+    "http://localhost:7331/*",
+    "https://*.trycloudflare.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -27,7 +28,8 @@
     {
       "matches": [
         "http://127.0.0.1:7331/*",
-        "http://localhost:7331/*"
+        "http://localhost:7331/*",
+        "https://*.trycloudflare.com/*"
       ],
       "js": [
         "app-bridge.js"

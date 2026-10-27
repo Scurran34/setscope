@@ -277,13 +277,24 @@ function parseTags(tagList: string | null | undefined): string[] {
   return [...tagList.matchAll(/"([^"]+)"|(\S+)/g)].map((m) => (m[1] ?? m[2])!.trim()).filter(Boolean);
 }
 
+/** soundcloud.com links without the ?utm_... tracking parameters the API adds. */
+export function cleanLink(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.hostname === "soundcloud.com" || u.hostname === "www.soundcloud.com") return `https://soundcloud.com${u.pathname.replace(/\/$/, "")}`;
+  } catch {
+    // leave anything else alone
+  }
+  return url;
+}
+
 export function toTrack(raw: RawTrack): ScTrack {
   const access = raw.access === "playable" || raw.access === "preview" || raw.access === "blocked" ? raw.access : "playable";
   const track: ScTrack = {
     urn: raw.urn ?? (raw.id !== undefined ? `soundcloud:tracks:${raw.id}` : ""),
     title: raw.title ?? "",
     uploader: raw.user?.username ?? "",
-    permalink: raw.permalink_url ?? "",
+    permalink: cleanLink(raw.permalink_url ?? ""),
     tags: parseTags(raw.tag_list),
     durationMs: raw.duration ?? 0,
     access,
@@ -303,7 +314,7 @@ function toUser(raw: Record<string, unknown>): ScUser {
   const user: ScUser = {
     urn: String(raw.urn ?? (raw.id !== undefined ? `soundcloud:users:${raw.id}` : "")),
     username: String(raw.username ?? ""),
-    permalink: String(raw.permalink_url ?? ""),
+    permalink: cleanLink(String(raw.permalink_url ?? "")),
   };
   if (typeof raw.avatar_url === "string") user.avatar = raw.avatar_url;
   if (typeof raw.public_favorites_count === "number") user.likesCount = raw.public_favorites_count;

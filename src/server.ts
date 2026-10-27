@@ -14,11 +14,18 @@
 //   POST /api/like  /api/label (add/remove a song in a playlist)  /api/playlists  /api/playlists/delete
 //   GET  /api/discover?genre=&page=&seed=   songs you might like (or trending ones), shuffled
 //   GET  /api/song-info?song=            key and BPM (GetSongBPM, cached)
+//   GET  /api/song/alongside?song=&sort=specific|count&page=   every song played in the same sets
 //   GET  /api/account   POST /api/account/getsongbpm-key (owner)
 //   GET  /api/status    POST /api/background (owner)
 //   POST /api/capture  /api/capture-set   from the browser extension
 //   POST /api/add-links /api/resume /api/clear-queue /api/include-older /api/retry-failed (needs login)
 //   POST /api/refresh-set { url }        re-read a set now (needs login)
+//   GET  /api/discovery?mode=now|most|deep&scope=all|followed|custom&djs=&genre=&period=&page=
+//                                        third-party tracks DJs are playing (src/catalog/discover.ts)
+//   GET  /api/djs?q=&following=1&page=   DJs with indexed sets;  POST /api/follow { dj, on }
+//   GET  /api/dj?name=  /api/dj/selections  /api/dj/own  /api/dj/ids    a DJ's profile, picks, own tracks, IDs
+//   GET  /api/vault   POST /api/vault { set, position, on }             the Unreleased Vault
+//   POST /api/gather/stop { dj }         cancel a DJ's sets that haven't been fetched yet
 //   GET  /api/charts/songs  /api/charts/artists  ?period=week|month|3months|year|all&genre=&q=&page=
 //   GET  /api/sets?q=&dj=&year=&page=  /api/set?id=  /api/genres  /api/search?q=  /api/vault-preview
 //   GET  /api/play?song=                 something to play for a song: its link, or its best SoundCloud match
@@ -29,6 +36,7 @@
 //   POST /api/saved-link                 save a SoundCloud upload in a category (needs login)
 //   POST /api/account/soundcloud         the SoundCloud app's credentials (owner)
 
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import type pg from "pg";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -39,7 +47,7 @@ import { correctArtist, correctSong, searchArtists, searchSongs, songsWithTitle 
 import { today } from "./analysis/common.ts";
 import { categoryHints, setsForYou, songsLike } from "./analysis/personal.ts";
 import { artistProfile } from "./analysis/profile.ts";
-import { analyzeSong, type SongReport } from "./analysis/song.ts";
+import { analyzeSong, playedAlongside, type SongReport } from "./analysis/song.ts";
 import { trending } from "./analysis/trending.ts";
 import { AccountError, Accounts, SESSION_DAYS, type User } from "./auth/accounts.ts";
 import { RateLimiter } from "./auth/rate-limit.ts";
@@ -61,6 +69,8 @@ import { ScError, ScRateLimited, SoundCloudClient, type ScTrack } from "./soundc
 import { isTrackLink, LinkStore } from "./soundcloud/links.ts";
 import { classify, remixesOf, songCandidates, type Candidate } from "./soundcloud/match.ts";
 import { versionOf } from "./catalog/identity.ts";
+import { discover, djProfile, followedIds, idLines, listDjs, MODES, ownTracks, resolveArtist, setFollow, type DiscoveryMode } from "./catalog/discover.ts";
+import { Vault } from "./personal/vault.ts";
 import { artistChart, genres, idStats, listSets, PERIODS, setCardsByIds, setDetail, songCards, songChart, type Period, type SongCard } from "./catalog/browse.ts";
 
 export const PORT = Number(process.env.SETSCOPE_PORT ?? 7331);
@@ -68,6 +78,10 @@ const WEB_DIR = join(import.meta.dirname, "..", "web");
 const COOKIE = "setscope_session";
 /** A "since" date that holds nothing back: for sets you asked for yourself. */
 const ALL_TIME = "0001-01-01";
+/** How long a capture key (for gathering through a shared link) stays valid. */
+const CAPTURE_TOKEN_MS = 12 * 60 * 60_000;
+/** Most sets one gather by someone other than you (through a shared link) can queue. */
+const FRIEND_GATHER_MAX = 200;
 
 export interface App {
   pool: pg.Pool;
@@ -88,6 +102,7 @@ export interface App {
   /** Slows down floods of captures / pasted links (per account, or per address without one). */
   captureLimit: RateLimiter;
   soundcloud: SoundCloudClient;
+  vault: Vault;
   links: LinkStore;
   /** Where the SoundCloud app's credentials are saved when the owner sets them. */
   soundcloudFile: string | undefined;
@@ -97,6 +112,8 @@ export interface App {
   likesLimit: RateLimiter;
   /** Tracks SoundCloud had no match for, and until when not to search again. */
   noMatch: Map<number, number>;
+  /** Capture keys handed to the extension: key -> whose, until when. */
+  captureTokens: Map<string, { userId: number; expires: number }>;
 }
 
 export interface AppDeps {
@@ -146,11 +163,13 @@ export function createApp({ pool, catalog, queue, accounts, userData }: AppDeps,
     secureCookies: options.secureCookies ?? false,
     since: sinceMonths(),
     soundcloud: options.soundcloud ?? new SoundCloudClient(),
+    vault: new Vault(pool),
     links: new LinkStore(pool),
     soundcloudFile: options.soundcloudFile,
     soundcloudLimit: options.soundcloudLimit ?? new RateLimiter(120, 10 * 60_000),
     likesLimit: options.likesLimit ?? new RateLimiter(400, 24 * 60 * 60_000),
     noMatch: new Map(),
+    captureTokens: new Map(),
   };
   return createServer((req, res) => {
     if (req.url?.startsWith("/api/") && req.url !== "/api/status") {
@@ -254,6 +273,31 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       const image = first ? await artistImage(app.pool, trackFromName(first).artist) : null;
       return sendJson(res, 200, { ...(await withUserData(app, user, report, sets)), image });
     }
+    case "GET /api/song/alongside": {
+      // Every song played in the same sets, 15 a page; "specific" (default) or "count" order.
+      const song = songParam(params);
+      const since = sinceMonths(intParam(params, "months", DEFAULT_MONTHS));
+      const sort = params.get("sort") === "count" ? "count" : "specific";
+      let query;
+      try {
+        query = parseSongQuery(song);
+      } catch (error) {
+        throw new BadRequest((error as Error).message);
+      }
+      const all = playedAlongside(await app.catalog.all(), query, since, sort);
+      const page = intParam(params, "page", 1);
+      const size = pageSizeParam(params, 15);
+      const slice = all.slice((page - 1) * size, page * size);
+      const cards = await songCards(app.pool, slice.map((r) => r.name));
+      return sendJson(res, 200, {
+        items: slice.map((r, i) => ({ ...r, rank: (page - 1) * size + i + 1, image: cards.get(r.name)?.image ?? null, soundcloud: cards.get(r.name)?.soundcloud ?? null })),
+        page,
+        pageSize: size,
+        total: all.length,
+        pages: Math.max(1, Math.ceil(all.length / size)),
+        sort,
+      });
+    }
     case "GET /api/artist": {
       const name = required(params, "name");
       app.since = sinceMonths(intParam(params, "months", DEFAULT_MONTHS));
@@ -284,6 +328,95 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       const song = required(params, "song");
       if (!song.includes(" - ")) throw new BadRequest('Expected "Artist - Title"');
       return sendJson(res, 200, await app.songInfo.info(song));
+    }
+
+    // ---- discovery: what DJs are playing ----
+    case "GET /api/discovery": {
+      const mode = discoveryMode(params);
+      const scope = params.get("scope") ?? "all";
+      let djIds: number[] | null = null;
+      let scopeNotice: string | null = null;
+      if (scope === "followed") {
+        if (!user) scopeNotice = "Sign in and follow DJs to see what they're playing. Showing all DJs for now.";
+        else {
+          djIds = await followedIds(app.pool, user.id);
+          if (!djIds.length) {
+            scopeNotice = "You aren't following any DJs yet: follow some from the DJs page. Showing all DJs for now.";
+            djIds = null;
+          }
+        }
+      } else if (scope === "custom") {
+        const names = (params.get("djs") ?? "").split(",").map((n) => n.trim()).filter(Boolean).slice(0, 50);
+        const ids = (await Promise.all(names.map((n) => resolveArtist(app.pool, n)))).filter((id): id is number => id !== undefined);
+        djIds = [...new Set(ids)];
+        if (!djIds.length) {
+          scopeNotice = names.length ? "None of those DJs are indexed. Showing all DJs." : "Pick some DJs. Showing all DJs for now.";
+          djIds = null;
+        }
+      }
+      const result = await discover(app.pool, { ...discoveryParams(params, mode), djIds, pageSize: pageSizeParam(params, 15) });
+      return sendJson(res, 200, { ...result, notice: scopeNotice ?? result.notice, scope: djIds ? scope : "all" });
+    }
+    case "GET /api/djs": {
+      const following = params.get("following") === "1";
+      if (following && !user) return sendJson(res, 200, { items: [], page: 1, pageSize: 24, total: 0, pages: 1 });
+      const onlyIds = following && user ? await followedIds(app.pool, user.id) : undefined;
+      if (onlyIds && !onlyIds.length) return sendJson(res, 200, { items: [], page: 1, pageSize: 24, total: 0, pages: 1 });
+      const options: Parameters<typeof listDjs>[1] = { page: intParam(params, "page", 1), pageSize: pageSizeParam(params, 24) };
+      const q = params.get("q")?.trim();
+      if (q) options.q = q;
+      if (onlyIds) options.onlyIds = onlyIds;
+      if (user) options.userId = user.id;
+      return sendJson(res, 200, await listDjs(app.pool, options));
+    }
+    case "POST /api/follow": {
+      requireOwnHeader(req);
+      const u = needUser("follow DJs");
+      const body = (await readJson(req)) as { dj?: unknown; on?: unknown };
+      if (typeof body.dj !== "string" || typeof body.on !== "boolean") throw new BadRequest("Expected { dj, on }");
+      const id = await resolveArtist(app.pool, body.dj);
+      if (id === undefined) throw new BadRequest(`"${body.dj}" isn't indexed.`);
+      await setFollow(app.pool, u.id, id, body.on);
+      return sendJson(res, 200, { following: body.on });
+    }
+    case "GET /api/dj": {
+      const id = await artistParam(app, params);
+      const profile = await djProfile(app.pool, id, user?.id);
+      const pages = await gatherPages(app, id, profile.page);
+      return sendJson(res, 200, { ...profile, waiting: await app.queue.waitingFrom(pages), discovery: await discoveryForArtist(app.pool, profile.name, profile.page ?? undefined) });
+    }
+    case "GET /api/dj/selections": {
+      const id = await artistParam(app, params);
+      const mode = discoveryMode(params);
+      return sendJson(res, 200, await discover(app.pool, { ...discoveryParams(params, mode), djIds: [id], pageSize: pageSizeParam(params, 15) }));
+    }
+    case "GET /api/dj/own":
+      return sendJson(res, 200, await ownTracks(app.pool, await artistParam(app, params), intParam(params, "page", 1), pageSizeParam(params, 15)));
+    case "GET /api/dj/ids":
+      return sendJson(res, 200, await idLines(app.pool, await artistParam(app, params), intParam(params, "page", 1), pageSizeParam(params, 15), user?.id));
+    case "POST /api/gather/stop": {
+      requireOwnHeader(req);
+      const stopper = needUser("stop gathering");
+      // The owner stops everyone's gathering for this DJ; others stop only their own.
+      const onlyFor = (await app.accounts.isOwner(stopper.id)) ? undefined : stopper.id;
+      const body = (await readJson(req)) as { dj?: unknown };
+      if (typeof body.dj !== "string") throw new BadRequest("Expected { dj }");
+      const id = await resolveArtist(app.pool, body.dj);
+      if (id === undefined) throw new BadRequest(`"${body.dj}" isn't indexed.`);
+      const profile = await djProfile(app.pool, id);
+      return sendJson(res, 200, { stopped: await app.queue.stopGathering(await gatherPages(app, id, profile.page), onlyFor) });
+    }
+    case "GET /api/vault": {
+      const u = needUser("see your Vault");
+      return sendJson(res, 200, await app.vault.list(u.id));
+    }
+    case "POST /api/vault": {
+      requireOwnHeader(req);
+      const u = needUser("save IDs to your Vault");
+      const body = (await readJson(req)) as { set?: unknown; position?: unknown; on?: unknown };
+      if (typeof body.set !== "string" || !Number.isInteger(body.position) || typeof body.on !== "boolean") throw new BadRequest("Expected { set, position, on }");
+      await userAction(() => app.vault.setSaved(u.id, body.set as string, body.position as number, body.on as boolean));
+      return sendJson(res, 200, { saved: body.on });
     }
 
     // ---- browsing (charts by performance date, sets, search) ----
@@ -321,11 +454,12 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 
     // ---- your data (needs login) ----
     case "GET /api/me": {
-      if (!user) return sendJson(res, 200, { likes: [], categories: [] });
+      if (!user) return sendJson(res, 200, { likes: [], categories: [], following: 0 });
       const { likes, categories } = await app.userData.get(user.id);
       return sendJson(res, 200, {
         likes: Object.values(likes),
         categories: Object.values(categories).map((c) => ({ name: c.name, songs: Object.values(c.songs) })),
+        following: (await followedIds(app.pool, user.id)).length,
       });
     }
     case "POST /api/like": {
@@ -644,26 +778,48 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
         queue: await app.queue.status(),
         background: await app.background?.status(),
       });
+    case "POST /api/capture-token": {
+      // A short-lived key the page hands the extension, so a capture sent from someone
+      // else's computer (through a shared link) counts as theirs.
+      requireOwnHeader(req);
+      const u = needUser("gather sets");
+      const key = randomBytes(24).toString("base64url");
+      const expires = Date.now() + CAPTURE_TOKEN_MS;
+      app.captureTokens.set(key, { userId: u.id, expires });
+      for (const [k, t] of app.captureTokens) if (t.expires < Date.now()) app.captureTokens.delete(k);
+      return sendJson(res, 200, { token: key, expires: new Date(expires).toISOString() });
+    }
     case "POST /api/capture": {
       // From the browser extension (which may not carry your login). It only acts on a
-      // page you opened yourself, so there's no cap and no date window: every set on the
-      // page is queued, newest first.
+      // page you opened yourself, so from this computer there's no cap and no date window:
+      // every set on the page is queued, newest first. From anyone else (a shared link),
+      // it needs their capture key, and a friend's gather is capped.
       requireOwnHeader(req);
-      const body = (await readJson(req, 5_000_000)) as { pageUrl?: unknown; urls?: unknown; complete?: unknown };
+      const body = (await readJson(req, 5_000_000)) as { pageUrl?: unknown; urls?: unknown; complete?: unknown; limit?: unknown; token?: unknown };
+      const who = await captureUser(app, req, user, body.token);
       if (!Array.isArray(body.urls)) throw new BadRequest("Expected { urls: string[] }");
       if (body.urls.length > 20_000) throw new BadRequest("Too many links in one capture.");
       const urls = [...new Set(body.urls.filter((u): u is string => typeof u === "string" && isFetchAllowed(u)))];
-      const result = await app.queue.enqueue(urls, ALL_TIME, { requestedBy: user?.id });
       // Remember how far gathering got on this DJ/track page, for "last gathered" on artist pages.
       const page = typeof body.pageUrl === "string" && /^https:\/\/(www\.)?1001tracklists\.com\/(artist|dj|track|source)\//.test(body.pageUrl) ? body.pageUrl : undefined;
+      // "Gather the newest N" from a DJ page: a bound you chose; without one, every set is queued.
+      let limit = typeof body.limit === "number" && Number.isInteger(body.limit) && body.limit > 0 ? body.limit : undefined;
+      if (!who.trusted) limit = Math.min(limit ?? FRIEND_GATHER_MAX, FRIEND_GATHER_MAX);
+      const options: { requestedBy?: number; page?: string; limit?: number } = {};
+      if (who.user) options.requestedBy = who.user.id;
+      if (page) options.page = canonicalPage(page);
+      if (limit) options.limit = limit;
+      const result = await app.queue.enqueue(urls, ALL_TIME, options);
       const discovery = page ? await recordDiscovery(app.pool, page, { found: urls.length, ...result, complete: body.complete === true }) : undefined;
-      console.log(`Captured ${urls.length} sets from ${page ? canonicalPage(page) : "a page"}: ${result.queued} new, ${result.alreadyCached} already in setscope.`);
+      console.log(`Captured ${urls.length} sets from ${page ? canonicalPage(page) : "a page"}${who.user ? ` for ${who.user.displayName}` : ""}: ${result.queued} new, ${result.alreadyCached} already in setscope.`);
       return sendJson(res, 200, { found: urls.length, ...result, discovery });
     }
     case "POST /api/capture-set": {
-      // A set page you opened yourself: no limit.
+      // A set page someone opened themselves: no limit from this computer; from a shared
+      // link it needs their capture key (and is rate-limited like other requests).
       requireOwnHeader(req);
-      const body = (await readJson(req, 10_000_000)) as { pageUrl?: unknown; html?: unknown };
+      const body = (await readJson(req, 10_000_000)) as { pageUrl?: unknown; html?: unknown; token?: unknown };
+      await captureUser(app, req, user, body.token);
       if (typeof body.pageUrl !== "string" || typeof body.html !== "string") throw new BadRequest("Expected { pageUrl: string, html: string }");
       const pageUrl = body.pageUrl.split("#")[0]!;
       if (!isFetchAllowed(pageUrl)) throw new BadRequest("Not a 1001Tracklists tracklist page");
@@ -705,8 +861,9 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       needUser("control the queue");
       return sendJson(res, 200, { retried: await app.queue.retryFailed() });
     case "POST /api/clear-queue":
+      // Everyone's waiting sets: the owner's call.
       requireOwnHeader(req);
-      needUser("control the queue");
+      await needOwner("clear everyone's queue");
       return sendJson(res, 200, await app.queue.clearQueue());
     case "POST /api/resume":
       requireOwnHeader(req);
@@ -789,6 +946,40 @@ function weightedShuffle<T extends { rank: number }>(items: T[], seed: number): 
     .map((x) => x.item);
 }
 
+function discoveryMode(params: URLSearchParams): DiscoveryMode {
+  const mode = (params.get("mode") ?? "now") as DiscoveryMode;
+  if (!MODES.includes(mode)) throw new BadRequest(`"mode" must be one of ${MODES.join(", ")}`);
+  return mode;
+}
+
+/** Period, genre, page and today for a discovery query; each mode has its own default period. */
+function discoveryParams(params: URLSearchParams, mode: DiscoveryMode): { mode: DiscoveryMode; period: Period; genre?: string; page: number; today: string } {
+  const fallback: Record<DiscoveryMode, Period> = { now: "month", most: "3months", deep: "year", intro: "year", closer: "year" };
+  const period = (params.get("period") || fallback[mode]) as Period;
+  if (!PERIODS.includes(period)) throw new BadRequest(`"period" must be one of ${PERIODS.join(", ")}`);
+  const out: { mode: DiscoveryMode; period: Period; genre?: string; page: number; today: string } = { mode, period, page: intParam(params, "page", 1), today: today() };
+  const genre = params.get("genre")?.trim();
+  if (genre) out.genre = genre;
+  return out;
+}
+
+/** The artist named by ?name= (an alias gives the artist it belongs to). */
+async function artistParam(app: App, params: URLSearchParams): Promise<number> {
+  const name = required(params, "name");
+  const id = await resolveArtist(app.pool, name);
+  if (id === undefined) throw new NotAllowed(`"${name}" isn't in the indexed sets yet.`, 404);
+  return id;
+}
+
+/** The 1001Tracklists pages a DJ's sets were gathered from (any of their names). */
+async function gatherPages(app: App, artistId: number, page: string | null): Promise<string[]> {
+  const r = await app.pool.query<{ page_url: string }>(
+    `select page_url from discovery_progress where artist_id = $1 or artist_id in (select artist_id from artist_aliases where canonical_id = $1)`,
+    [artistId],
+  );
+  return [...new Set([...r.rows.map((x) => x.page_url), ...(page ? [canonicalPage(page)] : [])])];
+}
+
 function chartParams(params: URLSearchParams): { period: Period; genre?: string; q?: string; page: number; today: string } {
   const period = (params.get("period") ?? "month") as Period;
   if (!PERIODS.includes(period)) throw new BadRequest(`"period" must be one of ${PERIODS.join(", ")}`);
@@ -802,6 +993,31 @@ function chartParams(params: URLSearchParams): { period: Period; genre?: string;
 
 function pageSizeParam(params: URLSearchParams, fallback: number): number {
   return Math.min(intParam(params, "size", fallback), 100);
+}
+
+/**
+ * Straight from this computer (not through a tunnel or proxy, which add forwarding
+ * headers): the person running setscope.
+ */
+function fromThisComputer(req: IncomingMessage): boolean {
+  const addr = req.socket.remoteAddress ?? "";
+  const loopback = addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+  return loopback && !req.headers["x-forwarded-for"] && !req.headers["cf-connecting-ip"] && !req.headers["forwarded"];
+}
+
+/**
+ * Who a capture is from. From this computer it's trusted as before (a key, if sent,
+ * says which account). From anywhere else a valid capture key is required, and the
+ * usual rate limit applies; the owner's key is trusted like this computer.
+ */
+async function captureUser(app: App, req: IncomingMessage, cookieUser: User | undefined, token: unknown): Promise<{ user?: User; trusted: boolean }> {
+  const entry = typeof token === "string" ? app.captureTokens.get(token) : undefined;
+  const tokenUser = entry && entry.expires > Date.now() ? await app.accounts.userById(entry.userId) : undefined;
+  const user = tokenUser ?? cookieUser;
+  if (fromThisComputer(req)) return user ? { user, trusted: true } : { trusted: true };
+  if (!user) throw new NotAllowed("Sign in on setscope (and reload the page) before gathering sets, so they're added under your account.", 401);
+  limitCaptures(app, req, user);
+  return { user, trusted: await app.accounts.isOwner(user.id) };
 }
 
 /** "Artist - Title" from ?song=. */
@@ -946,6 +1162,8 @@ if (import.meta.main) {
     const { imported } = await importLegacySets(catalog, dir);
     console.log(`Imported ${imported} sets.`);
   }
+  const recredited = await catalog.rebuildCreditsIfOutdated();
+  if (recredited) console.log(`Re-derived artist credits for ${recredited} tracks with the current rules.`);
   const reparsed = await catalog.reparseOutdated();
   if (reparsed) console.log(`Re-read ${reparsed} sets with the newer parser.`);
 

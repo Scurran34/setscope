@@ -32,11 +32,11 @@ async function isCaptureTab(tab) {
   return true;
 }
 
-async function sendToServer(server, message) {
+async function sendToServer(server, message, token) {
   const [path, payload] =
     message.type === "captureSet"
-      ? ["/api/capture-set", { pageUrl: message.pageUrl, html: message.html }]
-      : ["/api/capture", { pageUrl: message.pageUrl, urls: message.urls, complete: message.complete === true }];
+      ? ["/api/capture-set", { pageUrl: message.pageUrl, html: message.html, ...(token ? { token } : {}) }]
+      : ["/api/capture", { pageUrl: message.pageUrl, urls: message.urls, complete: message.complete === true, ...(message.limit ? { limit: message.limit } : {}), ...(token ? { token } : {}) }];
   const response = await fetch(`${server}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Setscope": "1" },
@@ -52,7 +52,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!tab) return false;
 
   if (message.type === "arm") {
-    const search = { query: message.query, kind: message.kind };
+    // limit: "gather the newest N sets" from setscope's DJ page (null: all of them).
+    const search = { query: message.query, kind: message.kind, limit: message.limit ?? null, token: message.token ?? null };
     // Send captures back to the same address the setscope page is open on.
     const server = new URL(sender.url ?? DEFAULT_SERVER).origin;
     chrome.storage.session.set({ armedAt: Date.now(), appTabId: tab.id, search, server }).then(() => sendResponse({ ok: true }));
@@ -70,7 +71,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     getState()
       .then(async (state) => {
         if (!state.captureTabs.includes(tab.id)) throw new Error("Not a setscope tab");
-        const result = await sendToServer(state.server, message);
+        const result = await sendToServer(state.server, message, state.search?.token ?? null);
         sendResponse({ ok: true, result });
         // Give the "sent" banner a moment, then close and return to setscope.
         setTimeout(async () => {

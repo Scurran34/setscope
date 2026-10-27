@@ -185,11 +185,22 @@ interface ScGlobal {
   Widget: ((iframe: HTMLIFrameElement) => ScWidget) & { Events: Record<string, string> };
 }
 
+/** A soundcloud.com link without the tracking parameters SoundCloud's API adds (?utm_...). */
+export function cleanSoundCloudUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.hostname === "soundcloud.com" || u.hostname === "www.soundcloud.com") return `https://soundcloud.com${u.pathname.replace(/\/$/, "")}`;
+  } catch {
+    // not a URL: leave it to the widget
+  }
+  return url;
+}
+
 /** Embed options: small and quiet; no buy/share/download buttons. */
 const EMBED_OPTIONS = { show_artwork: false, buying: false, sharing: false, download: false, show_comments: false, show_playcount: false, color: "#5b4bd6" };
 
 export class SoundCloudProvider implements PlaybackProvider {
-  private readonly iframe: HTMLIFrameElement;
+  private iframe: HTMLIFrameElement;
   private readonly events: ProviderEvents;
   private widget: ScWidget | undefined;
 
@@ -204,15 +215,17 @@ export class SoundCloudProvider implements PlaybackProvider {
       this.events.error("SoundCloud's player couldn't load (check your connection or content blocker).");
       return;
     }
-    if (!this.widget) {
-      const params = new URLSearchParams({ url: item.source, auto_play: String(autoplay), ...Object.fromEntries(Object.entries(EMBED_OPTIONS).map(([k, v]) => [k, String(v)])) });
-      this.iframe.src = `https://w.soundcloud.com/player/?${params}`;
-      this.widget = sc.Widget(this.iframe);
-      this.bindEvents(sc);
-    } else {
-      // Same widget, new sound: existing event listeners keep working.
-      this.widget.load(item.source, { ...EMBED_OPTIONS, auto_play: autoplay });
-    }
+    const url = cleanSoundCloudUrl(item.source);
+    // Every sound gets a fresh embed (a new frame in the same place, same id). Reusing one
+    // with widget.load() left every sound after the first stuck on "Loading…": the widget
+    // stopped reporting READY (or the load callback) after its first sound.
+    const fresh = this.iframe.cloneNode(false) as HTMLIFrameElement;
+    const params = new URLSearchParams({ url, auto_play: String(autoplay), ...Object.fromEntries(Object.entries(EMBED_OPTIONS).map(([k, v]) => [k, String(v)])) });
+    fresh.src = `https://w.soundcloud.com/player/?${params}`;
+    this.iframe.replaceWith(fresh);
+    this.iframe = fresh;
+    this.widget = sc.Widget(fresh);
+    this.bindEvents(sc);
   }
 
   play(): void {
@@ -231,30 +244,37 @@ export class SoundCloudProvider implements PlaybackProvider {
     this.widget?.setVolume(volume);
   }
 
+  /** The sound is loaded: tell the player its length and who uploaded it. */
+  private reportReady(): void {
+    const widget = this.widget;
+    if (!widget) return;
+    widget.getDuration((duration) => {
+      widget.getCurrentSound((sound) => {
+        const info: { duration: number; sound?: SoundInfo } = { duration };
+        if (sound) {
+          const s: SoundInfo = { title: sound.title ?? "", uploader: sound.user?.username ?? "" };
+          if (sound.user?.permalink_url) s.uploaderUrl = sound.user.permalink_url;
+          if (sound.permalink_url) s.permalink = cleanSoundCloudUrl(sound.permalink_url);
+          const art = sound.artwork_url ?? sound.user?.avatar_url;
+          if (art) s.artwork = art;
+          info.sound = s;
+        }
+        this.events.ready(info);
+      });
+    });
+  }
+
   private bindEvents(sc: ScGlobal): void {
     const widget = this.widget!;
     const E = sc.Widget.Events;
-    widget.bind(E.READY!, () => {
-      widget.getDuration((duration) => {
-        widget.getCurrentSound((sound) => {
-          const info: { duration: number; sound?: SoundInfo } = { duration };
-          if (sound) {
-            const s: SoundInfo = { title: sound.title ?? "", uploader: sound.user?.username ?? "" };
-            if (sound.user?.permalink_url) s.uploaderUrl = sound.user.permalink_url;
-            if (sound.permalink_url) s.permalink = sound.permalink_url;
-            const art = sound.artwork_url ?? sound.user?.avatar_url;
-            if (art) s.artwork = art;
-            info.sound = s;
-          }
-          this.events.ready(info);
-        });
-      });
-    });
-    widget.bind(E.PLAY!, () => this.events.play());
-    widget.bind(E.PAUSE!, () => this.events.pause());
-    widget.bind(E.FINISH!, () => this.events.finish());
-    widget.bind(E.PLAY_PROGRESS!, (data) => this.events.progress(data?.currentPosition ?? 0));
-    widget.bind(E.ERROR!, () => this.events.error("SoundCloud can't play this here (it may be private, removed, or not allowed to be embedded)."));
+    // Events from an embed that has since been replaced are ignored.
+    const current = () => this.widget === widget;
+    widget.bind(E.READY!, () => current() && this.reportReady());
+    widget.bind(E.PLAY!, () => current() && this.events.play());
+    widget.bind(E.PAUSE!, () => current() && this.events.pause());
+    widget.bind(E.FINISH!, () => current() && this.events.finish());
+    widget.bind(E.PLAY_PROGRESS!, (data) => current() && this.events.progress(data?.currentPosition ?? 0));
+    widget.bind(E.ERROR!, () => current() && this.events.error("SoundCloud can't play this here (it may be private, removed, or not allowed to be embedded)."));
   }
 }
 
@@ -308,7 +328,9 @@ export function mountPlayerBar(core: PlayerCore, root: HTMLElement, scFrame: HTM
   core.subscribe((s) => {
     root.hidden = s.status === "empty";
     if (s.status !== "empty") root.classList.remove("pl-collapsed");
-    scFrame.hidden = s.status === "empty";
+    // The provider swaps in a fresh frame for each sound (same id), so look it up each time.
+    const frame = (scFrame.id && document.getElementById(scFrame.id)) || scFrame;
+    frame.hidden = s.status === "empty";
     const playing = s.status === "playing";
     toggle.textContent = playing ? "❚❚" : "▶";
     toggle.setAttribute("aria-label", playing ? "Pause" : "Play");

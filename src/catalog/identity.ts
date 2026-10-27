@@ -58,6 +58,64 @@ export function versionOf(title: string): { type: VersionType; artists?: string;
   return { type: "original", base: title };
 }
 
+export type CreditRole = "main" | "featured" | "remixer" | "mashup_component";
+
+/** Someone credited on a recording, and how. */
+export interface Credit {
+  name: string;
+  role: CreditRole;
+}
+
+const FEATURING = /\s(?:ft\.?|feat\.?|featuring)\s/i;
+const VS = /\svs\.?\s/i;
+
+/**
+ * Who made this recording, from how the tracklist line is written:
+ *   "A & B - Title"                    A, B: main
+ *   "A ft. B - Title"                  A: main, B: featured (vocalists are written this way too)
+ *   "A - Title (C Remix)"              C: remixer (also edits, bootlegs, reworks, VIPs)
+ *   "A vs. B - X vs. Y (C Edit)"       A, B: mashup_component (their songs are in it), C: remixer
+ *   "A vs. B - Title"                  a collaboration: A, B main (a mashup has "vs." in the title too)
+ * The source doesn't say who was sampled or who sang when it isn't marked "ft.", so
+ * those roles are never guessed.
+ */
+export function credits(track: Track, oneAct: string[] = []): Credit[] {
+  const version = versionOf(track.title);
+  const mashup = version.type === "mashup" || VS.test(version.base);
+  // Names like "Cause & Affect" are one act when 1001Tracklists gives them their own
+  // page (passed in as `oneAct`, plus any linked as one name on this line): don't split those.
+  const whole = [...new Set([...oneAct, ...Object.keys(track.artistPages ?? {})])].filter((n) => /\s(?:&|x|vs\.?|pres\.?|\/)\s|,\s/i.test(n));
+  const split = (text: string) => splitKeeping(text, whole);
+  const ftAt = track.artist.search(FEATURING);
+  const lead = split(ftAt === -1 ? track.artist : track.artist.slice(0, ftAt));
+  const featured = ftAt === -1 ? [] : split(track.artist.slice(ftAt).replace(/^\s*(?:ft\.?|feat\.?|featuring)\s/i, ""));
+  const out: Credit[] = [];
+  const seen = new Set<string>();
+  const add = (name: string, role: CreditRole) => {
+    const key = normalizeName(name);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({ name, role });
+  };
+  for (const name of lead) add(name, mashup ? "mashup_component" : "main");
+  for (const name of featured) add(name, mashup ? "mashup_component" : "featured");
+  if (version.artists) for (const name of split(version.artists)) add(name, "remixer");
+  return out;
+}
+
+/** splitArtists, but names in `whole` stay in one piece. */
+function splitKeeping(text: string, whole: string[]): string[] {
+  let marked = text;
+  const kept: string[] = [];
+  for (const name of [...whole].sort((a, b) => b.length - a.length)) {
+    const at = marked.toLowerCase().indexOf(name.toLowerCase());
+    if (at === -1) continue;
+    kept.push(marked.slice(at, at + name.length));
+    marked = `${marked.slice(0, at)}\u0000${kept.length - 1}\u0000${marked.slice(at + name.length)}`;
+  }
+  return splitArtists(marked).map((part) => part.replace(/\u0000(\d+)\u0000/g, (_, i: string) => kept[Number(i)]!));
+}
+
 export function identify(track: Track): TrackIdentity {
   const mainArtists = splitArtists(track.artist);
   const version = versionOf(track.title);

@@ -32,7 +32,8 @@ import { mountPlayerBar, PlayerCore, SoundCloudProvider, type Playable } from ".
 type Mode = "song" | "artist";
 
 type Route =
-  | { page: "home" }
+  | { page: "home"; params: URLSearchParams }
+  | { page: "djs"; params: URLSearchParams }
   | { page: "trending" }
   | { page: "account" }
   | { page: "library" }
@@ -41,7 +42,8 @@ type Route =
   | { page: "sets"; params: URLSearchParams }
   | { page: "set"; id: string }
   | { page: "find"; query: string }
-  | { page: "artist"; name: string; exact: boolean }
+  | { page: "artist"; name: string; exact: boolean; params: URLSearchParams }
+  | { page: "artistStats"; name: string; exact: boolean }
   | { page: "song"; artist: string; song: string }
   | { page: "search"; query: string; exact: boolean }
   | { page: "playlist"; name: string }
@@ -58,6 +60,8 @@ interface Status {
 interface Me {
   likes: string[];
   categories: { name: string; songs: string[] }[];
+  /** How many DJs you follow (Discover starts with them when you follow any). */
+  following?: number;
 }
 
 type ArtistPage = ArtistReport & { profile: ArtistProfile; discovery?: DiscoveryRecord };
@@ -72,7 +76,7 @@ const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as 
 const maybe = <T extends HTMLElement>(id: string) => document.getElementById(id) as T | null;
 
 let mode: Mode = "song";
-let route: Route = { page: "home" };
+let route: Route = { page: "home", params: new URLSearchParams() };
 let me: Me = { likes: [], categories: [] };
 
 /** Who's signed in, and whether sign-up is open, invite-only or closed. */
@@ -239,8 +243,9 @@ function markPlaying(button: Element): void {
   else button.textContent = on ? (state.status === "loading" ? "Loading…" : "❚❚ Pause") : "▶ Play";
 }
 
-// Keep every play button on the page in step with the player.
-player.subscribe(() => {
+// Keep every play button on the page in step with the player (and spin the logo's record).
+player.subscribe((state) => {
+  document.body.classList.toggle("is-playing", state.status === "playing");
   for (const button of document.querySelectorAll(".play-btn")) markPlaying(button);
 });
 
@@ -314,6 +319,7 @@ async function loadMe(): Promise<void> {
     // keep what we had
   }
   $("meName").textContent = auth.user ? auth.user.displayName : "Sign in";
+  void refreshCaptureKey();
   $("meDot").textContent = auth.user ? (auth.user.displayName.match(/[A-Za-z0-9]/)?.[0] ?? "?").toUpperCase() : "?";
 }
 
@@ -334,21 +340,39 @@ function parseRoute(hash: string): Route {
   if (first === "set" && second) return { page: "set", id: second };
   if (first === "find" && second) return { page: "find", query: second };
   if (first === "artist" && second && third === "song" && fourth) return { page: "song", artist: second, song: fourth };
-  if (first === "artist" && second) return { page: "artist", name: second, exact: third === "exact" };
+  if (first === "artist" && second && third === "stats") return { page: "artistStats", name: second, exact: fourth === "exact" };
+  if (first === "artist" && second) return { page: "artist", name: second, exact: third === "exact", params };
+  if (first === "djs") return { page: "djs", params };
   if (first === "song" && second) return { page: "search", query: second, exact: third === "exact" };
   // Playlists were called categories before; old links still work.
   if ((first === "playlist" || first === "category") && second) return { page: "playlist", name: second };
   if (first === "discover") return second ? { page: "discover", params, profile: second } : { page: "discover", params };
-  return { page: "home" };
+  return { page: "home", params };
 }
 
 /** Show whatever page the address names. */
+/** The last address shown, to tell "next page" from "a different page". */
+let lastHash = "";
+
+/** "#/djs?q=x&page=2" -> ["#/djs", "q=x"]: the page, and its filters without the page number. */
+function splitHash(hash: string): [string, string] {
+  const [path = "", query = ""] = hash.split("?");
+  const params = new URLSearchParams(query);
+  params.delete("page");
+  return [path || "#/", params.toString()];
+}
+
 async function showRoute(): Promise<void> {
   hideSuggest();
+  const [prevPath, prevFilters] = splitHash(lastHash);
+  const [path, filters] = splitHash(location.hash);
+  const samePage = lastHash !== "" && prevPath === path;
+  const keepY = window.scrollY;
+  lastHash = location.hash;
   route = parseRoute(location.hash);
   const NAV: Partial<Record<Route["page"], string>> = {
-    home: "home", songs: "songs", trending: "songs", song: "songs", search: "songs", artists: "artists", artist: "artists",
-    sets: "sets", set: "sets", library: "library", playlist: "library", account: "account", discover: "discover",
+    home: "home", djs: "djs", artist: "djs", artistStats: "djs", artists: "djs",
+    library: "library", playlist: "library", account: "account",
   };
   const nav = NAV[route.page] ?? "";
   for (const a of document.querySelectorAll<HTMLAnchorElement>("[data-nav]")) a.classList.toggle("active", a.dataset.nav === nav);
@@ -358,7 +382,14 @@ async function showRoute(): Promise<void> {
   $("formError").hidden = true;
   await loadMe();
   await render();
-  window.scrollTo({ top: 0 });
+  if (samePage && filters === prevFilters) {
+    // Next/previous page of a list: land at the top of that list, not the top of the site.
+    const list = document.querySelector<HTMLElement>("#view [data-list]") ?? document.querySelector<HTMLElement>("#view .filters");
+    if (list) window.scrollTo({ top: Math.max(0, list.getBoundingClientRect().top + window.scrollY - 80) });
+  } else if (samePage) {
+    // A filter changed on the same page: stay where you were.
+    window.scrollTo({ top: keepY });
+  } else window.scrollTo({ top: 0 });
 }
 
 /** Draw the current page from fresh data. */
@@ -367,12 +398,16 @@ async function render(): Promise<void> {
   try {
     switch (route.page) {
       case "home":
-        return show(await homePage());
+        return show(await discoverHome(route.params));
+      case "djs":
+        return show(await djsPage(route.params));
       case "trending":
         return show(await trendingPage());
       case "account":
         return show(await accountPage());
       case "artist":
+        return show(await djPage(route.name, route.params));
+      case "artistStats":
         return show(await artistPage(route.name, route.exact));
       case "song":
         return show(await songPage(route.song, route.artist, true));
@@ -912,130 +947,639 @@ function mosaic(images: string[]): HTMLElement {
   return el("div", { class: `mosaic${shown.length === 1 ? " one" : ""}` }, ...shown.map((src) => el("img", { src, alt: "", loading: "lazy", referrerpolicy: "no-referrer" })));
 }
 
-// ---- Home ----
+// ---- Discover: what DJs are playing ----
 
-async function homePage(): Promise<HTMLElement> {
-  const heroInput = el("input", { type: "text", placeholder: "Search artists, songs, or sets…", "aria-label": "Search" }) as HTMLInputElement;
-  const heroForm = el("form", { class: "hero-search", role: "search" }, heroInput, el("button", { type: "submit", class: "primary" }, "Search"));
-  heroForm.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const text = heroInput.value.trim();
-    if (text) location.hash = `#/find/${enc(text)}`;
-  });
-  const hero = el(
-    "section",
-    { class: "hero" },
-    el("h1", {}, "Discover what's being played now."),
-    el("p", {}, `The songs DJs keep reaching for, the artists behind them, and full tracklists, from ${plural(lastStatus?.sets ?? 0, "indexed DJ set")}.`),
-    heroForm,
-    el(
-      "div",
-      { class: "entry" },
-      el("a", { href: "#/songs?period=week" }, "Top songs this week"),
-      el("a", { href: "#/trending" }, "Rising"),
-      el("a", { href: "#/artists" }, "Artists"),
-      el("a", { href: "#/sets" }, "Latest sets"),
-      el("a", { href: "#/discover" }, "Explore SoundCloud"),
-    ),
-  );
+type DiscoveryMode = "now" | "most" | "deep" | "intro" | "closer";
+const ALL_MODES: DiscoveryMode[] = ["now", "most", "deep", "intro", "closer"];
+const MAIN_MODES: DiscoveryMode[] = ["now", "most", "deep"];
 
-  // Trending songs, with its own time and genre filters.
-  const songsCard = loading(el("section", { class: "card" }), "Trending Songs");
-  let period: Period = "week";
-  let genre = "";
-  const drawSongs = async () => {
-    try {
-      const r = await getJson<Paged<SongRow>>(`/api/charts/songs?period=${period}&genre=${enc(genre)}&size=6`);
-      const filters = el("div", { class: "filters" }, periodTabs(period, (p) => ((period = p), void drawSongs())), await genreSelect(genre, (g) => ((genre = g), void drawSongs())));
-      songsCard.replaceChildren(
-        sectionHead("Trending Songs", listHash("songs", new URLSearchParams(), { period, genre })),
-        filters,
-        r.items.length ? songsTable(r.items, { compact: true }) : el("p", { class: "empty" }, `No indexed sets ${period === "all" ? "yet" : `in the last ${PERIOD_WORDS[period]}`}.`),
-      );
-    } catch (e) {
-      failed(songsCard, "Trending Songs", e);
+interface DiscoveryRow {
+  rank: number;
+  song: string;
+  artist: string;
+  title: string;
+  genre: string | null;
+  image: string | null;
+  soundcloud: string | null;
+  sets: number;
+  djs: number;
+  supporters: string[];
+  lastPlayed: string | null;
+  catalogSets: number;
+  /** Intros / 90 + 5: sets it was played in at all, and the share that were openers/closers. */
+  allSets?: number;
+  share?: number;
+}
+
+interface DiscoveryResult extends Paged<DiscoveryRow> {
+  mode: DiscoveryMode;
+  coverage: { sets: number; djs: number; from: string | null; to: string | null; catalogSets: number };
+  notice: string | null;
+  scope?: string;
+}
+
+const MODE_INFO: Record<DiscoveryMode, { label: string; blurb: string; how: string; period: Period }> = {
+  now: {
+    label: "Playing Now",
+    blurb: "Other artists' tracks in these DJs' latest sets",
+    how: "Each set a track was played in counts, weighted by how recent the set is: a set's weight halves every 14 days. Ties go to more sets, then more DJs.",
+    period: "month",
+  },
+  most: {
+    label: "Most Played",
+    blurb: "The tracks they keep coming back to",
+    how: "The number of different sets that played the track (a track played twice in one set counts once). Ties go to more DJs, then the most recently played.",
+    period: "3months",
+  },
+  deep: {
+    label: "Deep Cuts",
+    blurb: "Rarer tracks these DJs genuinely back",
+    how: "Played by at least 2 of these DJs (or in 2+ sets by one DJ), but in no more than 2% of all indexed sets. Ranked by how many of these DJs play it, then by how much of its play comes from them.",
+    period: "year",
+  },
+  intro: {
+    label: "Intros",
+    blurb: "What DJs open their sets with",
+    how: "Tracks in the first two lines of sets with at least 10 tracks listed. A track needs 2+ such sets (by 2+ DJs when you're looking at several), and at least 20% of its plays by these DJs have to be openers, so a hit that happens to start one set isn't an intro. Ranked by DJs, then sets.",
+    period: "year",
+  },
+  closer: {
+    label: "90 + 5",
+    blurb: "The closers DJs love to finish on",
+    how: "Tracks in the last two lines of sets with at least 10 tracks listed. A track needs 2+ such sets (by 2+ DJs when you're looking at several), and at least 20% of its plays by these DJs have to be closers, so a hit that happens to end one set isn't a closer. Ranked by DJs, then sets.",
+    period: "year",
+  },
+};
+
+/** ♡ that likes a song without leaving the page. */
+function likeIcon(song: string): HTMLElement {
+  let liked = me.likes.includes(song);
+  const b = el("button", { type: "button", class: liked ? "icon-btn on" : "icon-btn", title: liked ? "Unlike" : "Like", "aria-pressed": String(liked), "aria-label": `Like ${song}` }, liked ? "♥" : "♡");
+  b.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    if (!auth.user) {
+      location.hash = "#/account";
+      return;
     }
+    liked = !liked;
+    try {
+      await post("/api/like", { song, liked });
+      b.className = liked ? "icon-btn on" : "icon-btn";
+      b.textContent = liked ? "♥" : "♡";
+      b.setAttribute("aria-pressed", String(liked));
+      await loadMe();
+    } catch (e) {
+      liked = !liked;
+      toast((e as Error).message);
+    }
+  });
+  return b;
+}
+
+/** "2026-10-26" -> "Oct 26" (with the year when it isn't this year). */
+function shortDate(date: string | null): string {
+  if (!date) return "?";
+  const d = new Date(`${date}T12:00:00`);
+  return d.toLocaleDateString([], { month: "short", day: "numeric", ...(d.getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" }) });
+}
+
+/** One ranked list of third-party tracks: click a title for its page; ♡, ＋ and ▶ stay put. */
+function discoveryList(r: DiscoveryResult, hrefFor: (page: number) => string): HTMLElement {
+  if (!r.items.length) {
+    return el(
+      "div",
+      { class: "empty" },
+      r.mode === "deep" ? "No Deep Cuts here yet: they need at least two of these DJs (or one DJ in two sets) playing a rarer track. Try a longer period."
+      : r.mode === "intro" || r.mode === "closer" ? `No ${r.mode === "intro" ? "openers" : "closers"} stand out yet: a track needs to ${r.mode === "intro" ? "open" : "close"} 2+ sets. Try a longer period, or gather more sets.`
+      : "Nothing played in this period by these DJs. Try a longer period, or gather more of their sets.",
+    );
+  }
+  const rows = r.items.map((t) => {
+    const metric =
+      r.mode === "intro" || r.mode === "closer"
+        ? `${r.mode === "intro" ? "Opened" : "Closed"} ${plural(t.sets, "set")} · ${plural(t.djs, "DJ")} · ${Math.round((t.share ?? 0) * 100)}% of its plays`
+      : r.mode === "deep" ? `${plural(t.djs, "DJ")} · in ${t.catalogSets} of ${t.catalogSets === 1 ? "1" : r.coverage.catalogSets} indexed sets`
+      : r.mode === "now" ? `${plural(t.sets, "set")} · last ${shortDate(t.lastPlayed)}`
+      : `${plural(t.sets, "set")} · ${plural(t.djs, "DJ")}`;
+    const more = t.djs > t.supporters.length ? ` +${t.djs - t.supporters.length}` : "";
+    return el(
+      "li",
+      { class: "disc-row" },
+      el("span", { class: "rank" }, String(t.rank)),
+      songArt(t.song, t.image, t.soundcloud),
+      el(
+        "div",
+        { class: "disc-main" },
+        el("a", { class: "disc-title", href: songHash(t.song) }, t.title),
+        el("div", { class: "who small" }, ...joined(artistsOf(t.song).map(artistLink), ", ")),
+        t.supporters.length ? el("div", { class: "supporters small" }, "Played by ", ...joined(t.supporters.map(artistLink), ", "), more) : "",
+      ),
+      el("div", { class: "disc-metric small muted" }, metric, t.genre ? el("div", {}, t.genre) : ""),
+      el("div", { class: "btns", style: "flex-wrap:nowrap" }, likeIcon(t.song), addToPlaylistButton(t.song), songPlayButton(t.song, t.soundcloud)),
+    );
+  });
+  return el("div", {}, el("ol", { class: "disc-list" }, ...rows), pager(r, hrefFor));
+}
+
+function coverageLine(r: DiscoveryResult): HTMLElement {
+  const c = r.coverage;
+  const range = c.from && c.to ? ` performed ${c.from} to ${c.to}` : "";
+  return el(
+    "p",
+    { class: "footnote" },
+    `Based on ${plural(c.sets, "indexed set")} from ${plural(c.djs, "DJ")}${range}, out of ${c.catalogSets} sets indexed by Rabbithole. `,
+    "A track counts only when none of the set's DJs made it (as artist, featured artist, remixer or mashup source). This shows what DJs played, not why: it can't tell organic support from promotion.",
+  );
+}
+
+/** All DJs / DJs I follow / Choose DJs (with a picker for the custom list). */
+function scopeControls(params: URLSearchParams, to: (changes: Record<string, string | null>) => void): HTMLElement {
+  const scope = params.get("scope") ?? (auth.user && me.following ? "followed" : "all");
+  const picked = (params.get("djs") ?? "").split(",").map((n) => n.trim()).filter(Boolean);
+  const pills = el(
+    "div",
+    { class: "tabs", role: "group", "aria-label": "Which DJs" },
+    ...(
+      [
+        ["all", "All DJs"],
+        ["followed", "DJs I follow"],
+        ["custom", "Choose DJs"],
+      ] as const
+    ).map(([value, label]) => {
+      const b = el("button", { type: "button", class: scope === value ? "on" : "", "aria-pressed": String(scope === value) }, label);
+      b.addEventListener("click", () => to({ scope: value }));
+      return b;
+    }),
+  );
+  if (scope !== "custom") return pills;
+  const chipsBox = el(
+    "div",
+    { class: "chips" },
+    ...picked.map((name) => {
+      const x = el("button", { type: "button", class: "chip-x", title: `Remove ${name}` }, "×");
+      x.addEventListener("click", () => to({ djs: picked.filter((n) => n !== name).join(",") || null }));
+      return el("span", { class: "chip" }, name, x);
+    }),
+  );
+  const input = el("input", { type: "search", placeholder: "Add a DJ…", list: "djPick", class: "small-input", "aria-label": "Add a DJ" }) as HTMLInputElement;
+  const options = el("datalist", { id: "djPick" });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const q = input.value.trim();
+      if (q.length < 2) return;
+      const r = await getJson<Paged<DjRow>>(`/api/djs?q=${enc(q)}&size=8`).catch(() => undefined);
+      options.replaceChildren(...(r?.items ?? []).map((d) => el("option", { value: d.name })));
+    }, 150);
+  });
+  const form = el("form", {}, input, options);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const name = input.value.trim();
+    if (name && !picked.includes(name)) to({ djs: [...picked, name].join(",") });
+  });
+  return el("div", { class: "stack-tight" }, pills, el("div", { class: "row", style: "justify-content:flex-start" }, chipsBox, form));
+}
+
+/**
+ * DJ photos rotating behind the hero's right side (every 6 s, with dots): DJs you follow
+ * when you follow some, otherwise the most-indexed DJs who have a photo.
+ */
+function heroSlides(): HTMLElement {
+  const box = el("div", { class: "hero-slides", "aria-hidden": "false" });
+  void (async () => {
+    const pick = async (path: string) => (await getJson<Paged<DjRow>>(path).catch(() => undefined))?.items.filter((d) => d.image) ?? [];
+    let djs = auth.user && me.following ? await pick("/api/djs?following=1&size=40") : [];
+    if (djs.length < 3) djs = [...djs, ...(await pick("/api/djs?size=40"))].filter((d, i, all) => all.findIndex((x) => x.name === d.name) === i);
+    djs = djs.slice(0, 8);
+    if (!djs.length) return;
+    let at = 0;
+    const slides = djs.map((d, i) => {
+      const img = el("img", { src: d.image!, alt: "", loading: i === 0 ? "eager" : "lazy", referrerpolicy: "no-referrer" });
+      img.addEventListener("error", () => slide.remove());
+      const slide = el("div", { class: i === 0 ? "slide on" : "slide" }, img);
+      return slide;
+    });
+    const caption = el("a", { class: "slide-caption" });
+    const dots = el("div", { class: "dots" });
+    const showSlide = (i: number) => {
+      at = (i + djs.length) % djs.length;
+      slides.forEach((s, n) => s.classList.toggle("on", n === at));
+      const d = djs[at]!;
+      caption.setAttribute("href", artistHash(d.name));
+      caption.replaceChildren(el("b", {}, d.name), el("span", {}, ` · ${plural(d.sets, "set")} indexed`));
+      for (const [n, dot] of [...dots.children].entries()) dot.classList.toggle("on", n === at);
+    };
+    dots.append(
+      ...djs.map((d, i) => {
+        const dot = el("button", { type: "button", "aria-label": `Show ${d.name}` });
+        dot.addEventListener("click", () => showSlide(i));
+        return dot;
+      }),
+    );
+    box.append(...slides, caption, djs.length > 1 ? dots : "");
+    showSlide(0);
+    const timer = setInterval(() => {
+      if (!box.isConnected) return clearInterval(timer);
+      if (!box.matches(":hover") && document.visibilityState === "visible") showSlide(at + 1);
+    }, 6000);
+  })();
+  return box;
+}
+
+/** Mode cards: the three ways to look, each saying what it means, plus the set moments (Intros, 90 + 5). */
+function modeTabs(mode: DiscoveryMode, pick: (m: DiscoveryMode) => void): HTMLElement {
+  const tab = (m: DiscoveryMode, cls: string) => {
+    const b = el("button", { type: "button", role: "tab", class: m === mode ? `${cls} on` : cls, "aria-selected": String(m === mode) }, el("b", {}, MODE_INFO[m].label), el("span", {}, MODE_INFO[m].blurb));
+    b.addEventListener("click", () => pick(m));
+    return b;
   };
+  return el(
+    "div",
+    { role: "tablist" },
+    el("div", { class: "modes" }, ...MAIN_MODES.map((m) => tab(m, "mode"))),
+    el("div", { class: "moments" }, el("span", { class: "moments-label" }, "Set moments"), tab("intro", "moment"), tab("closer", "moment")),
+  );
+}
 
-  const artistsCard = loading(el("section", { class: "card" }), "Trending Artists");
-  const exploreCard = loading(el("section", { class: "card" }), "Popular Artists to Explore");
-  const setsSection = loading(el("section", { class: "card" }), "Recent DJ Sets");
-  const youCard = loading(el("section", { class: "card" }), "Your Music");
-  const vaultCard = vaultSpot();
+/** A small top-5 card for Intros or 90 + 5, with the same DJs and genre as the page. */
+function momentPreview(mode: "intro" | "closer", base: URLSearchParams, seeAll: string): HTMLElement {
+  const card = el("section", { class: "card moment-card" }, el("h2", {}, MODE_INFO[mode].label), el("p", { class: "muted small" }, "Loading…"));
+  const query = new URLSearchParams(base);
+  query.set("mode", mode);
+  query.set("period", "year");
+  query.set("page", "1");
+  query.set("size", "5");
+  void getJson<DiscoveryResult>(`/api/discovery?${query}`)
+    .then((r) =>
+      card.replaceChildren(
+        el("div", { class: "section-head" }, el("div", {}, el("h2", {}, MODE_INFO[mode].label), el("div", { class: "small muted" }, MODE_INFO[mode].blurb)), el("a", { class: "see-all", href: seeAll }, "See all →")),
+        r.items.length
+          ? el(
+              "ol",
+              { class: "disc-list compact" },
+              ...r.items.map((t) =>
+                el(
+                  "li",
+                  { class: "disc-row" },
+                  songArt(t.song, t.image, t.soundcloud, "small"),
+                  el("div", { class: "disc-main" }, el("a", { class: "disc-title", href: songHash(t.song) }, t.title), el("div", { class: "who small muted" }, `${t.artist} · ${mode === "intro" ? "opened" : "closed"} ${plural(t.sets, "set")} by ${plural(t.djs, "DJ")}`)),
+                ),
+              ),
+            )
+          : el("p", { class: "muted small" }, `Nothing stands out yet over the last 12 months.`),
+      ),
+    )
+    .catch((e) => failed(card, MODE_INFO[mode].label, e));
+  return card;
+}
 
-  void drawSongs();
-  void getJson<Paged<ArtistRow>>("/api/charts/artists?period=week&size=5")
-    .then((r) => artistsCard.replaceChildren(sectionHead("Trending Artists", "#/artists?period=week"), r.items.length ? peopleList(r.items) : el("p", { class: "empty" }, "No sets this week yet.")))
-    .catch((e) => failed(artistsCard, "Trending Artists", e));
-  void getJson<Paged<ArtistRow>>("/api/charts/artists?period=3months&photo=1&size=8")
-    .then((r) => exploreCard.replaceChildren(sectionHead("Popular Artists to Explore", "#/artists?period=3months"), circles(r.items)))
-    .catch((e) => failed(exploreCard, "Popular Artists to Explore", e));
-  void getJson<Paged<SetCard>>("/api/sets?size=8")
-    .then((r) => setsSection.replaceChildren(sectionHead("Recent DJ Sets", "#/sets"), el("div", { class: "set-grid" }, ...r.items.map(setCardEl))))
-    .catch((e) => failed(setsSection, "Recent DJ Sets", e));
-  fillYourMusic(youCard);
+async function discoverHome(params: URLSearchParams): Promise<HTMLElement> {
+  const mode = (ALL_MODES.includes(params.get("mode") as DiscoveryMode) ? params.get("mode") : "now") as DiscoveryMode;
+  const period = (params.get("period") ?? MODE_INFO[mode].period) as Period;
+  const genre = params.get("genre") ?? "";
+  const to = (changes: Record<string, string | null>) => (location.hash = listHash("", params, changes));
+  const scopeParam = params.get("scope") ?? (auth.user && me.following ? "followed" : "all");
+  const query = new URLSearchParams({ mode, period, page: params.get("page") ?? "1", scope: scopeParam });
+  if (genre) query.set("genre", genre);
+  if (params.get("djs")) query.set("djs", params.get("djs")!);
 
-  const scCard = el(
+  const results = el("section", { class: "card", "data-list": "" }, el("p", { class: "muted small" }, "Loading…"));
+  const head = el(
+    "section",
+    { class: "hero hero-compact" },
+    heroSlides(),
+    el("div", { class: "kicker" }, "DJ-supported music discovery"),
+    el("h1", {}, "Streams can be bought. Genuine DJ support is harder to manufacture."),
+    el("p", {}, "Rabbithole shows which tracks DJs actually play in their sets, made by other artists, so you can find what the DJs you trust are supporting."),
+  );
+  const controls = el(
     "section",
     { class: "card" },
-    sectionHead("Discover on SoundCloud"),
-    el(
-      "p",
-      { class: "muted small" },
-      auth.soundcloud
-        ? "Browse what a DJ, label or friend has liked on SoundCloud, or open any song to find its SoundCloud upload and remixes."
-        : "Once SoundCloud is connected (Account), you can browse curators' likes and find songs' uploads and remixes here.",
-    ),
-    el("div", { class: "btns" }, el("a", { class: "act-link", href: "#/discover" }, "Explore curators' likes →")),
+    modeTabs(mode, (m) => to({ mode: m, period: null })),
+    el("div", { class: "filters", style: "margin-top:14px" }, scopeControls(params, to)),
+    el("div", { class: "filters" }, periodTabs(period, (p) => to({ period: p })), await genreSelect(genre, (g) => to({ genre: g }))),
   );
+  void getJson<DiscoveryResult>(`/api/discovery?${query}`)
+    .then((r) => {
+      results.replaceChildren(
+        el("div", { class: "section-head" }, el("h2", {}, MODE_INFO[mode].label), el("span", { class: "small muted" }, `${plural(r.total, "track")}`)),
+        r.notice ? el("p", { class: "notice small" }, r.notice) : "",
+        discoveryList(r, (n) => listHash("", params, { page: String(n) })),
+        el("details", { class: "small how" }, el("summary", {}, "How this is ranked"), el("p", {}, MODE_INFO[mode].how)),
+        coverageLine(r),
+      );
+    })
+    .catch((e) => failed(results, MODE_INFO[mode].label, e));
+  const scopeOnly = new URLSearchParams({ scope: scopeParam });
+  if (genre) scopeOnly.set("genre", genre);
+  if (params.get("djs")) scopeOnly.set("djs", params.get("djs")!);
+  const moments = MAIN_MODES.includes(mode)
+    ? el(
+        "div",
+        { class: "grid" },
+        momentPreview("intro", scopeOnly, listHash("", params, { mode: "intro", period: null, page: null })),
+        momentPreview("closer", scopeOnly, listHash("", params, { mode: "closer", period: null, page: null })),
+      )
+    : "";
+  return el("div", { class: "stack" }, head, controls, results, moments);
+}
 
+// ---- DJs ----
+
+interface DjRow {
+  name: string;
+  image: string | null;
+  country: string | null;
+  sets: number;
+  lastSet: string | null;
+  following?: boolean;
+}
+
+function followButton(name: string, following: boolean, after?: (on: boolean) => void): HTMLElement {
+  let on = following;
+  const b = el("button", { type: "button", class: on ? "follow on" : "follow primary", "aria-pressed": String(on) }, on ? "Following" : "Follow");
+  b.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!auth.user) {
+      location.hash = "#/account";
+      return;
+    }
+    on = !on;
+    try {
+      await post("/api/follow", { dj: name, on });
+      b.className = on ? "follow on" : "follow primary";
+      b.textContent = on ? "Following" : "Follow";
+      b.setAttribute("aria-pressed", String(on));
+      await loadMe();
+      after?.(on);
+    } catch (e) {
+      on = !on;
+      toast((e as Error).message);
+    }
+  });
+  return b;
+}
+
+function djCard(d: DjRow): HTMLElement {
+  return el(
+    "div",
+    { class: "dj-card" },
+    el("a", { href: artistHash(d.name), class: "dj-link" }, art(d.name, d.image, "round md"), el("div", { class: "t" }, d.name), el("div", { class: "a" }, `${plural(d.sets, "set")} indexed${d.lastSet ? ` · last ${d.lastSet}` : ""}`)),
+    followButton(d.name, d.following ?? false),
+  );
+}
+
+async function djsPage(params: URLSearchParams): Promise<HTMLElement> {
+  const q = params.get("q") ?? "";
+  const page = Number(params.get("page") ?? 1) || 1;
+  const [all, following] = await Promise.all([
+    getJson<Paged<DjRow>>(`/api/djs?q=${enc(q)}&page=${page}`),
+    auth.user ? getJson<Paged<DjRow>>("/api/djs?following=1&size=100") : Promise.resolve(undefined),
+  ]);
+  const search = el("input", { type: "search", placeholder: "Search DJs…", value: q, "aria-label": "Search DJs", style: "min-width:240px" }) as HTMLInputElement;
+  const form = el("form", {}, search);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    location.hash = listHash("djs", params, { q: search.value.trim() });
+  });
   return el(
     "div",
     { class: "stack" },
-    hero,
-    el("div", { class: "split" }, songsCard, artistsCard),
-    exploreCard,
-    setsSection,
-    scCard,
-    el("div", { class: "split" }, youCard, vaultCard),
+    pageHead("DJs", "DJs with sets indexed by Rabbithole. Follow the ones you trust: Discover then shows what they're playing."),
+    following
+      ? el(
+          "section",
+          { class: "card" },
+          sectionHead(`Following (${following.total})`, following.total ? "#/?scope=followed" : undefined),
+          following.items.length ? el("div", { class: "dj-grid" }, ...following.items.map(djCard)) : el("p", { class: "muted small" }, "Not following anyone yet. Follow DJs below."),
+        )
+      : el("section", { class: "card muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to follow DJs and see what they're playing."),
+    el(
+      "section",
+      { class: "card", "data-list": "" },
+      el("div", { class: "section-head" }, el("h2", {}, q ? `DJs matching “${q}”` : "All DJs"), form),
+      all.items.length ? el("div", { class: "dj-grid" }, ...all.items.map(djCard)) : el("p", { class: "empty" }, q ? "No indexed DJ by that name. Their sets may not be gathered yet." : "No DJs indexed yet."),
+      pager(all, (n) => listHash("djs", params, { page: String(n) })),
+      el("p", { class: "footnote" }, "Only DJs who performed indexed sets are listed: singers and producers whose songs DJs play aren't DJs here."),
+    ),
   );
 }
 
-/** Home's one personal section: a recommended set, a few recent likes, your playlists. */
-function fillYourMusic(card: HTMLElement): void {
-  if (!auth.user) {
-    card.replaceChildren(
-      sectionHead("Your Music"),
-      el("p", { class: "muted small" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to like songs, make playlists, and get sets picked for you."),
-    );
-    return;
-  }
-  card.replaceChildren(sectionHead("Your Music", "#/library"), el("p", { class: "muted small" }, "Loading…"));
-  void getJson<ForYou>(`/api/for-you?months=${months()}`)
-    .then((r) => {
+interface DjProfileData {
+  name: string;
+  aliases: { name: string; evidence: string }[];
+  image: string | null;
+  country: string | null;
+  page: string | null;
+  links: { label: string; url: string }[];
+  sets: number;
+  firstSet: string | null;
+  lastSet: string | null;
+  following: boolean;
+  waiting: number;
+  discovery?: DiscoveryRecord;
+}
+
+interface OwnTrack {
+  song: string;
+  title: string;
+  artist: string;
+  role: string;
+  image: string | null;
+  soundcloud: string | null;
+  otherSets: number;
+  otherDjs: number;
+  ownSets: number;
+}
+
+interface IdLine {
+  setId: string;
+  setTitle: string;
+  date: string | null;
+  position: number;
+  text: string;
+  saved?: boolean;
+}
+
+/** A section with its own pages (15 at a time), loaded on its own. */
+function pagedSection<T>(title: string, load: (page: number) => Promise<Paged<T>>, draw: (r: Paged<T>) => Node, empty: string, footnote?: string): HTMLElement {
+  const card = el("section", { class: "card" }, el("h2", {}, title), el("p", { class: "muted small" }, "Loading…"));
+  const go = async (page: number) => {
+    try {
+      const r = await load(page);
+      const nav = el("nav", { class: "pager" });
+      if (r.pages > 1) {
+        const prev = el("button", { type: "button" }, "‹ Newer");
+        const next = el("button", { type: "button" }, "Older ›");
+        prev.toggleAttribute("disabled", r.page <= 1);
+        next.toggleAttribute("disabled", r.page >= r.pages);
+        prev.addEventListener("click", () => void go(r.page - 1));
+        next.addEventListener("click", () => void go(r.page + 1));
+        nav.append(prev, el("span", { class: "gap" }, `${r.page} of ${r.pages}`), next);
+      }
       card.replaceChildren(
-        sectionHead("Your Music", "#/library"),
-        r.sets.length ? featuredSet(r.sets, true) : el("p", { class: "muted small" }, "Like songs (♡ on a song page) to get sets picked for you."),
-        r.likedSongs.length ? el("div", { class: "tiles", style: "margin-top:16px" }, ...r.likedSongs.slice(0, 4).map((c) => songTile(c))) : "",
-        me.categories.length ? el("div", { style: "margin-top:14px" }, chips(me.categories.map((c) => ({ name: `${c.name} (${c.songs.length})`, href: playlistHash(c.name) })))) : "",
+        el("div", { class: "section-head" }, el("h2", {}, title), el("span", { class: "small muted" }, String(r.total))),
+        r.items.length ? draw(r) : el("p", { class: "empty" }, empty),
+        nav,
+        footnote ? el("p", { class: "footnote" }, footnote) : "",
       );
-    })
-    .catch((e) => failed(card, "Your Music", e));
+    } catch (e) {
+      failed(card, title, e);
+    }
+  };
+  void go(1);
+  return card;
 }
 
-/** Where the Unreleased Vault will go: following IDs until they're identified or released. */
-function vaultSpot(): HTMLElement {
-  const stat = el("p", { class: "small muted" });
-  void getJson<{ lines: number; sets: number }>("/api/vault-preview")
-    .then((r) => (stat.textContent = `${plural(r.lines, "unidentified ID line")} across ${plural(r.sets, "indexed set")} so far.`))
-    .catch(() => {});
-  return el(
+/** Gather their sets: choose how many of the newest, see what's waiting, stop. */
+function gatherCard(p: DjProfileData): HTMLElement {
+  const gather = gatherControl("dj", (limit) => {
+    if (p.page) openPage(p.page, p.name, limit);
+    else openOnSite(p.name, "artist", limit);
+  });
+  const status = el("span", { class: "small muted" });
+  const stop = el("button", { type: "button" }, "Stop gathering");
+  const setWaiting = (n: number) => {
+    status.textContent = n ? `${plural(n, "set")} from this DJ waiting to be read` : p.discovery ? gatheredLine(p.discovery) : "Opens their 1001Tracklists page; the extension collects the set links.";
+    stop.hidden = n === 0;
+  };
+  stop.addEventListener("click", async () => {
+    stop.textContent = "Stopping…";
+    try {
+      const r = await post<{ stopped: number }>("/api/gather/stop", { dj: p.name });
+      toast(`Stopped: ${plural(r.stopped, "set")} won't be fetched.`);
+      setWaiting(0);
+    } catch (e) {
+      toast((e as Error).message);
+    }
+    stop.textContent = "Stop gathering";
+  });
+  setWaiting(p.waiting);
+  return el("section", { class: "card" }, el("div", { class: "row" }, el("div", {}, el("b", {}, "Their sets"), el("div", {}, status)), el("div", { class: "btns" }, gather, stop)));
+}
+
+async function djPage(name: string, params: URLSearchParams): Promise<HTMLElement> {
+  let p: DjProfileData;
+  try {
+    p = await getJson<DjProfileData>(`/api/dj?name=${enc(name)}`);
+  } catch {
+    // Not in the catalog as an artist: maybe a song-only name; show the older artist page.
+    return artistPage(name, false);
+  }
+  if (p.name !== name && !params.toString()) history.replaceState(null, "", artistHash(p.name));
+  const mode = (ALL_MODES.includes(params.get("mode") as DiscoveryMode) ? params.get("mode") : "most") as DiscoveryMode;
+  const period = (params.get("period") ?? (mode === "now" ? "month" : mode === "intro" || mode === "closer" ? "year" : "all")) as Period;
+  const genre = params.get("genre") ?? "";
+  const to = (changes: Record<string, string | null>) => (location.hash = listHash(`artist/${enc(p.name)}`, params, changes));
+
+  const backdrop = el("div", { class: "backdrop" });
+  if (p.image) backdrop.style.backgroundImage = `url(${JSON.stringify(p.image)})`;
+  const hero = el(
     "section",
-    { class: "card vault-spot" },
-    el("div", { class: "section-head" }, el("h2", {}, "Unreleased Vault"), el("span", { class: "soon" }, "Coming soon")),
-    el("p", { class: "small" }, "Save the IDs you hear in sets, and setscope will tell you when one gets identified or released."),
-    stat,
+    { class: "profile-hero" },
+    backdrop,
+    art(p.name, p.image, "xl round"),
+    el(
+      "div",
+      { class: "body" },
+      el("div", { class: "crumbs" }, el("a", { href: "#/djs" }, "DJs"), " › ", p.name),
+      el("div", { class: "kicker" }, p.sets ? "DJ" : "Artist"),
+      el("h1", {}, p.name),
+      p.aliases.length ? el("div", { class: "small", title: p.aliases.map((a) => a.evidence).join("\n") }, "Also listed as ", p.aliases.map((a) => a.name).join(", ")) : "",
+      el("div", { class: "meta" }, [p.country, p.sets ? `${plural(p.sets, "indexed set")}` : "no indexed sets as a DJ", p.firstSet && p.lastSet ? `${p.firstSet} to ${p.lastSet}` : ""].filter(Boolean).join(" · ")),
+      el("div", { class: "btns", style: "margin-top:14px" }, p.sets ? followButton(p.name, p.following) : "", el("a", { class: "act-link", href: `${artistHash(p.name)}/stats` }, "Stats & trends →")),
+      p.links.length || p.page ? el("div", { class: "chips", style: "margin-top:12px" }, ...[...(p.page ? [{ label: "1001Tracklists", url: p.page }] : []), ...p.links].map((l) => externalLink(l.url, l.label, "chip"))) : "",
+    ),
   );
+
+  const selections = el("section", { class: "card", "data-list": "" }, el("p", { class: "muted small" }, "Loading…"));
+  if (p.sets) {
+    const query = new URLSearchParams({ name: p.name, mode, period, page: params.get("page") ?? "1" });
+    if (genre) query.set("genre", genre);
+    void getJson<DiscoveryResult>(`/api/dj/selections?${query}`)
+      .then(async (r) =>
+        selections.replaceChildren(
+          el("div", { class: "section-head" }, el("h2", {}, `What ${p.name} plays`), el("span", { class: "small muted" }, "tracks by other artists")),
+          modeTabs(mode, (m) => to({ mode: m, period: null, page: null })),
+          el("div", { class: "filters", style: "margin-top:12px" }, periodTabs(period, (x) => to({ period: x })), await genreSelect(genre, (g) => to({ genre: g }))),
+          r.notice ? el("p", { class: "notice small" }, r.notice) : "",
+          discoveryList(r, (n) => listHash(`artist/${enc(p.name)}`, params, { page: String(n) })),
+          el("details", { class: "small how" }, el("summary", {}, "How this is ranked"), el("p", {}, MODE_INFO[mode].how)),
+          coverageLine(r),
+        ),
+      )
+      .catch((e) => failed(selections, `What ${p.name} plays`, e));
+  }
+
+  const own = pagedSection<OwnTrack>(
+    "Own productions",
+    (page) => getJson(`/api/dj/own?name=${enc(p.name)}&page=${page}`),
+    (r) =>
+      el(
+        "ol",
+        { class: "disc-list" },
+        ...r.items.map((t) =>
+          el(
+            "li",
+            { class: "disc-row" },
+            songArt(t.song, t.image, t.soundcloud),
+            el("div", { class: "disc-main" }, el("a", { class: "disc-title", href: songHash(t.song) }, t.title), el("div", { class: "who small" }, t.artist, t.role === "main" ? "" : el("span", { class: "muted" }, ` · ${t.role === "remixer" ? "their remix/edit" : "featured"}`))),
+            el("div", { class: "disc-metric small muted" }, `${plural(t.otherSets, "set")} by ${plural(t.otherDjs, "other DJ")}`, t.ownSets ? el("div", {}, `${t.ownSets} of their own`) : ""),
+            el("div", { class: "btns", style: "flex-wrap:nowrap" }, likeIcon(t.song), addToPlaylistButton(t.song), songPlayButton(t.song, t.soundcloud)),
+          ),
+        ),
+      ),
+    "No tracks credited to them in indexed sets.",
+    "Tracks they made, featured on, or remixed. Mashups that only use one of their songs aren't counted as theirs.",
+  );
+
+  const ids = pagedSection<IdLine>(
+    "IDs they've played",
+    (page) => getJson(`/api/dj/ids?name=${enc(p.name)}&page=${page}`),
+    (r) =>
+      el(
+        "ol",
+        { class: "tracklist" },
+        ...r.items.map((l) => {
+          let saved = l.saved ?? false;
+          const save = el("button", { type: "button", class: saved ? "act on" : "act" }, saved ? "In your Vault" : "Save to Vault");
+          save.addEventListener("click", async () => {
+            if (!auth.user) {
+              location.hash = "#/account";
+              return;
+            }
+            saved = !saved;
+            try {
+              await post("/api/vault", { set: l.setId, position: l.position, on: saved });
+              save.textContent = saved ? "In your Vault" : "Save to Vault";
+              save.className = saved ? "act on" : "act";
+            } catch (e) {
+              saved = !saved;
+              toast((e as Error).message);
+            }
+          });
+          return el(
+            "li",
+            {},
+            el("span", { class: "id" }, "ID"),
+            el("span", { class: "t" }, l.text, el("div", { class: "who small muted" }, el("a", { href: `#/set/${enc(l.setId)}` }, l.setTitle), ` · track ${l.position + 1}`)),
+            save,
+          );
+        }),
+      ),
+    "No unidentified tracks in their indexed sets.",
+    "Each line is its own ID: two “ID - ID” lines are never assumed to be the same track. Saved IDs update by themselves when a re-read tracklist names them.",
+  );
+
+  const sets = el("section", { class: "card" }, el("p", { class: "muted small" }, "Loading…"));
+  void getJson<Paged<SetCard>>(`/api/sets?dj=${enc(p.name)}&size=6`)
+    .then((r) => sets.replaceChildren(sectionHead(`Recent sets (${r.total})`, r.total > r.items.length ? listHash("sets", new URLSearchParams(), { dj: p.name }) : undefined), r.items.length ? el("div", { class: "set-grid" }, ...r.items.map(setCardEl)) : el("p", { class: "muted small" }, "No sets of theirs indexed yet.")))
+    .catch((e) => failed(sets, "Recent sets", e));
+
+  return el("div", { class: "stack" }, hero, p.sets ? selections : "", auth.user ? gatherCard(p) : "", own, p.sets ? ids : "", p.sets ? sets : "");
 }
 
 // ---- Songs ----
@@ -1067,7 +1611,7 @@ async function songsPage(params: URLSearchParams): Promise<HTMLElement> {
       el(
         "p",
         { class: "footnote" },
-        `${plural(r.total, "song")} from ${plural(r.setsInWindow, "set")} indexed by setscope${period === "all" ? "" : ` in the last ${PERIOD_WORDS[period]}`}, not every set in existence. `,
+        `${plural(r.total, "song")} from ${plural(r.setsInWindow, "set")} indexed by Rabbithole${period === "all" ? "" : ` in the last ${PERIOD_WORDS[period]}`}, not every set in existence. `,
         period === "all" ? "" : `Trend compares each song's share of sets with the ${PERIOD_WORDS[period]} before, and shows only when both windows have enough sets.`,
       ),
     ),
@@ -1117,7 +1661,7 @@ async function artistsPage(params: URLSearchParams): Promise<HTMLElement> {
           )
         : el("p", { class: "empty" }, q ? `No artists matching “${q}”.` : "No indexed sets in this window."),
       pager(r, (n) => listHash("artists", params, { page: String(n) })),
-      el("p", { class: "footnote" }, "Counts DJ sets indexed by setscope, by performance date. Photos come from 1001Tracklists profiles."),
+      el("p", { class: "footnote" }, "Counts DJ sets indexed by Rabbithole, by performance date. Photos come from 1001Tracklists profiles."),
     ),
   );
 }
@@ -1286,16 +1830,7 @@ async function newPlaylist(): Promise<void> {
 async function libraryPage(): Promise<HTMLElement> {
   if (!auth.user) return signInPage();
   const [forYou, playlists] = await Promise.all([getJson<ForYou>(`/api/for-you?months=${months()}`), getJson<PlaylistSummary[]>("/api/playlists")]);
-  const SHOWN = 12;
   const liked = forYou.likedSongs;
-  const likedGrid = el("div", { class: "tiles" }, ...liked.slice(0, SHOWN).map((c) => songTile(c, unlikeButton(c.name))));
-  const allLikes = el("button", { type: "button", class: "act" }, `Show all ${liked.length}`);
-  allLikes.addEventListener("click", () => {
-    likedGrid.replaceChildren(...liked.map((c) => songTile(c, unlikeButton(c.name))));
-    allLikes.remove();
-  });
-  const playAllLikes = el("button", { type: "button", class: "primary" }, "▶ Play all");
-  playAllLikes.addEventListener("click", () => void playAll(liked.map((c) => c.name), new Map(liked.map((c) => [c.name, c.soundcloud]))));
   const newCard = el("a", { class: "cover-card new-card", href: "#/library" }, el("div", { class: "mosaic one" }, el("div", { class: "empty-cover" }, "＋")), el("div", { class: "t" }, "New playlist"), el("div", { class: "a" }, "Name it, then add songs with ＋"));
   newCard.addEventListener("click", (event) => {
     event.preventDefault();
@@ -1317,23 +1852,172 @@ async function libraryPage(): Promise<HTMLElement> {
         newCard,
       ),
     ),
-    el(
-      "section",
-      { class: "card" },
-      sectionHead(`Liked songs`, undefined, liked.length ? playAllLikes : undefined),
-      liked.length ? likedGrid : el("p", { class: "muted small" }, "Nothing liked yet: ♡ a song on its page."),
-      liked.length > SHOWN ? el("div", { style: "margin-top:14px" }, allLikes) : "",
-    ),
-    suggestionCarousel(),
+    likedSection(liked),
+    vaultSection(),
   );
 }
 
-function unlikeButton(song: string): HTMLElement {
+interface VaultItem {
+  setId: string;
+  setTitle: string;
+  date: string | null;
+  position: number;
+  savedText: string;
+  text: string;
+  status: "unidentified" | "identified";
+  song: string | null;
+  changedAt: string | null;
+  lastChecked: string | null;
+  soundcloud: string | null;
+}
+
+/** Saved IDs, each still tied to the set line it was heard on; identified ones come first. */
+function vaultSection(): HTMLElement {
+  const card = el("section", { class: "card" }, el("h2", {}, "Unreleased Vault"), el("p", { class: "muted small" }, "Loading…"));
+  void getJson<VaultItem[]>("/api/vault")
+    .then((items) => {
+      const rows = items.map((v) => {
+        const remove = el("button", { type: "button", class: "act" }, "Remove");
+        remove.addEventListener("click", async () => {
+          await post("/api/vault", { set: v.setId, position: v.position, on: false });
+          remove.closest("li")?.remove();
+        });
+        const where = el("div", { class: "who small muted" }, "Heard in ", el("a", { href: `#/set/${enc(v.setId)}` }, v.setTitle), ` · track ${v.position + 1}`);
+        return v.status === "identified" && v.song
+          ? el(
+              "li",
+              {},
+              songArt(v.song, null, v.soundcloud, "small"),
+              el(
+                "span",
+                { class: "t" },
+                el("span", { class: "badge-ok" }, "Identified"),
+                " ",
+                el("a", { href: songHash(v.song) }, v.song),
+                el("div", { class: "who small muted" }, `Saved as “${v.savedText}”${v.changedAt ? ` · named ${new Date(v.changedAt).toLocaleDateString()}` : ""}`),
+                where,
+              ),
+              el("div", { class: "btns", style: "flex-wrap:nowrap" }, likeIcon(v.song), addToPlaylistButton(v.song), remove),
+            )
+          : el(
+              "li",
+              {},
+              el("span", { class: "id" }, "ID"),
+              el("span", { class: "t" }, v.text, where, el("div", { class: "who small muted" }, v.lastChecked ? `Tracklist last re-read ${new Date(v.lastChecked).toLocaleDateString()}` : "Not re-read since it was indexed")),
+              remove,
+            );
+      });
+      card.replaceChildren(
+        el("div", { class: "section-head" }, el("h2", {}, "Unreleased Vault"), el("span", { class: "small muted" }, `${items.filter((v) => v.status === "identified").length} of ${items.length} identified`)),
+        rows.length ? el("ol", { class: "tracklist" }, ...rows) : el("p", { class: "muted small" }, "Save IDs from a DJ's page (“IDs they've played”) and they'll show up here, and change by themselves once a tracklist names them."),
+        el("p", { class: "footnote" }, "Rabbithole re-reads recent sets with IDs every couple of weeks; when 1001Tracklists names a track, its Vault entry updates."),
+      );
+    })
+    .catch((e) => failed(card, "Unreleased Vault", e));
+  return card;
+}
+
+/** Liked songs: search, genre and sort filters, 12 tiles a page, and Play all for what's showing. */
+function likedSection(liked: SongCard[]): HTMLElement {
+  const PER_PAGE = 12;
+  const card = el("section", { class: "card", "data-list": "" });
+  if (!liked.length) {
+    card.append(el("h2", {}, "Liked songs"), el("p", { class: "muted small" }, "Nothing liked yet: ♡ a song anywhere you see it."));
+    return card;
+  }
+  let page = 1;
+  const search = el("input", { type: "search", placeholder: "Find a song or artist…", "aria-label": "Find in liked songs" }) as HTMLInputElement;
+  const genres = [...new Set(liked.map((c) => c.genre).filter((g): g is string => Boolean(g)))].sort((a, b) => a.localeCompare(b));
+  const genre = el(
+    "select",
+    { "aria-label": "Genre" },
+    el("option", { value: "" }, "All genres"),
+    ...genres.map((g) => el("option", { value: g }, g)),
+    ...(liked.some((c) => !c.genre) ? [el("option", { value: "-" }, "No genre listed")] : []),
+  ) as HTMLSelectElement;
+  const sort = el(
+    "select",
+    { "aria-label": "Sort" },
+    el("option", { value: "new" }, "Newest liked"),
+    el("option", { value: "title" }, "Title A–Z"),
+    el("option", { value: "artist" }, "Artist A–Z"),
+  ) as HTMLSelectElement;
+  const count = el("span", { class: "small muted" });
+  const grid = el("div", { class: "tiles" });
+  const nav = el("nav", { class: "pager" });
+  const playAllBtn = el("button", { type: "button", class: "primary" }, "▶ Play all");
+
+  const shown = (): SongCard[] => {
+    const q = normalizeText(search.value);
+    const list = liked.filter(
+      (c) =>
+        (!q || normalizeText(`${c.title} ${c.artist}`).includes(q)) &&
+        (!genre.value || (genre.value === "-" ? !c.genre : c.genre === genre.value)),
+    );
+    if (sort.value === "title") list.sort((a, b) => a.title.localeCompare(b.title));
+    if (sort.value === "artist") list.sort((a, b) => a.artist.localeCompare(b.artist) || a.title.localeCompare(b.title));
+    return list;
+  };
+  const draw = () => {
+    const list = shown();
+    const pages = Math.max(1, Math.ceil(list.length / PER_PAGE));
+    page = Math.min(page, pages);
+    const unliked = (name: string) => () => {
+      liked.splice(liked.findIndex((c) => c.name === name), 1);
+      draw();
+    };
+    grid.replaceChildren(...list.slice((page - 1) * PER_PAGE, page * PER_PAGE).map((c) => songTile(c, unlikeButton(c.name, unliked(c.name)))));
+    count.textContent = list.length === liked.length ? plural(liked.length, "song") : `${list.length} of ${liked.length}`;
+    nav.replaceChildren();
+    if (pages > 1) {
+      const pageButton = (n: number, label = String(n)) => {
+        const b = el("button", { type: "button", class: n === page ? "on" : "", ...(n === page ? { "aria-current": "page" } : {}) }, label);
+        b.addEventListener("click", () => {
+          page = n;
+          draw();
+          card.scrollIntoView({ block: "start" });
+          window.scrollBy(0, -80);
+        });
+        return b;
+      };
+      if (page > 1) nav.append(pageButton(page - 1, "‹"));
+      let last = 0;
+      for (const n of [...new Set([1, page - 1, page, page + 1, pages])].filter((n) => n >= 1 && n <= pages).sort((a, b) => a - b)) {
+        if (n - last > 1) nav.append(el("span", { class: "gap" }, "…"));
+        nav.append(pageButton(n));
+        last = n;
+      }
+      if (page < pages) nav.append(pageButton(page + 1, "›"));
+    }
+    if (!list.length) grid.replaceChildren(el("p", { class: "empty" }, "No liked songs match those filters."));
+  };
+  for (const control of [search, genre, sort]) control.addEventListener("input", () => ((page = 1), draw()));
+  playAllBtn.addEventListener("click", () => {
+    const list = shown();
+    void playAll(list.map((c) => c.name), new Map(list.map((c) => [c.name, c.soundcloud])));
+  });
+  draw();
+  card.append(
+    el("div", { class: "section-head" }, el("div", {}, el("h2", {}, "Liked songs"), count), playAllBtn),
+    el("div", { class: "filters" }, search, genre, sort),
+    grid,
+    nav,
+  );
+  return card;
+}
+
+/** Lowercase, no accents or punctuation: for matching what someone types. */
+function normalizeText(text: string): string {
+  return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function unlikeButton(song: string, after?: () => void): HTMLElement {
   const b = el("button", { type: "button", class: "icon-btn on", title: "Unlike", "aria-label": `Unlike ${song}` }, "♥");
   b.addEventListener("click", async () => {
     await post("/api/like", { song, liked: false });
     await loadMe();
-    b.closest(".tile")?.remove();
+    if (after) after();
+    else b.closest(".tile")?.remove();
   });
   return b;
 }
@@ -1566,7 +2250,7 @@ function signInPage(): HTMLElement {
   return el(
     "div",
     { class: "stack" },
-    pageHead(first ? "Create the owner account" : "Sign in", first ? "You're the first person here: this account will own the site (and gets your existing likes)." : "setscope is private: you need an account to like songs and collect sets."),
+    pageHead(first ? "Create the owner account" : "Sign in", first ? "You're the first person here: this account will own the site (and gets your existing likes)." : "Rabbithole is private: you need an account to like songs and collect sets."),
     el(
       "div",
       { class: "grid" },
@@ -1605,7 +2289,7 @@ async function artistPage(name: string, exact: boolean): Promise<HTMLElement> {
       el(
         "div",
         { class: "btns", style: "margin-top:14px" },
-        findButton(p.ownSets.length ? "Gather more sets" : "Find their sets on 1001Tracklists", p.name, "artist", true),
+        gatherControl("dj", (limit) => openOnSite(p.name, "artist", limit), true),
         el("a", { class: "act-link", href: listHash("sets", new URLSearchParams(), { dj: p.name }) }, "Their sets →"),
       ),
       links.length ? el("div", { class: "chips", style: "margin-top:12px" }, ...links.map((l) => externalLink(l.url, l.label, "chip"))) : "",
@@ -1764,7 +2448,7 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
       el("div", { class: "kicker" }, "Song"),
       el("h1", {}, title),
       artists.length && !none ? el("div", { class: "meta" }, ...joined(artists.map(artistLink), ", ")) : "",
-      none ? el("div", { class: "meta" }, "No indexed sets contain this song yet. Find it on 1001Tracklists and setscope will collect its sets.") : "",
+      none ? el("div", { class: "meta" }, "No indexed sets contain this song yet. Find it on 1001Tracklists and Rabbithole will collect its sets.") : "",
       r.matchedAs.length > 1 ? el("div", { class: "muted small" }, `Also written as: ${r.matchedAs.slice(1).map((m) => m.name).join(", ")}`) : "",
       correctionNotice("song", name, r.correctedFrom),
       r.otherVersions?.length ? el("div", { class: "small" }, `Other songs called “${r.song}”:`, chips(r.otherVersions.map((v) => ({ name: v.name, href: songHash(v.name) })))) : "",
@@ -1775,7 +2459,7 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
         playSlot,
         none ? "" : likeButton(name, r.liked ?? false, () => void render()),
         none ? "" : addToPlaylistButton(name, "＋ Playlist"),
-        findButton(none ? "Find sets on 1001Tracklists" : "Gather more sets", name, "song", none),
+        gatherControl("song", (limit) => openOnSite(name, "song", limit), none),
       ),
     ),
   );
@@ -1803,23 +2487,139 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
         linkTo: "artist",
         action: (dj) => {
           if (!dj.url) return undefined;
-          const button = el("button", { type: "button", class: "act", title: `Collect ${dj.name}'s sets from their 1001Tracklists page` }, "Get sets");
-          button.addEventListener("click", () => openPage(dj.url!));
+          const n = gatherAmount();
+          const button = el("button", { type: "button", class: "act", title: `Gather ${dj.name}'s last ${n} sets from their 1001Tracklists page (change the number with any Gather menu)` }, `Get last ${n}`);
+          button.addEventListener("click", () => openPage(dj.url!, dj.name, gatherAmount()));
           return button;
         },
       }),
       rankedCard("Recurring IDs", r.recurringIds, "set", "No ID showed up in more than one of these sets."),
     ),
-    rankedCard("Most played alongside it", r.coPlayed, "set", "none", { linkTo: "song" }),
+    alongsideSection(name),
     setsCard(`Recently played in sets (${r.setsWithSong})`, r.sets, "none", 10),
   );
   return page;
 }
 
+interface AlongsideRow {
+  rank: number;
+  name: string;
+  together: number;
+  everywhere: number;
+  image: string | null;
+  soundcloud: string | null;
+}
+
+/** Every song played in the same sets, 15 a page: "Goes with it" (specific) or "Most shared sets". */
+function alongsideSection(song: string): HTMLElement {
+  const card = el("section", { class: "card" }, el("h2", {}, "Played alongside it"), el("p", { class: "muted small" }, "Loading…"));
+  let sort: "specific" | "count" = "specific";
+  const go = async (page: number) => {
+    try {
+      const r = await getJson<Paged<AlongsideRow>>(`/api/song/alongside?song=${enc(song)}&sort=${sort}&page=${page}&months=${months()}`);
+      const sorter = el(
+        "div",
+        { class: "tabs" },
+        ...(
+          [
+            ["specific", "Goes with it"],
+            ["count", "Most shared sets"],
+          ] as const
+        ).map(([value, label]) => {
+          const b = el("button", { type: "button", class: sort === value ? "on" : "" }, label);
+          b.addEventListener("click", () => {
+            sort = value;
+            void go(1);
+          });
+          return b;
+        }),
+      );
+      const nav = el("nav", { class: "pager" });
+      if (r.pages > 1) {
+        const prev = el("button", { type: "button" }, "‹");
+        const next = el("button", { type: "button" }, "›");
+        prev.toggleAttribute("disabled", r.page <= 1);
+        next.toggleAttribute("disabled", r.page >= r.pages);
+        prev.addEventListener("click", () => void go(r.page - 1));
+        next.addEventListener("click", () => void go(r.page + 1));
+        nav.append(prev, el("span", { class: "gap" }, `${r.page} of ${r.pages}`), next);
+      }
+      card.replaceChildren(
+        el("div", { class: "section-head" }, el("div", {}, el("h2", {}, "Played alongside it"), el("div", { class: "small muted" }, `${plural(r.total, "song")} shared 2+ sets with it`)), sorter),
+        r.items.length
+          ? el(
+              "ol",
+              { class: "disc-list" },
+              ...r.items.map((t) =>
+                el(
+                  "li",
+                  { class: "disc-row" },
+                  el("span", { class: "rank" }, String(t.rank)),
+                  songArt(t.name, t.image, t.soundcloud),
+                  el("div", { class: "disc-main" }, el("a", { class: "disc-title", href: songHash(t.name) }, titleOf(t.name)), el("div", { class: "who small" }, ...joined(artistsOf(t.name).map(artistLink), ", "))),
+                  el("div", { class: "disc-metric small muted" }, `${t.together} of its ${plural(t.everywhere, "set")}`, el("div", {}, "had this song too")),
+                  el("div", { class: "btns", style: "flex-wrap:nowrap" }, likeIcon(t.name), addToPlaylistButton(t.name), songPlayButton(t.name, t.soundcloud)),
+                ),
+              ),
+            )
+          : el("p", { class: "empty" }, "No song shares two or more sets with it yet."),
+        nav,
+        el(
+          "p",
+          { class: "footnote" },
+          sort === "specific"
+            ? "Goes with it: of the sets that play each song, how many also play this one (with a small allowance so a song seen twice doesn't top the list). Songs that belong with this one beat hits that are in every set."
+            : "Most shared sets: how many sets played both, which favours the biggest songs.",
+        ),
+      );
+    } catch (e) {
+      failed(card, "Played alongside it", e);
+    }
+  };
+  void go(1);
+  return card;
+}
+
 function findButton(label: string, query: string, kind: Mode, primary: boolean): HTMLElement {
-  const button = el("button", { type: "button", class: primary ? "primary" : "" }, label);
-  button.addEventListener("click", () => openOnSite(query, kind));
+  const button = el("button", { type: "button", class: primary ? "primary" : "", title: `Collects the last ${gatherAmount()} sets from the page you pick` }, label);
+  button.addEventListener("click", () => openOnSite(query, kind, gatherAmount()));
   return button;
+}
+
+/** How many sets a gather takes: 10, 20, 30 or 40, remembered between visits. */
+const GATHER_SIZES = [10, 20, 30, 40];
+
+function gatherAmount(): number {
+  try {
+    const saved = Number(localStorage.getItem("setscope.gather"));
+    if (GATHER_SIZES.includes(saved)) return saved;
+  } catch {
+    // private window: use the default
+  }
+  return 20;
+}
+
+/**
+ * [Gather] [their last 20 sets ▾]: always says exactly how many of the newest sets it
+ * takes. Sets already in Rabbithole are skipped, not swapped for older ones.
+ */
+function gatherControl(kind: "dj" | "song", run: (limit: number) => void, primary = true): HTMLElement {
+  const words = (n: number) => (kind === "song" ? `the last ${n} sets that played it` : `their last ${n} sets`);
+  const amount = el(
+    "select",
+    { "aria-label": "How many sets to gather" },
+    ...GATHER_SIZES.map((n) => el("option", n === gatherAmount() ? { value: String(n), selected: "" } : { value: String(n) }, words(n))),
+  ) as HTMLSelectElement;
+  amount.addEventListener("change", () => {
+    try {
+      localStorage.setItem("setscope.gather", amount.value);
+    } catch {
+      // not remembered: fine
+    }
+  });
+  const go = el("button", { type: "button", class: primary ? "primary" : "" }, "Gather");
+  go.addEventListener("click", () => run(Number(amount.value)));
+  return el("span", { class: "gather", title: "Opens their 1001Tracklists page; the extension collects that many of the newest sets. Ones already in Rabbithole are skipped." }, go, amount);
 }
 
 /** "Showing results for X · Search for <typed> instead" when the server auto-corrected. */
@@ -1961,7 +2761,7 @@ async function playlistPage(name: string): Promise<HTMLElement> {
   playAllBtn.addEventListener("click", () => void playAll(r.songs, known));
   const del = el("button", { type: "button" }, "Delete playlist");
   del.addEventListener("click", async () => {
-    if (!confirm(`Delete “${r.name}”? The songs stay in setscope.`)) return;
+    if (!confirm(`Delete “${r.name}”? The songs stay in Rabbithole.`)) return;
     await post("/api/playlists/delete", { name: r.name });
     await loadMe();
     location.hash = "#/library";
@@ -2398,8 +3198,8 @@ const POPUP_FEATURES = "popup,width=1100,height=900";
  * sends. The extension opens the matching result (or you click it), collects every
  * set on that page, sends the links here, and closes the popup.
  */
-function openOnSite(query: string, kind: Mode): void {
-  if (!armExtension(query, kind)) return;
+function openOnSite(query: string, kind: Mode, limit?: number): void {
+  if (!armExtension(query, kind, limit)) return;
   window.open("about:blank", POPUP, POPUP_FEATURES);
   const form = el("form", { method: "post", action: "https://www.1001tracklists.com/search/result.php", target: POPUP }) as HTMLFormElement;
   form.append(
@@ -2415,16 +3215,16 @@ function openOnSite(query: string, kind: Mode): void {
  * Opens a 1001Tracklists page in the popup: a set the app couldn't fetch (the
  * extension saves it), or a DJ's page (the extension collects their set links).
  */
-function openPage(url: string): void {
-  if (armExtension("", "set")) window.open(url, POPUP, POPUP_FEATURES);
+function openPage(url: string, who = "", limit?: number): void {
+  if (armExtension(who, limit ? "artist" : "set", limit)) window.open(url, POPUP, POPUP_FEATURES);
 }
 
 /** Tell the extension the next 1001Tracklists tab is ours to read and close. False if it isn't installed. */
-function armExtension(query: string, kind: Mode | "set"): boolean {
+function armExtension(query: string, kind: Mode | "set", limit?: number): boolean {
   if (!extensionInstalled()) {
     const error = $("formError");
     error.textContent =
-      "The setscope extension isn't running in this browser, so nothing can collect the sets. " +
+      "The Rabbithole extension isn't running in this browser, so nothing can collect the sets. " +
       "Open http://127.0.0.1:7331 in Chrome (with the extension loaded) and try again.";
     error.hidden = false;
     $("setup").hidden = false;
@@ -2435,8 +3235,31 @@ function armExtension(query: string, kind: Mode | "set"): boolean {
     showExtensionNotices();
     window.scrollTo({ top: 0 });
   }
-  window.postMessage({ source: "setscope-app", type: "arm", query, kind }, location.origin);
+  window.postMessage({ source: "setscope-app", type: "arm", query, kind, ...(limit ? { limit } : {}), ...(captureKey ? { token: captureKey.token } : {}) }, location.origin);
   return true;
+}
+
+/**
+ * A capture key for the extension, so sets you gather through a shared setscope link
+ * count as yours. Fetched ahead of time: gathering opens a popup, which has to happen
+ * straight from the click, with no waiting.
+ */
+let captureKey: { token: string; expires: number } | undefined;
+
+async function refreshCaptureKey(): Promise<void> {
+  if (!auth.user) {
+    captureKey = undefined;
+    return;
+  }
+  if (captureKey && captureKey.expires - Date.now() > 60 * 60_000) return;
+  try {
+    const res = await fetch("/api/capture-token", { method: "POST", headers: { "Content-Type": "application/json", "X-Setscope": "1" }, body: "{}" });
+    if (!res.ok) return;
+    const r = (await res.json()) as { token: string; expires: string };
+    captureKey = { token: r.token, expires: Date.parse(r.expires) };
+  } catch {
+    // Gathering from this computer works without one.
+  }
 }
 
 function extensionInstalled(): boolean {
@@ -2482,12 +3305,12 @@ function pauseMessage(q: QueueStatus): string {
       // When the site says how long to wait (Retry-After), pass that on.
       const seconds = Number(q.blocked?.match(/Retry-After: (\d+)/)?.[1]);
       const wait = seconds >= 60 ? `about ${seconds >= 5400 ? `${Math.round(seconds / 3600)} hours` : seconds >= 3000 ? "an hour" : `${Math.round(seconds / 60)} minutes`}` : "15–30 minutes";
-      return `1001Tracklists asked setscope to slow down, so it stopped. Next: wait ${wait}, then press Try again.`;
+      return `1001Tracklists asked Rabbithole to slow down, so it stopped. Next: wait ${wait}, then press Try again.`;
     }
     case "failure":
       return "A request failed (connection or page problem). Check your internet, then press Try again.";
     case "restart":
-      return `${plural(q.waiting.length, "set")} were waiting when setscope last stopped. Press Try again to continue, or Clear queue.`;
+      return `${plural(q.waiting.length, "set")} were waiting when Rabbithole last stopped. Press Try again to continue, or Clear queue.`;
     default:
       return "Paused.";
   }
@@ -2572,7 +3395,8 @@ function renderQueueCard(q: QueueStatus): void {
   $("qDetails").hidden = !paused || !q.blocked || q.pauseReason === "restart";
   $("qDetailsText").textContent = q.blocked ?? "";
   $("resumeBtn").hidden = !paused;
-  $("clearBtn").hidden = q.waiting.length === 0 && q.older === 0;
+  // Clearing removes everyone's waiting sets, so only the owner gets the button.
+  $("clearBtn").hidden = !auth.user?.owner || (q.waiting.length === 0 && q.older === 0);
   $("failedBox").hidden = q.failed === 0;
   $("failedMsg").textContent = `${plural(q.failed, "set")} couldn't be fetched after a few tries (connection or page problems).`;
   $("olderBox").hidden = q.older === 0;
@@ -2647,7 +3471,7 @@ function renderBackground(b: BackgroundStatus): void {
     resting: `On · ${b.today} of ${b.dailyCap} today${b.pending ? ` · ${b.pending} front-page sets to go, one every 90 seconds` : " · checks the front page about once an hour"}`,
     "waiting-for-queue": `On · waiting for your queue to finish first · ${b.today} of ${b.dailyCap} today`,
     "daily-limit": `On · reached today's limit of ${b.dailyCap} sets; continues tomorrow`,
-    paused: `Paused until ${until}: 1001Tracklists asked setscope to slow down.`,
+    paused: `Paused until ${until}: 1001Tracklists asked Rabbithole to slow down.`,
   };
   status.textContent = text[b.state];
 }
@@ -2813,7 +3637,7 @@ $("addLinksBtn").addEventListener("click", async () => {
   const msg = $("addLinksMsg");
   try {
     const r = await post<{ found: number; queued: number; alreadyCached: number }>("/api/add-links", { text: text.value });
-    msg.textContent = `${plural(r.found, "link")}: ${r.queued} new, ${r.alreadyCached} already in setscope.`;
+    msg.textContent = `${plural(r.found, "link")}: ${r.queued} new, ${r.alreadyCached} already in Rabbithole.`;
     text.value = "";
   } catch (e) {
     msg.textContent = (e as Error).message;
