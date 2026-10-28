@@ -1,6 +1,6 @@
 import type pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { discover, djProfile, followedIds, idLines, listDjs, ownTracks, rankRows, resolveArtist, setFollow } from "../src/catalog/discover.ts";
+import { discover, djProfile, followedIds, idLines, listDjs, monthlyPlays, ownTracks, playsMost, resolveArtist, setFollow, supporters } from "../src/catalog/discover.ts";
 import { PgCatalog } from "../src/catalog/pg-catalog.ts";
 import { listSets } from "../src/catalog/browse.ts";
 import { normalizeName } from "../src/normalize.ts";
@@ -11,22 +11,6 @@ import { databaseAvailable, freshSchema } from "./helpers/db.ts";
 import { makeSet } from "./fixtures/sets.ts";
 
 const TODAY = "2026-10-27";
-
-describe("rankRows", () => {
-  const row = (name: string, sets: number, djs: number, catalogSets: number, recency = 0, last = "2026-10-01") => ({ track_id: name.length, name, sets, djs, catalogSets, recency, last_played: last, dj_ids: [] });
-  it("Deep Cuts need real support and must be uncommon across the whole catalog", () => {
-    const rows = [row("Everywhere", 30, 20, 60), row("Once", 1, 1, 1), row("Gem", 3, 3, 4), row("Pair", 2, 2, 2)];
-    // 200 indexed sets: at most 4 (2%) to count as uncommon.
-    expect(rankRows(rows, "deep", { catalogTotal: 200, multiDj: true }).map((r) => r.name)).toEqual(["Gem", "Pair"]);
-    // One DJ selected: 2+ of their sets is enough support.
-    expect(rankRows(rows, "deep", { catalogTotal: 200, multiDj: false }).map((r) => r.name)).toEqual(["Gem", "Pair"]);
-  });
-  it("Most Played counts sets; Playing Now weighs recent sets", () => {
-    const rows = [row("Old favourite", 10, 5, 10, 0.5), row("New one", 4, 4, 4, 3.2)];
-    expect(rankRows(rows, "most", { catalogTotal: 100, multiDj: true })[0]!.name).toBe("Old favourite");
-    expect(rankRows(rows, "now", { catalogTotal: 100, multiDj: true })[0]!.name).toBe("New one");
-  });
-});
 
 const available = await databaseAvailable();
 
@@ -109,6 +93,19 @@ describe.skipIf(!available)("discovery on the database", () => {
   it("keeps their own productions apart, without mashups that only use their song", async () => {
     const own = await ownTracks(pool, djA, 1, 15);
     expect(own.items.map((t) => [t.song, t.role, t.otherSets, t.ownSets])).toEqual([["DJ A - Own Song", "main", 1, 2]]);
+  });
+
+  it("knows who plays an artist's tracks, whose tracks they play, and month by month", async () => {
+    // DJ B played DJ A's song; DJ A's (and Alpha's) own sets don't count as support.
+    expect(await supporters(pool, djA)).toEqual([{ name: "DJ B", image: null, sets: 1 }]);
+    const plays = await playsMost(pool, djA);
+    expect(plays.slice(0, 2)).toEqual([
+      { name: "Kite", image: null, sets: 2 },
+      { name: "Nova", image: null, sets: 2 },
+    ]);
+    expect(plays.some((x) => x.name === "DJ A")).toBe(false); // never themselves
+    const months = await monthlyPlays(pool, djA, ["DJ A - Own Song"], TODAY);
+    expect(months.get("DJ A - Own Song")).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]); // DJ B's set this month
   });
 
   it("lists IDs line by line, and follows DJs by any of their names", async () => {

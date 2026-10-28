@@ -8,10 +8,16 @@
 
 import type pg from "pg";
 import { baseTitle, normalizeName, splitArtists } from "../normalize.ts";
+import { trackImageSql, type TrackImage } from "./artwork.ts";
 
-export type Period = "week" | "month" | "3months" | "year" | "all";
-export const PERIODS: Period[] = ["week", "month", "3months", "year", "all"];
-const PERIOD_DAYS: Record<Exclude<Period, "all">, number> = { week: 7, month: 30, "3months": 91, year: 365 };
+export type Period = "week" | "month" | "3months" | "6months" | "year" | "all";
+export const PERIODS: Period[] = ["week", "month", "3months", "6months", "year", "all"];
+const PERIOD_DAYS: Record<Exclude<Period, "all">, number> = { week: 7, month: 30, "3months": 90, "6months": 182, year: 365 };
+
+/** How many days a period covers (today included); null for all time. */
+export function periodDays(period: Period): number | null {
+  return period === "all" ? null : PERIOD_DAYS[period];
+}
 
 /** Minimum sets in each window before a trend is shown, so 1 set vs 2 isn't "+100%". */
 const TREND_MIN_SETS = 5;
@@ -88,8 +94,9 @@ export interface SongRow {
   /** Unique DJs who played it, in the window. */
   djs: number;
   trend: number | "new" | null;
-  /** A photo of its main artist, when we have one (not cover art). */
+  /** A picture for it (see artwork.ts: SoundCloud artwork, or a photo of its maker). */
   artistImage: string | null;
+  imageKind: TrackImage["kind"] | null;
   /** Its confirmed SoundCloud link, if any. */
   soundcloud: string | null;
 }
@@ -101,7 +108,7 @@ export async function songChart(pool: pg.Pool, query: ChartQuery): Promise<Paged
   const genre = query.genre?.trim() || null;
   const r = await pool.query<{
     artist_text: string; title: string; genre: string | null; sets: number; djs: number; prev: number;
-    artist_image: string | null; soundcloud: string | null; total: number;
+    artist_image: TrackImage | null; soundcloud: string | null; total: number;
   }>(
     `with cur as (
        select st.track_id, count(distinct st.set_id)::int sets, count(distinct sd.artist_id)::int djs,
@@ -122,8 +129,7 @@ export async function songChart(pool: pg.Pool, query: ChartQuery): Promise<Paged
         group by st.track_id
      )
      select t.artist_text, t.title, coalesce(t.genre, cur.genre) genre, cur.sets, cur.djs, coalesce(prev.sets, 0) prev,
-            (select a.image_url from track_artists ta join artists a on a.id = ta.artist_id
-              where ta.track_id = t.id and ta.role = 'main' and a.image_url is not null order by ta.position limit 1) artist_image,
+            ${trackImageSql("t")} artist_image,
             (select l.url from external_track_links l where l.track_id = t.id order by l.confidence desc, l.created_at limit 1) soundcloud,
             count(*) over ()::int total
        from cur join tracks t on t.id = cur.track_id left join prev on prev.track_id = cur.track_id
@@ -142,7 +148,8 @@ export async function songChart(pool: pg.Pool, query: ChartQuery): Promise<Paged
     sets: row.sets,
     djs: row.djs,
     trend: w.prevFrom ? trendOf(row.sets, curSets, row.prev, prevSets) : null,
-    artistImage: row.artist_image,
+    artistImage: row.artist_image?.url ?? null,
+    imageKind: row.artist_image?.kind ?? null,
     soundcloud: row.soundcloud,
   }));
   return { ...paged(items, r.rows[0]?.total ?? 0, query.page, query.pageSize), setsInWindow: curSets };
@@ -177,23 +184,36 @@ export function isFeatured(artistText: string, name: string): boolean {
 
 /** One artist's plays in a window: which sets by other DJs played them, and how. */
 export interface ArtistPlays {
-  /** set id -> true when every track of theirs in that set only features them. */
-  sets: Map<number, boolean>;
+  /** set id -> what the set counts for (creditWeight of their best-credited track in it). */
+  sets: Map<number, number>;
   /** track id -> sets (by other DJs) it was played in. */
   songs: Map<number, number>;
 }
 
 /**
+ * What one play counts toward an artist, by how they're credited on the track:
+ *   1    they made it: an original of theirs, or their remix/edit/VIP/bootleg/rework
+ *   0.5  they're featured on it (vocals), or it's someone else's version of their song
+ *   0    their song is one of a mashup's ingredients (the mashup is its maker's)
+ */
+export function creditWeight(role: string, versionType: string, featured: boolean): number {
+  if (role === "mashup_component") return 0;
+  if (role === "remixer") return 1;
+  if (role === "featured" || featured) return FEATURE_WEIGHT;
+  return ["remix", "edit", "vip", "bootleg", "rework", "mashup"].includes(versionType) ? FEATURE_WEIGHT : 1;
+}
+
+/**
  * How much an artist counts in the ranking:
  *   1. Sets by *other* DJs that played them (their own sets don't count: an artist's
- *      radio show full of their own songs isn't other DJs choosing them). A set where
- *      they're only featured counts half.
+ *      radio show full of their own songs isn't other DJs choosing them), each worth the
+ *      creditWeight of their best-credited track in it.
  *   2. Cut by up to half when most of those plays are one song, so a single big hit or
  *      feature doesn't outrank artists DJs keep reaching for across their catalog.
  */
 export function creditScore(plays: ArtistPlays): number {
   let base = 0;
-  for (const featuredOnly of plays.sets.values()) base += featuredOnly ? FEATURE_WEIGHT : 1;
+  for (const weight of plays.sets.values()) base += weight;
   // Share of their sets that their single most-played song accounts for.
   const dominance = plays.sets.size ? Math.max(0, ...plays.songs.values()) / plays.sets.size : 0;
   return base * (1 - 0.5 * dominance);
@@ -208,16 +228,18 @@ interface PlayRow {
   track_id: number;
   artist_text: string;
   role: string;
+  version_type: string;
 }
 
 /** Every (artist, set, track) play in a window, leaving out artists' own sets. */
 async function artistPlays(pool: pg.Pool, from: string | null, to: string | null, genre: string | null, q: string | null, withPhoto: boolean): Promise<Map<number, ArtistPlays & { row: PlayRow }>> {
   const r = await pool.query<PlayRow>(
-    `select a.id artist_id, a.name, a.image_url, a.country, st.set_id, st.track_id, t.artist_text, ta.role
+    `select a.id artist_id, a.name, a.image_url, a.country, st.set_id, st.track_id, t.artist_text, ta.role, t.version_type::text
        from set_tracks st join sets s on s.id = st.set_id join tracks t on t.id = st.track_id
        join track_artists ta on ta.track_id = st.track_id join artists a on a.id = ta.artist_id
        left join set_djs own on own.set_id = st.set_id and own.artist_id = ta.artist_id
-      where t.identity_key is not null and own.artist_id is null
+      where t.identity_key is not null and own.artist_id is null and ta.role <> 'mashup_component'
+        and not exists (select 1 from set_duplicates dup where dup.set_id = st.set_id)
         and ($1::date is null or s.performed_on >= $1) and ($2::date is null or s.performed_on < $2)
         and ($3::text is null or coalesce(st.genre, t.genre) = $3)
         and ($4::text is null or lower(a.name) like $4) and (not $5 or a.image_url is not null)`,
@@ -226,8 +248,8 @@ async function artistPlays(pool: pg.Pool, from: string | null, to: string | null
   const out = new Map<number, ArtistPlays & { row: PlayRow; seen: Set<string> }>();
   for (const row of r.rows) {
     const a = out.get(row.artist_id) ?? { row, sets: new Map(), songs: new Map(), seen: new Set() };
-    const featured = row.role === "featured" || row.role === "mashup_component" || (row.role === "main" && isFeatured(row.artist_text, row.name));
-    a.sets.set(row.set_id, (a.sets.get(row.set_id) ?? true) && featured);
+    const weight = creditWeight(row.role, row.version_type, row.role === "main" && isFeatured(row.artist_text, row.name));
+    a.sets.set(row.set_id, Math.max(a.sets.get(row.set_id) ?? 0, weight));
     const pair = `${row.set_id}:${row.track_id}`;
     if (!a.seen.has(pair)) {
       a.seen.add(pair);
@@ -418,8 +440,9 @@ export interface SongCard {
   artist: string;
   title: string;
   genre: string | null;
-  /** A photo of its first main artist that has one (not cover art). */
+  /** A picture for it, and what kind (see artwork.ts). */
   image: string | null;
+  imageKind: TrackImage["kind"] | null;
   /** A SoundCloud link to play it (confirmed, or matched automatically earlier). */
   soundcloud: string | null;
 }
@@ -432,11 +455,10 @@ export async function songCards(pool: pg.Pool, names: string[]): Promise<Map<str
   };
   const keys = [...new Set(names.map(keyOf).filter((k): k is string => k !== null))];
   if (!keys.length) return new Map();
-  const r = await pool.query<{ identity_key: string; artist_text: string; title: string; genre: string | null; image: string | null; soundcloud: string | null }>(
+  const r = await pool.query<{ identity_key: string; artist_text: string; title: string; genre: string | null; image: TrackImage | null; soundcloud: string | null }>(
     `select t.identity_key, t.artist_text, t.title,
             coalesce(t.genre, (select mode() within group (order by st.genre) from set_tracks st where st.track_id = t.id and st.genre is not null)) genre,
-            (select a.image_url from track_artists ta join artists a on a.id = ta.artist_id
-              where ta.track_id = t.id and ta.role = 'main' and a.image_url is not null order by ta.position limit 1) image,
+            ${trackImageSql("t")} image,
             (select l.url from external_track_links l where l.track_id = t.id
               order by (l.added_by is null and l.provenance = 'search_match'), l.confidence desc, l.created_at limit 1) soundcloud
        from tracks t where t.identity_key = any($1)`,
@@ -446,7 +468,7 @@ export async function songCards(pool: pg.Pool, names: string[]): Promise<Map<str
   const out = new Map<string, SongCard>();
   for (const name of names) {
     const row = byKey.get(keyOf(name) ?? "");
-    if (row) out.set(name, { name, artist: row.artist_text, title: row.title, genre: row.genre, image: row.image, soundcloud: row.soundcloud });
+    if (row) out.set(name, { name, artist: row.artist_text, title: row.title, genre: row.genre, image: row.image?.url ?? null, imageKind: row.image?.kind ?? null, soundcloud: row.soundcloud });
   }
   return out;
 }

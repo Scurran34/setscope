@@ -75,6 +75,15 @@ describe("credits", () => {
     expect(credits({ artist: "Cause & Affect", title: "Stampede" }).map((x) => x.name)).toEqual(["Cause", "Affect"]); // no evidence: split
   });
 
+  it("reads titles joined with X as a mashup, so its source artists aren't credited as its makers", () => {
+    expect(c("Rihanna vs. Kernkraft 400 vs. Endor", "Disturbia X Zombie Nation X Pump It Up")).toEqual([
+      "Rihanna:mashup_component",
+      "Kernkraft 400:mashup_component",
+      "Endor:mashup_component",
+    ]);
+    expect(c("Armin van Buuren vs. Vini Vici", "Great Spirit X")).toEqual(["Armin van Buuren:main", "Vini Vici:main"]);
+  });
+
   it("reads 'A vs. B' with an ordinary title as a collaboration", () => {
     expect(c("Armin van Buuren vs. Vini Vici", "Great Spirit")).toEqual(["Armin van Buuren:main", "Vini Vici:main"]);
   });

@@ -134,39 +134,3 @@ function idIdentity(tracks: Track[], index: number): { key: string; label: strin
   }
   return undefined;
 }
-
-export interface Alongside {
-  name: string;
-  /** Sets that played both songs. */
-  together: number;
-  /** Sets (in the window) that played it at all. */
-  everywhere: number;
-}
-
-/**
- * Every song played in the same sets as this one (2+ shared sets: one is a coincidence).
- *
- * "specific" (the default) ranks by how much of the other song's play is alongside this
- * one: shared sets / (all its sets + 3). A song that almost always comes with this one
- * beats a hit that's simply in every set; the +3 keeps a song seen twice from topping the
- * list on luck. "count" ranks by shared sets alone.
- */
-export function playedAlongside(sets: Tracklist[], query: SongQuery, since: string, sort: "specific" | "count" = "specific"): Alongside[] {
-  const together = new Counter();
-  const everywhere = new Map<string, number>();
-  for (const set of filterSince(sets, since)) {
-    const others = new Map<string, string>();
-    let hasSong = false;
-    for (const track of set.tracks) {
-      if (matchesSong(track, query)) hasSong = true;
-      else if (!isId(track)) others.set(songKey(track), displayName(track));
-    }
-    for (const key of others.keys()) everywhere.set(key, (everywhere.get(key) ?? 0) + 1);
-    if (hasSong) for (const [key, name] of others) together.add(key, name);
-  }
-  const keyOf = new Map<string, string>();
-  for (const set of filterSince(sets, since)) for (const t of set.tracks) if (!isId(t)) keyOf.set(displayName(t), songKey(t));
-  const rows = together.top(Number.POSITIVE_INFINITY, 2).map((r) => ({ name: r.name, together: r.count, everywhere: everywhere.get(keyOf.get(r.name) ?? "") ?? r.count }));
-  const score = (r: Alongside) => (sort === "count" ? r.together : r.together / (r.everywhere + 3));
-  return rows.sort((a, b) => score(b) - score(a) || b.together - a.together || a.name.localeCompare(b.name));
-}

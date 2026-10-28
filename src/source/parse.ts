@@ -2,7 +2,7 @@
 // string, whether it came from the fetcher or from a page you saved in your browser.
 
 import * as cheerio from "cheerio";
-import type { DjProfile, Track, Tracklist } from "../model.ts";
+import type { DjProfile, SetKind, Track, Tracklist } from "../model.ts";
 
 const SITE = "https://www.1001tracklists.com";
 const TRACKLIST_PATH = /\/tracklist\/([a-z0-9]+)\/[^"'\s?#]*\.html/i;
@@ -28,6 +28,15 @@ export function dateFromUrl(url: string): string | undefined {
 /** True if the HTML is a tracklist page (as opposed to a DJ page, track page, or challenge). */
 export function isTracklistPage(html: string): boolean {
   return html.includes("tlpItem");
+}
+
+/**
+ * The set's type as the page itself describes it ("Tracklist / playlist for radio show
+ * ..."). undefined when the page doesn't say; never guessed from the tracklist.
+ */
+export function setKind(html: string): SetKind | undefined {
+  const kind = html.match(/Tracklist \/ playlist for (live set|radio show|podcast) /)?.[1];
+  return kind === "live set" ? "live" : kind === "radio show" ? "radio" : kind === "podcast" ? "podcast" : undefined;
 }
 
 export function parseTracklist(html: string, url: string): Tracklist {
@@ -57,6 +66,11 @@ export function parseTracklist(html: string, url: string): Tracklist {
   if (soundcloudId) set.soundcloud = `https://api.soundcloud.com/tracks/${soundcloudId}`;
   const profiles = djCards($);
   if (profiles.length > 0) set.djProfiles = profiles;
+  const kind = setKind(html);
+  if (kind) set.kind = kind;
+  const source = $("#pageTitle a[href^='/source/']").first();
+  const seriesKey = source.attr("href")?.match(/^\/source\/([a-z0-9]+)\//i)?.[1];
+  if (seriesKey && source.text().trim()) set.series = { key: seriesKey, name: source.text().trim() };
   set.parserVersion = PARSER_VERSION;
   return set;
 }

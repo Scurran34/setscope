@@ -188,6 +188,8 @@ describe.skipIf(!available)("collection sessions", () => {
     expect(await session(id)).toMatchObject({ state: "access_required", collected: 1 });
     const status = await queue.status();
     expect(status).toMatchObject({ state: "blocked", pauseReason: "site", blockKind: "rate_limit" });
+    expect(status.waiting).toHaveLength(5); // still listed, so each can be opened by hand
+    expect(status.waiting[0]).toBe(url("s1", 27)); // the one it stopped on first
     expect(Date.parse(status.pausedUntil!)).toBeGreaterThan(Date.now() + 3500_000);
     expect(await queue.resume()).toMatchObject({ resumed: false }); // not before the site's time
     queue.kick();
@@ -231,5 +233,32 @@ describe.skipIf(!available)("collection sessions", () => {
     await queue.settled();
     expect(await session(id)).toMatchObject({ state: "completed", collected: 2, remaining: 0 });
     expect((await queue.status()).state).toBe("idle"); // neither paused collecting
+  });
+
+  it("after Open next, offers a different set while the opened one is being saved", async () => {
+    site.script.push(() => {
+      throw new BlockedError("HTTP 401 from site", 401, "auth");
+    });
+    await gather(links(4), 4);
+    await queue.settled();
+    const before = (await queue.status()).waiting;
+    expect(before).toHaveLength(4);
+    expect(await queue.markOpened(before[0]!)).toBe(true);
+    const after = (await queue.status()).waiting;
+    expect(after[0]).toBe(before[1]); // the next press opens another one
+    expect(after.at(-1)).toBe(before[0]); // still waiting, at the back, until it's saved
+  });
+
+  it("a set opened by hand leaves the line at once and counts toward its collection", async () => {
+    const opened = "https://www.1001tracklists.com/tracklist/zz9fix1/dj-alpha-dj-beta-fixture-radio-101-2026-09-10.html";
+    site.script.push(() => {
+      throw new BlockedError("HTTP 401 from site", 401, "auth");
+    });
+    const { id } = await gather([opened, ...links(2)], 3);
+    await queue.settled();
+    expect(await session(id)).toMatchObject({ state: "access_required", collected: 0 });
+    await queue.importPage(pageHtml, opened);
+    expect((await queue.status()).waiting).not.toContain(opened);
+    expect(await session(id)).toMatchObject({ collected: 1 });
   });
 });

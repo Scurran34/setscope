@@ -15,7 +15,9 @@ import { credits, identify } from "./identity.ts";
 
 const SOURCE = "1001tracklists";
 /** Bump when credits() changes, so stored credits are re-derived once at startup. */
-export const CREDITS_VERSION = 3;
+export const CREDITS_VERSION = 4;
+/** Bump when markDuplicates() changes, so every set is checked again at startup. */
+export const DUPLICATES_VERSION = 2;
 
 /** Names with "&", "x", "/"... that have their own 1001Tracklists page: one act, never split. */
 async function oneActNames(db: Db): Promise<string[]> {
@@ -119,6 +121,18 @@ export class PgCatalog implements Catalog {
     return tracks.length;
   }
 
+  /** Check every set for duplicates once per DUPLICATES_VERSION (new sets are checked as they're saved). */
+  async markDuplicatesIfOutdated(): Promise<number> {
+    const done = await this.pool.query<{ value: string }>("select value from app_meta where key = 'duplicates_version'");
+    if (Number(done.rows[0]?.value ?? 0) >= DUPLICATES_VERSION) return 0;
+    const found = await markDuplicates(this.pool);
+    await this.pool.query(
+      "insert into app_meta (key, value) values ('duplicates_version', $1) on conflict (key) do update set value = excluded.value",
+      [String(DUPLICATES_VERSION)],
+    );
+    return found;
+  }
+
   /** Forget the in-memory copy (after changes made outside this object, e.g. an import). */
   invalidate(): void {
     this.cache = undefined;
@@ -183,19 +197,78 @@ async function saveSet(db: Db, set: Tracklist, html: string): Promise<number> {
           or o.id in (select track_id from set_tracks where set_id = $1))`,
     [setId],
   );
+  await markDuplicates(db, setId);
   return changed;
+}
+
+/** Identified tracks two same-day sets of one event must share (of the longer one) to be one performance... */
+export const DUPLICATE_SIMILARITY = 0.9;
+/** ...and a day apart (a set past midnight listed under both dates): practically the same tracklist. */
+export const DUPLICATE_SIMILARITY_NEXT_DAY = 0.98;
+/** ...and the fewest identified tracks a set needs before it's compared at all. */
+export const DUPLICATE_MIN_TRACKS = 8;
+
+/**
+ * Record sets that are the same performance indexed twice (see 007_support_metrics.sql):
+ * a DJ in common (aliases folded), the same event (title without its date), and either
+ * the same date with DUPLICATE_SIMILARITY of the identified tracks shared, or a day
+ * apart with DUPLICATE_SIMILARITY_NEXT_DAY. Tours and residencies (different nights,
+ * similar sets) stay separate performances. The copy indexed later is the duplicate.
+ * Pass a set id to check just that set, or nothing to check them all.
+ */
+export async function markDuplicates(db: Db, setId?: number): Promise<number> {
+  if (setId !== undefined) await db.query("delete from set_duplicates where set_id = $1 or duplicate_of = $1", [setId]);
+  else await db.query("delete from set_duplicates");
+  const r = await db.query(
+    `with canon as (select a.id, coalesce(al.canonical_id, a.id) cid from artists a left join artist_aliases al on al.artist_id = a.id),
+     ident as (
+       select st.set_id, array_agg(distinct st.track_id) tracks, count(distinct st.track_id) n
+         from set_tracks st join tracks t on t.id = st.track_id
+        where t.identity_key is not null group by st.set_id having count(distinct st.track_id) >= ${DUPLICATE_MIN_TRACKS}
+     ),
+     pairs as (
+       select distinct a.id a_id, b.id b_id
+         from sets a join set_djs ad on ad.set_id = a.id join canon ac on ac.id = ad.artist_id
+         join set_djs bd on bd.set_id <> a.id join canon bc on bc.id = bd.artist_id and bc.cid = ac.cid
+         join sets b on b.id = bd.set_id
+        where a.id < b.id and abs(a.performed_on - b.performed_on) <= 1
+          -- the same event: the title without its date matches
+          and regexp_replace(a.title, '\\s*\\d{4}-\\d{2}-\\d{2}\\s*$', '') = regexp_replace(b.title, '\\s*\\d{4}-\\d{2}-\\d{2}\\s*$', '')
+          and ($1::bigint is null or a.id = $1 or b.id = $1)
+     ),
+     scored as (
+       select p.a_id, p.b_id, sa.performed_on = sb.performed_on same_day,
+              (select count(*) from unnest(ia.tracks) x where x = any(ib.tracks))::float8 / greatest(ia.n, ib.n) sim
+         from pairs p join ident ia on ia.set_id = p.a_id join ident ib on ib.set_id = p.b_id
+         join sets sa on sa.id = p.a_id join sets sb on sb.id = p.b_id
+     )
+     insert into set_duplicates (set_id, duplicate_of, similarity)
+     select b_id, min(a_id), max(sim) from scored
+      where sim >= case when same_day then ${DUPLICATE_SIMILARITY} else ${DUPLICATE_SIMILARITY_NEXT_DAY} end
+      group by b_id
+     on conflict (set_id) do nothing`,
+    [setId ?? null],
+  );
+  return r.rowCount ?? 0;
 }
 
 async function upsertSet(db: Db, set: Tracklist): Promise<number> {
   const r = await db.query<{ id: number }>(
-    `insert into sets (source, source_id, url, title, performed_on, soundcloud_url, parser_version, last_refreshed_at)
-     values ($1, $2, $3, $4, $5, $6, $7, now())
+    `insert into sets (source, source_id, url, title, performed_on, soundcloud_url, parser_version, last_refreshed_at,
+                       set_type, set_type_evidence, series_key, series_name)
+     values ($1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11)
      on conflict (source, source_id) do update set
        url = excluded.url, title = excluded.title, performed_on = excluded.performed_on,
        soundcloud_url = coalesce(excluded.soundcloud_url, sets.soundcloud_url),
-       parser_version = excluded.parser_version, last_refreshed_at = now()
+       parser_version = excluded.parser_version, last_refreshed_at = now(),
+       set_type = excluded.set_type, set_type_evidence = excluded.set_type_evidence,
+       series_key = excluded.series_key, series_name = excluded.series_name
      returning id`,
-    [SOURCE, set.id, set.url, set.title, set.date || null, set.soundcloud ?? null, set.parserVersion ?? null],
+    [
+      SOURCE, set.id, set.url, set.title, set.date || null, set.soundcloud ?? null, set.parserVersion ?? null,
+      set.kind ?? "unknown", set.kind ? `page description: ${{ live: "live set", radio: "radio show", podcast: "podcast" }[set.kind]}` : null,
+      set.series?.key ?? null, set.series?.name ?? null,
+    ],
   );
   return r.rows[0]!.id;
 }

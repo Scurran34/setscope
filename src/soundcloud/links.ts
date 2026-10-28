@@ -80,14 +80,14 @@ export class LinkStore {
     });
   }
 
-  async addSongLink(userId: number, song: string, link: { url: string; externalId: string; confidence: number; provenance: "user" | "search_match" }): Promise<void> {
+  async addSongLink(userId: number, song: string, link: { url: string; externalId: string; confidence: number; provenance: "user" | "search_match"; artwork?: string }): Promise<void> {
     if (!isTrackLink(link.url)) throw new UserDataError("That isn't a SoundCloud track link.");
     const trackId = await findTrackId(this.pool, song);
     await this.pool.query(
-      `insert into external_track_links (track_id, provider, url, external_id, confidence, provenance, added_by)
-       values ($1, 'soundcloud', $2, $3, $4, $5, $6)
-       on conflict (track_id, provider, url) do nothing`,
-      [trackId, link.url, link.externalId, link.confidence, link.provenance, userId],
+      `insert into external_track_links (track_id, provider, url, external_id, confidence, provenance, added_by, artwork_url)
+       values ($1, 'soundcloud', $2, $3, $4, $5, $6, $7)
+       on conflict (track_id, provider, url) do update set artwork_url = coalesce(excluded.artwork_url, external_track_links.artwork_url)`,
+      [trackId, link.url, link.externalId, link.confidence, link.provenance, userId, link.artwork ?? null],
     );
   }
 
@@ -103,13 +103,13 @@ export class LinkStore {
   }
 
   /** Save the best search match for a song nobody has linked yet (no one confirmed it). */
-  async saveAutoMatch(trackId: number, link: { url: string; externalId: string; confidence: number }): Promise<void> {
+  async saveAutoMatch(trackId: number, link: { url: string; externalId: string; confidence: number; artwork?: string }): Promise<void> {
     if (!isTrackLink(link.url)) return;
     await this.pool.query(
-      `insert into external_track_links (track_id, provider, url, external_id, confidence, provenance, added_by)
-       values ($1, 'soundcloud', $2, $3, $4, 'search_match', null)
+      `insert into external_track_links (track_id, provider, url, external_id, confidence, provenance, added_by, artwork_url)
+       values ($1, 'soundcloud', $2, $3, $4, 'search_match', null, $5)
        on conflict (track_id, provider, url) do nothing`,
-      [trackId, link.url, link.externalId, link.confidence],
+      [trackId, link.url, link.externalId, link.confidence, link.artwork ?? null],
     );
   }
 

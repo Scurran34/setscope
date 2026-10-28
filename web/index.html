@@ -369,6 +369,19 @@
     .collector-pop .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 6px 0 10px; }
     .collector-pop .bar div { height: 100%; background: var(--accent); transition: width 0.4s; }
     .collector-pop .settings { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; padding-top: 10px; margin-top: 10px; border-top: 1px solid var(--line); font-size: 13px; }
+    .support-line { white-space: nowrap; }
+    .support-line b { color: var(--text); font-weight: 600; }
+    .link-btn { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font: inherit; text-decoration: underline; text-underline-offset: 2px; }
+    .disc-list li.shared-sets { display: block; padding: 4px 12px 10px 48px; }
+    .disc-list li.shared-sets ul { margin: 0; padding-left: 16px; }
+    .collector-pop h3 { font-size: 13px; margin: 0; }
+    .collector-pop .q-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding-top: 10px; margin: 10px 0 6px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+    .collector-pop .q-list { margin: 6px 0; }
+    .collector-pop .q-list li { display: flex; align-items: center; gap: 8px; }
+    .collector-pop .q-list li .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .collector-pop .q-list li.opened .name { opacity: 0.6; }
+    .collector-pop .q-links { margin-top: 10px; }
+    .collector-pop .q-links textarea { width: 100%; margin: 6px 0; box-sizing: border-box; }
     .collector-pop .others { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
     .collector-pop .warn-box { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 10px; padding: 10px 12px; font-size: 13px; margin: 10px 0; }
     @media (max-width: 860px) { .collector-pop { top: 104px; right: 12px; } }
@@ -519,6 +532,18 @@
     .gather { display: inline-flex; align-items: center; gap: 0; }
     .gather > button { border-top-right-radius: 0; border-bottom-right-radius: 0; }
     .gather > select { border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: 0; padding: 8px 10px; font-size: 14px; height: 100%; }
+    /* artist page: Collect in the header, and the three buttons that switch what's below */
+    .artist-collect { margin-top: 12px; }
+    .artist-collect .collect-status { margin-top: 6px; }
+    .artist-tabs { display: flex; gap: 6px; flex-wrap: wrap; padding: 4px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; }
+    .artist-tabs button { flex: 1 1 140px; border: 0; background: transparent; color: var(--muted); font-weight: 600; padding: 10px 14px; border-radius: 10px; }
+    .artist-tabs button:hover { color: var(--text); }
+    .artist-tabs button.on { background: var(--accent); color: #fff; }
+    .spark { display: inline-flex; align-items: flex-end; gap: 2px; width: 74px; height: 24px; flex: none; }
+    .spark i { flex: 1; background: var(--accent2); border-radius: 1px; opacity: 0.85; }
+    .spark i.zero { background: var(--line); opacity: 1; }
+    .spark-empty { width: 74px; text-align: center; flex: none; }
+    @media (max-width: 700px) { .spark, .spark-empty { display: none; } }
     button.follow { padding: 5px 16px; font-size: 13px; border-radius: 99px; }
     button.follow.on { background: transparent; border-color: var(--accent); color: var(--accent2); }
     button.act.on { border-color: var(--accent); color: var(--accent2); }
@@ -561,12 +586,10 @@
 
   <div class="strip">
     <div id="strip" class="strip-inner" hidden>
-      <b id="stripTitle"></b>
-      <div id="stripBar" class="strip-bar" hidden><div></div></div>
-      <span id="stripMsg" class="muted"></span>
-      <button id="stripRefresh" type="button" class="act primary" hidden>Refresh</button>
-      <button id="stripDetails" type="button" class="act">Open queue</button>
+      <b id="stripTitle">New sets are in</b>
+      <button id="stripRefresh" type="button" class="act primary">Refresh</button>
     </div>
+  </div>
   </div>
 
   <main>
@@ -596,59 +619,10 @@
     <div id="view"></div>
   </main>
 
-  <!-- Collecting sets: a drawer from the top bar's Queue button, reachable from every page. -->
-  <div id="drawerShade" class="shade" hidden></div>
-  <aside id="queueDrawer" class="drawer" hidden aria-label="Collecting sets">
-    <div class="section-head">
-      <h2>Collecting sets</h2>
-      <button id="queueClose" type="button" class="act" aria-label="Close">✕</button>
-    </div>
-    <p class="small muted">Sets get here three ways: <b>Gather more sets</b> on a song or artist page (opens 1001Tracklists; the
-      extension collects every set on the page), <b>Get sets</b> next to a DJ, or pasting links below. Rabbithole then reads them one
-      at a time, newest first.</p>
-    <div id="queueMount"><div class="card muted small" id="queueIdle">Nothing queued right now.</div></div>
-    <div id="bgCard" class="card" hidden>
-      <div class="row"><label class="switch"><input type="checkbox" id="bgToggle"> <b>Background collecting</b></label><span id="bgStatus" class="small muted"></span></div>
-    </div>
-    <details class="card" id="addLinksBox">
-      <summary><b>Add sets by link</b> <span class="muted small">paste 1001Tracklists set links, or any text containing them</span></summary>
-      <textarea id="addLinksText" rows="3" placeholder="https://www.1001tracklists.com/tracklist/..."></textarea>
-      <div class="row"><span id="addLinksMsg" class="muted small"></span><button id="addLinksBtn" type="button" class="act">Add</button></div>
-    </details>
-  </aside>
-
   <div id="toast" class="toast" role="status" hidden></div>
 
   <!-- The collection panel, opened from the header pill. Filled in by renderCollector(). -->
   <section id="collectorPop" class="collector-pop" role="dialog" aria-label="Set collection" hidden></section>
-
-  <!-- The full queue card, put into the queue drawer at startup. -->
-  <template id="queueTemplate">
-    <section id="queueCard" class="card queue">
-      <div class="row">
-        <b id="qTitle"></b>
-        <span id="qEta" class="muted small"></span>
-      </div>
-      <div id="qBarWrap" class="progress"><div id="qBar"></div></div>
-      <p id="qMsg" class="small"></p>
-      <details id="qDetails" class="small muted" hidden><summary>Details</summary><code id="qDetailsText"></code></details>
-      <div class="btns">
-        <button id="resumeBtn" type="button" class="primary">Try again</button>
-        <button id="moreBtn" type="button" class="primary">Fetch 5 more</button>
-        <button id="allBtn" type="button">Fetch all</button>
-        <button id="clearBtn" type="button">Clear queue</button>
-      </div>
-      <div id="failedBox" class="row older" hidden>
-        <span id="failedMsg" class="small muted"></span>
-        <button id="retryBtn" type="button" class="act">Retry them</button>
-      </div>
-      <div id="olderBox" class="row older" hidden>
-        <span id="olderMsg" class="small muted"></span>
-        <button id="olderBtn" type="button" class="act">Include them</button>
-      </div>
-      <div id="qList" class="queue-list"></div>
-    </section>
-  </template>
 
   <!-- The player: one for the whole app, outside the page area so it keeps playing as you move around. -->
   <section id="player" class="player" hidden aria-label="Player">

@@ -43,12 +43,12 @@ type Route =
   | { page: "sets"; params: URLSearchParams }
   | { page: "set"; id: string }
   | { page: "find"; query: string }
-  | { page: "artist"; name: string; exact: boolean; params: URLSearchParams }
-  | { page: "artistStats"; name: string; exact: boolean }
+  | { page: "artist"; name: string; exact: boolean; params: URLSearchParams; tab: "profile" | "stats" | "sets" }
   | { page: "song"; artist: string; song: string }
   | { page: "search"; query: string; exact: boolean }
   | { page: "playlist"; name: string }
-  | { page: "discover"; params: URLSearchParams; profile?: string };
+  | { page: "discover"; params: URLSearchParams; profile?: string }
+  | { page: "rankings" };
 
 interface Status {
   sets: number;
@@ -70,7 +70,7 @@ interface Me {
 type ArtistPage = ArtistReport & { profile: ArtistProfile; discovery?: DiscoveryRecord };
 
 /** Waiting sets listed before "Show the rest". */
-const LIST_PREVIEW = 3;
+const LIST_PREVIEW = 5;
 /** Songs listed on an artist page before "Show all". */
 const SONG_PREVIEW = 15;
 
@@ -177,6 +177,43 @@ function chips(items: { name: string; href: string }[]): HTMLElement {
 /** A number in the stats strip under a page's hero. */
 function bigStat(value: string | number, label: string): HTMLElement {
   return el("div", {}, el("b", {}, String(value)), el("span", {}, label));
+}
+
+interface SongSupport {
+  djs: number;
+  sets: number;
+  repeatDjs: number;
+  recentDjs: number;
+  recentSets: number;
+  newDjs: number;
+  growth: number | "new" | null;
+  lastPlayed: string | null;
+  recentDays: number;
+}
+
+/**
+ * A song's DJ support, three numbers kept apart, breadth first: Unique DJs, Set
+ * appearances and Recent supporting DJs, over every indexed DJ and all indexed history.
+ */
+function supportStats(song: string): HTMLElement {
+  const box = el("div", { class: "stats" }, bigStat("…", "Unique DJs"), bigStat("…", "Set appearances"), bigStat("…", "Recent supporting DJs"), bigStat("…", "Last played"));
+  void getJson<SongSupport>(`/api/song/support?song=${enc(song)}`)
+    .then((x) => {
+      const momentum = x.growth === "new" ? "new in the last 90 days" : typeof x.growth === "number" ? `${x.growth > 0 ? "+" : ""}${x.growth}% vs the 90 days before` : "not enough earlier data to compare";
+      const cells = [
+        [x.djs, "Unique DJs", "Different DJs (aliases counted once) who played it in someone else's set, in every indexed set. A DJ playing it 30 times is still one DJ."],
+        [x.sets, "Set appearances", `Different indexed sets it was played in${x.repeatDjs ? `; ${plural(x.repeatDjs, "DJ")} played it in more than one` : ""}.`],
+        [x.recentDjs, "Recent supporting DJs", `Different DJs who played it in the last ${x.recentDays} days (${plural(x.recentSets, "set")}${x.newDjs ? `, ${plural(x.newDjs, "DJ")} new to it` : ""}); ${momentum}.`],
+        [x.lastPlayed ?? "–", "Last played", "The most recent performance date of an indexed set that played it."],
+      ] as const;
+      box.replaceChildren(...cells.map(([value, label, help]) => {
+        const cell = bigStat(value, label);
+        cell.title = help;
+        return cell;
+      }));
+    })
+    .catch(() => box.replaceChildren(el("p", { class: "muted small" }, "Support numbers aren't available for this song.")));
+  return box;
 }
 
 function stat(value: string | number, label: string): HTMLElement {
@@ -335,6 +372,7 @@ function parseRoute(hash: string): Route {
   const parts = path.split("/").map((p) => decodeURIComponent(p));
   const [first, second, third, fourth] = parts;
   if (first === "trending") return { page: "trending" };
+  if (first === "rankings") return { page: "rankings" };
   if (first === "account") return { page: "account" };
   if (first === "library") return { page: "library" };
   if (first === "songs") return { page: "songs", params };
@@ -343,8 +381,10 @@ function parseRoute(hash: string): Route {
   if (first === "set" && second) return { page: "set", id: second };
   if (first === "find" && second) return { page: "find", query: second };
   if (first === "artist" && second && third === "song" && fourth) return { page: "song", artist: second, song: fourth };
-  if (first === "artist" && second && third === "stats") return { page: "artistStats", name: second, exact: fourth === "exact" };
-  if (first === "artist" && second) return { page: "artist", name: second, exact: third === "exact", params };
+  if (first === "artist" && second) {
+    const tab = third === "stats" || third === "sets" ? third : "profile";
+    return { page: "artist", name: second, exact: third === "exact", params, tab };
+  }
   if (first === "djs") return { page: "djs", params };
   if (first === "song" && second) return { page: "search", query: second, exact: third === "exact" };
   // Playlists were called categories before; old links still work.
@@ -374,7 +414,7 @@ async function showRoute(): Promise<void> {
   lastHash = location.hash;
   route = parseRoute(location.hash);
   const NAV: Partial<Record<Route["page"], string>> = {
-    home: "home", djs: "djs", artist: "djs", artistStats: "djs", artists: "djs",
+    home: "home", djs: "djs", artist: "djs", artists: "djs",
     library: "library", playlist: "library", account: "account",
   };
   const nav = NAV[route.page] ?? "";
@@ -409,9 +449,7 @@ async function render(): Promise<void> {
       case "account":
         return show(await accountPage());
       case "artist":
-        return show(await djPage(route.name, route.params));
-      case "artistStats":
-        return show(await artistPage(route.name, route.exact));
+        return show(await djPage(route.name, route.params, route.tab));
       case "song":
         return show(await songPage(route.song, route.artist, true));
       case "search":
@@ -432,6 +470,8 @@ async function render(): Promise<void> {
         return show(await findPage(route.query));
       case "discover":
         return show(await discoverPage(route.params, route.profile));
+      case "rankings":
+        return show(rankingsPage());
     }
   } catch (e) {
     show(el("div", { class: "card" }, el("p", { class: "error" }, (e as Error).message)));
@@ -482,8 +522,8 @@ function playRound(item: Playable | null, missing = "No SoundCloud link yet: ope
   return el("button", { type: "button", class: "play-round", disabled: "", title: missing, "aria-label": missing }, "▶");
 }
 
-const PERIOD_LABELS: Record<Period, string> = { week: "This Week", month: "This Month", "3months": "Last 3 Months", year: "Last 12 Months", all: "All Time" };
-const PERIOD_WORDS: Record<Period, string> = { week: "week", month: "month", "3months": "3 months", year: "12 months", all: "" };
+const PERIOD_LABELS: Record<Period, string> = { week: "This Week", month: "This Month", "3months": "Last 3 Months", "6months": "Last 6 Months", year: "Last 12 Months", all: "All Time" };
+const PERIOD_WORDS: Record<Period, string> = { week: "week", month: "month", "3months": "3 months", "6months": "6 months", year: "12 months", all: "" };
 
 function periodTabs(current: Period, pick: (p: Period) => void): HTMLElement {
   return el(
@@ -758,8 +798,18 @@ function songPlayButton(name: string, known: string | null, extraClass = "", rou
 }
 
 /** Artwork with a ▶ that shows on hover (always on touch screens). */
-function songArt(name: string, image: string | null, known: string | null, cls = ""): HTMLElement {
-  return el("div", { class: cls.includes("small") ? "art-wrap small" : "art-wrap" }, art(artistsOf(name)[0] ?? name, image, cls), songPlayButton(name, known, "art-play"));
+/** Where a song's picture came from (the server's artwork.ts). */
+type ImageKind = "soundcloud" | "creator" | "artist";
+const IMAGE_WORDS: Record<ImageKind, string> = {
+  soundcloud: "Artwork from its SoundCloud upload",
+  creator: "Photo of the artist who made this version (not cover art)",
+  artist: "Photo of the artist (not cover art)",
+};
+
+function songArt(name: string, image: string | null, known: string | null, cls = "", kind?: ImageKind | null): HTMLElement {
+  const picture = art(artistsOf(name)[0] ?? name, image, cls);
+  if (image && kind) picture.setAttribute("title", IMAGE_WORDS[kind]);
+  return el("div", { class: cls.includes("small") ? "art-wrap small" : "art-wrap" }, picture, songPlayButton(name, known, "art-play"));
 }
 
 let openMenu: HTMLElement | undefined;
@@ -836,13 +886,15 @@ function songTile(card: SongCard, extra?: Node): HTMLElement {
 
 interface FeaturedSet extends SetCard {
   liked: string[];
+  /** Why it's recommended, from real counts. */
+  reasons?: string[];
 }
 
 /** One recommended set at a time, big, changing every 20 seconds (or with the dots). */
 function featuredSet(sets: FeaturedSet[], compact = false): HTMLElement {
   const box = el("section", { class: `featured${compact ? " compact" : ""}` });
   if (!sets.length) return box;
-  const pick = [...sets].sort(() => Math.random() - 0.5);
+  const pick = sets; // best first: the server already ranked and diversified them
   let at = 0;
   const bg = el("div", { class: "bg" });
   const body = el("div", { class: "body" });
@@ -856,7 +908,8 @@ function featuredSet(sets: FeaturedSet[], compact = false): HTMLElement {
       el("div", { class: "kicker" }, "Recommended set for you"),
       el("h2", {}, el("a", { href: `#/set/${enc(s.id)}`, style: "text-decoration:none" }, s.event)),
       el("div", { class: "meta" }, ...joined(s.djs.map((d) => artistLink(d.name)), " & "), ` · ${s.date ?? ""} · ${plural(s.tracks, "track")}`),
-      el("div", { class: "liked" }, `Plays ${s.liked.length} of your liked songs: `, s.liked.slice(0, 3).map(titleOf).join(", "), s.liked.length > 3 ? "…" : ""),
+      s.reasons?.length ? el("div", { class: "liked" }, s.reasons.join(" · ")) : "",
+      s.liked.length ? el("div", { class: "liked small" }, "Your likes in it: ", s.liked.slice(0, 3).map(titleOf).join(", "), s.liked.length > 3 ? "…" : "") : "",
       el("div", { class: "btns", style: "margin-top:14px" }, playable ? playableButton(playable) : "", el("a", { class: "act-link", href: `#/set/${enc(s.id)}` }, "Open tracklist →")),
     );
     dots.replaceChildren(
@@ -963,12 +1016,21 @@ interface DiscoveryRow {
   title: string;
   genre: string | null;
   image: string | null;
+  imageKind: ImageKind | null;
   soundcloud: string | null;
-  sets: number;
+  /** Unique canonical DJs (breadth), qualifying set appearances, and DJs in the last 90 days. */
   djs: number;
+  sets: number;
+  recentDjs: number;
+  repeatDjs: number;
+  newDjs: number;
+  growth: number | "new" | null;
+  score: number;
   supporters: string[];
   lastPlayed: string | null;
   catalogSets: number;
+  /** Deep Cuts: DJs outside the selection who play it. */
+  otherDjs?: number;
   /** Intros / 90 + 5: sets it was played in at all, and the share that were openers/closers. */
   allSets?: number;
   share?: number;
@@ -976,7 +1038,7 @@ interface DiscoveryRow {
 
 interface DiscoveryResult extends Paged<DiscoveryRow> {
   mode: DiscoveryMode;
-  coverage: { sets: number; djs: number; from: string | null; to: string | null; catalogSets: number };
+  coverage: { sets: number; djs: number; from: string | null; to: string | null; catalogSets: number; catalogDjs: number };
   notice: string | null;
   scope?: string;
 }
@@ -985,19 +1047,19 @@ const MODE_INFO: Record<DiscoveryMode, { label: string; blurb: string; how: stri
   now: {
     label: "Playing Now",
     blurb: "Other artists' tracks in these DJs' latest sets",
-    how: "Each set a track was played in counts, weighted by how recent the set is: a set's weight halves every 14 days. Ties go to more sets, then more DJs.",
-    period: "month",
+    how: "Breadth first: each DJ who played it in the period counts once, plus a little (at most half a DJ) for playing it again. Each DJ's part fades with the age of their latest play (it halves every third of the period), and DJs who only just started playing it count a quarter extra. Uses the date each set was performed, so old sets collected today never count as new.",
+    period: "3months",
   },
   most: {
     label: "Most Played",
     blurb: "The tracks they keep coming back to",
-    how: "The number of different sets that played the track (a track played twice in one set counts once). Ties go to more DJs, then the most recently played.",
-    period: "3months",
+    how: "Breadth first: the number of different DJs who played it, plus up to half a DJ each for coming back to it (with diminishing returns: min(1 + 0.25·log2(plays), 2)). Radio episodes count less toward repeats, and at most 8 episodes of one show count, so 15 DJs beat one DJ's 30 radio plays.",
+    period: "all",
   },
   deep: {
     label: "Deep Cuts",
     blurb: "Rarer tracks these DJs genuinely back",
-    how: "Played by at least 2 of these DJs (or in 2+ sets by one DJ), but in no more than 2% of all indexed sets. Ranked by how many of these DJs play it, then by how much of its play comes from them.",
+    how: "Support from these DJs (repeat plays count fully here) × how rare it is across every indexed DJ (3 ÷ (3 + DJs who play it)) × how much evidence there is (sets ÷ (sets + 1)). Needs 2+ sets, and tracks played by more than 1% of indexed DJs are left out. Rare in Rabbithole's index isn't proof of rare in the world: coverage is uneven.",
     period: "year",
   },
   intro: {
@@ -1046,6 +1108,41 @@ function shortDate(date: string | null): string {
   return d.toLocaleDateString([], { month: "short", day: "numeric", ...(d.getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" }) });
 }
 
+/** How the rankings work, in plain words (the full version is docs/RANKINGS.md). */
+function rankingsPage(): HTMLElement {
+  const section = (title: string, ...lines: string[]) => el("section", { class: "card" }, el("h2", {}, title), ...lines.map((l) => el("p", { class: "small" }, l)));
+  return el(
+    "div",
+    { class: "stack" },
+    pageHead("How rankings work", "Streams can be bought. Genuine DJ support is harder to manufacture."),
+    section(
+      "What counts",
+      "A play is a track in an indexed DJ set, by artists other than the set's DJs (a DJ playing their own music isn't support). Unidentified IDs never count. Dates are when the set was performed, never when Rabbithole collected it. A set indexed twice (same DJ, same day, nearly the same tracks) counts once.",
+      "This shows what DJs played, not why: it can't tell organic support from promotion. It only covers sets Rabbithole has indexed, which is uneven: not every DJ or performance.",
+    ),
+    section(
+      "Three numbers, kept apart",
+      "Unique DJs (breadth): different DJs who played it. Aliases are one DJ (Lorenzo is Chris Lorenzo), and a DJ who played it 30 times is still one DJ. This matters most.",
+      "Set appearances (repeat support): different sets it was played in. Each DJ's repeats count with diminishing returns: min(1 + 0.25·log2(plays), 2), so one DJ adds at most one extra DJ's worth. Radio and podcast episodes count 0.75 of a play toward repeats, and at most 8 episodes of one recurring show count.",
+      "Recent supporting DJs (momentum): different DJs in the last 90 days, DJs new to it (their first play is recent and Rabbithole has older sets of theirs without it), and the change vs the period before as a share of active DJs, only when both periods have 5+ active DJs.",
+    ),
+    section(
+      "Playing Now · Most Played · Deep Cuts",
+      "Most Played (all history by default): Σ over DJs of 1 + ½·(their repeat contribution − 1). 15 DJs once each (15) beat one DJ thirty times (1.5).",
+      "Playing Now (90 days by default): the same, but each DJ's part halves every third of the period since their latest play, and DJs new to it count ¼ extra.",
+      "Deep Cuts: these DJs' support (full repeat contribution) × 3 ÷ (3 + DJs anywhere who play it) × sets ÷ (sets + 1). Needs 2+ sets; tracks played by more than 1% of indexed DJs (at least 4) are left out. Rare here isn't proof of rare everywhere.",
+    ),
+    section(
+      "Played alongside it",
+      "Goes with it: shared sets ÷ √(this song's sets × the other song's sets), × shared DJs ÷ (shared DJs + 2). A big consistent overlap (25 of 50) beats a tiny perfect one (4 of 4). Most shared sets: the raw count. Both use every indexed set with the song.",
+    ),
+    section(
+      "Recommended sets",
+      "Sets from the last year, scored on your liked songs in them, tracks DJs you follow also play, tracks with limited broader support, how many tracks by other artists they have, and genre, fading with age (half every 90 days), radio episodes × 0.85. Then one set per DJ and per show, and no near-copies, before anything repeats. Each reason shown is a real count.",
+    ),
+  );
+}
+
 /** One ranked list of third-party tracks: click a title for its page; ♡, ＋ and ▶ stay put. */
 function discoveryList(r: DiscoveryResult, hrefFor: (page: number) => string): HTMLElement {
   if (!r.items.length) {
@@ -1060,16 +1157,14 @@ function discoveryList(r: DiscoveryResult, hrefFor: (page: number) => string): H
   const rows = r.items.map((t) => {
     const metric =
       r.mode === "intro" || r.mode === "closer"
-        ? `${r.mode === "intro" ? "Opened" : "Closed"} ${plural(t.sets, "set")} · ${plural(t.djs, "DJ")} · ${Math.round((t.share ?? 0) * 100)}% of its plays`
-      : r.mode === "deep" ? `${plural(t.djs, "DJ")} · in ${t.catalogSets} of ${t.catalogSets === 1 ? "1" : r.coverage.catalogSets} indexed sets`
-      : r.mode === "now" ? `${plural(t.sets, "set")} · last ${shortDate(t.lastPlayed)}`
-      : `${plural(t.sets, "set")} · ${plural(t.djs, "DJ")}`;
+        ? [`${r.mode === "intro" ? "Opened" : "Closed"} ${plural(t.sets, "set")} · ${plural(t.djs, "DJ")} · ${Math.round((t.share ?? 0) * 100)}% of its plays`]
+        : supportMetrics(t, r.mode);
     const more = t.djs > t.supporters.length ? ` +${t.djs - t.supporters.length}` : "";
     return el(
       "li",
       { class: "disc-row" },
       el("span", { class: "rank" }, String(t.rank)),
-      songArt(t.song, t.image, t.soundcloud),
+      songArt(t.song, t.image, t.soundcloud, "", t.imageKind),
       el(
         "div",
         { class: "disc-main" },
@@ -1077,11 +1172,36 @@ function discoveryList(r: DiscoveryResult, hrefFor: (page: number) => string): H
         el("div", { class: "who small" }, ...joined(artistsOf(t.song).map(artistLink), ", ")),
         t.supporters.length ? el("div", { class: "supporters small" }, "Played by ", ...joined(t.supporters.map(artistLink), ", "), more) : "",
       ),
-      el("div", { class: "disc-metric small muted" }, metric, t.genre ? el("div", {}, t.genre) : ""),
+      el("div", { class: "disc-metric small muted" }, ...metric, t.genre ? el("div", {}, t.genre) : ""),
       el("div", { class: "btns", style: "flex-wrap:nowrap" }, likeIcon(t.song), addToPlaylistButton(t.song), songPlayButton(t.song, t.soundcloud)),
     );
   });
   return el("div", {}, el("ol", { class: "disc-list" }, ...rows), pager(r, hrefFor));
+}
+
+/**
+ * The three support numbers, breadth first: "14 DJs · 26 sets · 8 recent", with what each
+ * means on hover, and the mode's extra (momentum for Playing Now, rarity for Deep Cuts).
+ */
+function supportMetrics(t: DiscoveryRow, mode: DiscoveryMode): (HTMLElement | string)[] {
+  const line = el(
+    "div",
+    { class: "support-line" },
+    el("b", { title: "Unique DJs: different DJs (aliases counted once) who played it in someone else's set, in this period" }, plural(t.djs, "DJ")),
+    " · ",
+    el("span", { title: `Set appearances: different indexed sets it was played in, in this period${t.repeatDjs ? ` (${plural(t.repeatDjs, "DJ")} played it in more than one)` : ""}` }, plural(t.sets, "set")),
+    " · ",
+    el("span", { title: "Recent supporting DJs: different DJs who played it in the last 90 days" }, `${t.recentDjs} recent`),
+  );
+  const extra =
+    mode === "now"
+      ? [t.newDjs ? `${plural(t.newDjs, "new DJ")}` : "", t.growth === "new" ? "new this period" : typeof t.growth === "number" ? `${t.growth > 0 ? "+" : ""}${t.growth}% vs before` : "", `last ${shortDate(t.lastPlayed)}`]
+          .filter(Boolean)
+          .join(" · ")
+      : mode === "deep" && t.otherDjs !== undefined
+        ? `${plural(t.otherDjs, "other DJ")} play it`
+        : `last ${shortDate(t.lastPlayed)}`;
+  return [line, el("div", { title: mode === "now" && t.growth === null ? "Not enough earlier data to compare" : "" }, extra)];
 }
 
 function coverageLine(r: DiscoveryResult): HTMLElement {
@@ -1090,8 +1210,9 @@ function coverageLine(r: DiscoveryResult): HTMLElement {
   return el(
     "p",
     { class: "footnote" },
-    `Based on ${plural(c.sets, "indexed set")} from ${plural(c.djs, "DJ")}${range}, out of ${c.catalogSets} sets indexed by Rabbithole. `,
-    "A track counts only when none of the set's DJs made it (as artist, featured artist, remixer or mashup source). This shows what DJs played, not why: it can't tell organic support from promotion.",
+    `Based on ${plural(c.sets, "indexed set")} from ${plural(c.djs, "DJ")}${range}, out of ${c.catalogSets} sets from ${c.catalogDjs} DJs indexed by Rabbithole (uneven coverage: not every DJ or performance). `,
+    "A play counts only when none of the set's DJs made the track (as artist, featured artist, remixer or mashup source), and a set indexed twice counts once. This shows what DJs played, not why: it can't tell organic support from promotion. ",
+    el("a", { class: "link", href: "#/rankings" }, "How rankings work"),
   );
 }
 
@@ -1390,12 +1511,21 @@ interface OwnTrack {
   song: string;
   title: string;
   artist: string;
-  role: string;
+  role: "main" | "remixer" | "featured" | "original_artist";
+  versionType: string;
   image: string | null;
+  imageKind: ImageKind | null;
   soundcloud: string | null;
   otherSets: number;
   otherDjs: number;
   ownSets: number;
+}
+
+/** How an artist is credited on one of "their" tracks, in words. */
+function creditWords(t: Pick<OwnTrack, "role" | "versionType">): string {
+  if (t.role === "remixer") return `their ${t.versionType === "vip" ? "VIP" : ["remix", "edit", "bootleg", "rework", "mashup"].includes(t.versionType) ? t.versionType : "version"}`;
+  if (t.role === "featured") return "featured";
+  return "their song, someone else's version (credited as original artist)";
 }
 
 interface IdLine {
@@ -1437,17 +1567,19 @@ function pagedSection<T>(title: string, load: (page: number) => Promise<Paged<T>
   return card;
 }
 
-/** Gather their sets: choose how many of the newest, see what's waiting, stop. */
-function gatherCard(p: DjProfileData): HTMLElement {
+type ArtistTab = "profile" | "stats" | "sets";
+
+/** The Collect control and what's waiting for this artist, for the top of their page. */
+function artistCollect(p: DjProfileData): HTMLElement {
   const gather = gatherControl("dj", (target) => {
     if (p.page) openPage(p.page, p.name, undefined, target);
     else openOnSite(p.name, "artist", undefined, target);
   });
-  const status = el("span", { class: "small muted" });
-  const stop = el("button", { type: "button" }, "Stop gathering");
+  const status = el("div", { class: "small muted collect-status" });
+  const stop = el("button", { type: "button", class: "act" }, "Stop gathering");
   const setWaiting = (n: number) => {
-    status.textContent = n ? `${plural(n, "set")} from this DJ waiting to be read` : p.discovery ? gatheredLine(p.discovery) : "Opens their 1001Tracklists page; the extension collects the set links.";
-    stop.hidden = n === 0;
+    status.textContent = n ? `${plural(n, "set")} of theirs waiting to be read` : p.discovery ? gatheredLine(p.discovery) : "Collect opens their 1001Tracklists page; the extension finds sets Rabbithole doesn't have yet.";
+    stop.hidden = n === 0 || !auth.user;
   };
   stop.addEventListener("click", async () => {
     stop.textContent = "Stopping…";
@@ -1461,10 +1593,31 @@ function gatherCard(p: DjProfileData): HTMLElement {
     stop.textContent = "Stop gathering";
   });
   setWaiting(p.waiting);
-  return el("section", { class: "card" }, el("div", { class: "row" }, el("div", {}, el("b", {}, "Their sets"), el("div", {}, status)), el("div", { class: "btns" }, gather, stop)));
+  return el("div", { class: "artist-collect" }, el("div", { class: "btns" }, gather, stop), status);
 }
 
-async function djPage(name: string, params: URLSearchParams): Promise<HTMLElement> {
+/** A tiny bar chart of 12 months (oldest first). */
+function sparkline(values: number[]): HTMLElement {
+  const max = Math.max(1, ...values);
+  const box = el("span", { class: "spark", title: `Sets by other DJs, last 12 months: ${values.join(", ")}`, "aria-label": `Played in ${values.reduce((a, b) => a + b, 0)} sets by other DJs in the last 12 months` });
+  for (const v of values) box.append(el("i", { style: `height:${Math.max(v ? 12 : 4, (v / max) * 100)}%`, class: v ? "" : "zero" }));
+  return box;
+}
+
+/** People as photo circles, each with a count. */
+function peopleCircles(people: { name: string; image: string | null; sets: number }[], unit: string): HTMLElement {
+  return el("div", { class: "circles" }, ...people.map((x) => el("a", { href: artistHash(x.name) }, art(x.name, x.image, "round"), x.name, el("span", { class: "sub" }, plural(x.sets, unit)))));
+}
+
+/**
+ * An artist: the same header on every tab (photo, Follow, Collect), and three buttons that
+ * only change what's below it:
+ *   Profile               what they play by other artists, and the IDs they've played
+ *   Productions & stats   their own tracks (with a 12-month sparkline each), who plays them
+ *                         most, who they play most, and whether other DJs play them more
+ *   Sets                  every indexed set of theirs
+ */
+async function djPage(name: string, params: URLSearchParams, wanted: ArtistTab = "profile"): Promise<HTMLElement> {
   let p: DjProfileData;
   try {
     p = await getJson<DjProfileData>(`/api/dj?name=${enc(name)}`);
@@ -1472,14 +1625,15 @@ async function djPage(name: string, params: URLSearchParams): Promise<HTMLElemen
     // Not in the catalog as an artist: maybe a song-only name; show the older artist page.
     return artistPage(name, false);
   }
-  if (p.name !== name && !params.toString()) history.replaceState(null, "", artistHash(p.name));
-  const mode = (ALL_MODES.includes(params.get("mode") as DiscoveryMode) ? params.get("mode") : "most") as DiscoveryMode;
-  const period = (params.get("period") ?? (mode === "now" ? "month" : mode === "intro" || mode === "closer" ? "year" : "all")) as Period;
-  const genre = params.get("genre") ?? "";
-  const to = (changes: Record<string, string | null>) => (location.hash = listHash(`artist/${enc(p.name)}`, params, changes));
+  const base = artistHash(p.name);
+  // Someone who never DJed an indexed set has no "what they play": start on their music.
+  let tab: ArtistTab = !p.sets && wanted === "profile" ? "stats" : wanted;
+  if (p.name !== name && !params.toString()) history.replaceState(null, "", tab === "profile" ? base : `${base}/${tab}`);
 
   const backdrop = el("div", { class: "backdrop" });
   if (p.image) backdrop.style.backgroundImage = `url(${JSON.stringify(p.image)})`;
+  const tabs = el("nav", { class: "artist-tabs", "aria-label": `${p.name}` });
+  const content = el("div", { class: "stack" });
   const hero = el(
     "section",
     { class: "profile-hero" },
@@ -1493,51 +1647,61 @@ async function djPage(name: string, params: URLSearchParams): Promise<HTMLElemen
       el("h1", {}, p.name),
       p.aliases.length ? el("div", { class: "small", title: p.aliases.map((a) => a.evidence).join("\n") }, "Also listed as ", p.aliases.map((a) => a.name).join(", ")) : "",
       el("div", { class: "meta" }, [p.country, p.sets ? `${plural(p.sets, "indexed set")}` : "no indexed sets as a DJ", p.firstSet && p.lastSet ? `${p.firstSet} to ${p.lastSet}` : ""].filter(Boolean).join(" · ")),
-      el("div", { class: "btns", style: "margin-top:14px" }, p.sets ? followButton(p.name, p.following) : "", el("a", { class: "act-link", href: `${artistHash(p.name)}/stats` }, "Stats & trends →")),
+      el("div", { class: "btns", style: "margin-top:12px" }, p.sets ? followButton(p.name, p.following) : ""),
+      artistCollect(p),
       p.links.length || p.page ? el("div", { class: "chips", style: "margin-top:12px" }, ...[...(p.page ? [{ label: "1001Tracklists", url: p.page }] : []), ...p.links].map((l) => externalLink(l.url, l.label, "chip"))) : "",
     ),
   );
 
-  const selections = el("section", { class: "card", "data-list": "" }, el("p", { class: "muted small" }, "Loading…"));
-  if (p.sets) {
-    const query = new URLSearchParams({ name: p.name, mode, period, page: params.get("page") ?? "1" });
-    if (genre) query.set("genre", genre);
-    void getJson<DiscoveryResult>(`/api/dj/selections?${query}`)
-      .then(async (r) =>
-        selections.replaceChildren(
-          el("div", { class: "section-head" }, el("h2", {}, `What ${p.name} plays`), el("span", { class: "small muted" }, "tracks by other artists")),
-          modeTabs(mode, (m) => to({ mode: m, period: null, page: null })),
-          el("div", { class: "filters", style: "margin-top:12px" }, periodTabs(period, (x) => to({ period: x })), await genreSelect(genre, (g) => to({ genre: g }))),
-          r.notice ? el("p", { class: "notice small" }, r.notice) : "",
-          discoveryList(r, (n) => listHash(`artist/${enc(p.name)}`, params, { page: String(n) })),
-          el("details", { class: "small how" }, el("summary", {}, "How this is ranked"), el("p", {}, MODE_INFO[mode].how)),
-          coverageLine(r),
-        ),
-      )
-      .catch((e) => failed(selections, `What ${p.name} plays`, e));
-  }
+  const show = (next: ArtistTab, remember: boolean) => {
+    tab = next;
+    tabs.replaceChildren(
+      ...(
+        [
+          ["profile", "Profile", "What they play by other artists"],
+          ["stats", "Productions & stats", "Their own tracks, who plays them, their trend"],
+          ["sets", "Sets", "Every indexed set of theirs"],
+        ] as const
+      ).map(([key, label, hint]) => {
+        const b = el("button", { type: "button", class: key === tab ? "on" : "", "aria-pressed": String(key === tab), title: hint }, label);
+        b.addEventListener("click", () => show(key, true));
+        return b;
+      }),
+    );
+    // Only what's below the header changes; the address follows, so Back works.
+    if (remember) {
+      history.pushState(null, "", next === "profile" ? base : `${base}/${next}`);
+      lastHash = location.hash;
+    }
+    content.replaceChildren(...(next === "profile" ? profileTab(p, params) : next === "stats" ? statsTab(p) : setsTab(p)));
+  };
+  show(tab, false);
+  return el("div", { class: "stack" }, hero, tabs, content);
+}
 
-  const own = pagedSection<OwnTrack>(
-    "Own productions",
-    (page) => getJson(`/api/dj/own?name=${enc(p.name)}&page=${page}`),
-    (r) =>
-      el(
-        "ol",
-        { class: "disc-list" },
-        ...r.items.map((t) =>
-          el(
-            "li",
-            { class: "disc-row" },
-            songArt(t.song, t.image, t.soundcloud),
-            el("div", { class: "disc-main" }, el("a", { class: "disc-title", href: songHash(t.song) }, t.title), el("div", { class: "who small" }, t.artist, t.role === "main" ? "" : el("span", { class: "muted" }, ` · ${t.role === "remixer" ? "their remix/edit" : "featured"}`))),
-            el("div", { class: "disc-metric small muted" }, `${plural(t.otherSets, "set")} by ${plural(t.otherDjs, "other DJ")}`, t.ownSets ? el("div", {}, `${t.ownSets} of their own`) : ""),
-            el("div", { class: "btns", style: "flex-wrap:nowrap" }, likeIcon(t.song), addToPlaylistButton(t.song), songPlayButton(t.song, t.soundcloud)),
-          ),
-        ),
+/** Profile: what they play by other artists (the discovery modes), and the IDs they've played. */
+function profileTab(p: DjProfileData, params: URLSearchParams): HTMLElement[] {
+  if (!p.sets) return [el("section", { class: "card empty" }, `${p.name} has no indexed sets as a DJ yet. Use Collect above, or see Productions & stats.`)];
+  const mode = (ALL_MODES.includes(params.get("mode") as DiscoveryMode) ? params.get("mode") : "most") as DiscoveryMode;
+  const period = (params.get("period") ?? (mode === "now" ? "month" : mode === "intro" || mode === "closer" ? "year" : "all")) as Period;
+  const genre = params.get("genre") ?? "";
+  const to = (changes: Record<string, string | null>) => (location.hash = listHash(`artist/${enc(p.name)}`, params, changes));
+  const selections = el("section", { class: "card", "data-list": "" }, el("p", { class: "muted small" }, "Loading…"));
+  const query = new URLSearchParams({ name: p.name, mode, period, page: params.get("page") ?? "1" });
+  if (genre) query.set("genre", genre);
+  void getJson<DiscoveryResult>(`/api/dj/selections?${query}`)
+    .then(async (r) =>
+      selections.replaceChildren(
+        el("div", { class: "section-head" }, el("h2", {}, `What ${p.name} plays`), el("span", { class: "small muted" }, "tracks by other artists")),
+        modeTabs(mode, (m) => to({ mode: m, period: null, page: null })),
+        el("div", { class: "filters", style: "margin-top:12px" }, periodTabs(period, (x) => to({ period: x })), await genreSelect(genre, (g) => to({ genre: g }))),
+        r.notice ? el("p", { class: "notice small" }, r.notice) : "",
+        discoveryList(r, (n) => listHash(`artist/${enc(p.name)}`, params, { page: String(n) })),
+        el("details", { class: "small how" }, el("summary", {}, "How this is ranked"), el("p", {}, MODE_INFO[mode].how)),
+        coverageLine(r),
       ),
-    "No tracks credited to them in indexed sets.",
-    "Tracks they made, featured on, or remixed. Mashups that only use one of their songs aren't counted as theirs.",
-  );
+    )
+    .catch((e) => failed(selections, `What ${p.name} plays`, e));
 
   const ids = pagedSection<IdLine>(
     "IDs they've played",
@@ -1576,13 +1740,61 @@ async function djPage(name: string, params: URLSearchParams): Promise<HTMLElemen
     "No unidentified tracks in their indexed sets.",
     "Each line is its own ID: two “ID - ID” lines are never assumed to be the same track. Saved IDs update by themselves when a re-read tracklist names them.",
   );
+  return [selections, ids];
+}
 
-  const sets = el("section", { class: "card" }, el("p", { class: "muted small" }, "Loading…"));
-  void getJson<Paged<SetCard>>(`/api/sets?dj=${enc(p.name)}&size=6`)
-    .then((r) => sets.replaceChildren(sectionHead(`Recent sets (${r.total})`, r.total > r.items.length ? listHash("sets", new URLSearchParams(), { dj: p.name }) : undefined), r.items.length ? el("div", { class: "set-grid" }, ...r.items.map(setCardEl)) : el("p", { class: "muted small" }, "No sets of theirs indexed yet.")))
-    .catch((e) => failed(sets, "Recent sets", e));
+/** Productions & stats: their own tracks with sparklines, who plays them, who they play, their trend. */
+function statsTab(p: DjProfileData): HTMLElement[] {
+  const own = pagedSection<OwnTrack & { months: number[] }>(
+    "Their productions",
+    (page) => getJson(`/api/dj/own?name=${enc(p.name)}&page=${page}`),
+    (r) =>
+      el(
+        "ol",
+        { class: "disc-list" },
+        ...r.items.map((t) =>
+          el(
+            "li",
+            { class: "disc-row" },
+            songArt(t.song, t.image, t.soundcloud, "", t.imageKind),
+            el("div", { class: "disc-main" }, el("a", { class: "disc-title", href: songHash(t.song) }, t.title), el("div", { class: "who small" }, t.artist, t.role === "main" ? "" : el("span", { class: "muted" }, ` · ${creditWords(t)}`))),
+            t.months.some((m) => m > 0) ? sparkline(t.months) : el("span", { class: "spark-empty small muted" }, "—"),
+            el("div", { class: "disc-metric small muted" }, `${plural(t.otherSets, "set")} by ${plural(t.otherDjs, "other DJ")}`, t.ownSets ? el("div", {}, `${t.ownSets} of their own`) : ""),
+            el("div", { class: "btns", style: "flex-wrap:nowrap" }, likeIcon(t.song), addToPlaylistButton(t.song), songPlayButton(t.song, t.soundcloud)),
+          ),
+        ),
+      ),
+    "No tracks credited to them in indexed sets.",
+    "Tracks they made, featured on, or remixed; the bars are sets by other DJs each month for the last 12 months. Mashups that only use one of their songs aren't counted as theirs.",
+  );
 
-  return el("div", { class: "stack" }, hero, p.sets ? selections : "", auth.user ? gatherCard(p) : "", own, p.sets ? ids : "", p.sets ? sets : "");
+  const people = el("div", { class: "grid" }, loading(el("section", { class: "card" }), "Who plays them most"), loading(el("section", { class: "card" }), `Who ${p.name} plays most`));
+  void getJson<{ playedBy: { name: string; image: string | null; sets: number }[]; plays: { name: string; image: string | null; sets: number }[] }>(`/api/dj/people?name=${enc(p.name)}`)
+    .then((r) =>
+      people.replaceChildren(
+        el("section", { class: "card" }, el("h2", {}, "Who plays them most"), r.playedBy.length ? peopleCircles(r.playedBy, "set") : el("p", { class: "muted small" }, "No other DJ has played their tracks in an indexed set yet.")),
+        el("section", { class: "card" }, el("h2", {}, `Who ${p.name} plays most`), r.plays.length ? peopleCircles(r.plays, "set") : el("p", { class: "muted small" }, "No indexed sets of theirs yet.")),
+      ),
+    )
+    .catch((e) => failed(people.firstElementChild as HTMLElement, "Who plays them most", e));
+
+  const trend = loading(el("section", { class: "card" }), "Are other DJs playing them more?");
+  void getJson<ArtistPage>(`/api/artist?name=${enc(p.name)}&months=${months()}&exact=1`)
+    .then((r) => trend.replaceWith(artistTrendCard(r)))
+    .catch((e) => failed(trend, "Are other DJs playing them more?", e));
+  return [own, people, trend];
+}
+
+/** Sets: every indexed set of theirs, newest first, 12 a page. */
+function setsTab(p: DjProfileData): HTMLElement[] {
+  return [
+    pagedSection<SetCard>(
+      "Their sets",
+      (page) => getJson(`/api/sets?dj=${enc(p.name)}&size=12&page=${page}`),
+      (r) => el("div", { class: "set-grid" }, ...r.items.map(setCardEl)),
+      "No sets of theirs indexed yet. Use Collect above.",
+    ),
+  ];
 }
 
 // ---- Songs ----
@@ -2145,7 +2357,10 @@ async function accountPage(): Promise<HTMLElement> {
   });
 
   const openQueue = el("button", { type: "button" }, "Open the queue");
-  openQueue.addEventListener("click", () => setQueueOpen(true));
+  openQueue.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setCollectorOpen(true);
+  });
 
   return el(
     "div",
@@ -2473,14 +2688,7 @@ async function songPage(query: string, artist: string | undefined, exact: boolea
     return page;
   }
   page.append(
-    el(
-      "div",
-      { class: "stats" },
-      bigStat(r.setsWithSong, "Sets"),
-      bigStat(r.uniqueDjs, "Unique DJs"),
-      bigStat(`${r.setsConsidered ? Math.round((r.setsWithSong / r.setsConsidered) * 1000) / 10 : 0}%`, `of indexed sets since ${r.since}`),
-      bigStat(r.sets[0]?.date ?? "–", "Last played"),
-    ),
+    supportStats(name),
     categoriesCard(name, r.categories ?? [], r.hints ?? []),
     soundcloudCard(name),
     el(
@@ -2508,25 +2716,34 @@ interface AlongsideRow {
   rank: number;
   name: string;
   together: number;
+  djs: number;
   everywhere: number;
+  share: number;
+  score: number;
   image: string | null;
+  imageKind: ImageKind | null;
   soundcloud: string | null;
 }
 
-/** Every song played in the same sets, 15 a page: "Goes with it" (specific) or "Most shared sets". */
+interface AlongsideResult extends Paged<AlongsideRow> {
+  anchorSets: number;
+  notice: string | null;
+}
+
+/** Every song played in the same sets (all indexed sets), 15 a page: "Goes with it" or "Most shared sets". */
 function alongsideSection(song: string): HTMLElement {
   const card = el("section", { class: "card" }, el("h2", {}, "Played alongside it"), el("p", { class: "muted small" }, "Loading…"));
-  let sort: "specific" | "count" = "specific";
+  let sort: "goes" | "shared" = "goes";
   const go = async (page: number) => {
     try {
-      const r = await getJson<Paged<AlongsideRow>>(`/api/song/alongside?song=${enc(song)}&sort=${sort}&page=${page}&months=${months()}`);
+      const r = await getJson<AlongsideResult>(`/api/song/alongside?song=${enc(song)}&sort=${sort}&page=${page}`);
       const sorter = el(
         "div",
         { class: "tabs" },
         ...(
           [
-            ["specific", "Goes with it"],
-            ["count", "Most shared sets"],
+            ["goes", "Goes with it"],
+            ["shared", "Most shared sets"],
           ] as const
         ).map(([value, label]) => {
           const b = el("button", { type: "button", class: sort === value ? "on" : "" }, label);
@@ -2547,32 +2764,66 @@ function alongsideSection(song: string): HTMLElement {
         next.addEventListener("click", () => void go(r.page + 1));
         nav.append(prev, el("span", { class: "gap" }, `${r.page} of ${r.pages}`), next);
       }
+      /** The sets behind a row, opened under it. */
+      const setsToggle = (t: AlongsideRow, rowOf: () => HTMLElement) => {
+        const b = el("button", { type: "button", class: "link-btn small" }, `${t.together} shared sets`);
+        let box: HTMLElement | undefined;
+        b.addEventListener("click", async () => {
+          if (box) {
+            box.remove();
+            box = undefined;
+            return;
+          }
+          box = el("li", { class: "shared-sets" }, el("span", { class: "muted small" }, "Loading…"));
+          rowOf().after(box);
+          try {
+            const sets = await getJson<SetCard[]>(`/api/song/shared-sets?song=${enc(song)}&with=${enc(t.name)}`);
+            box.replaceChildren(el("ul", { class: "plain small" }, ...sets.map((x) => el("li", {}, el("a", { class: "link", href: `#/set/${x.id}` }, x.title)))));
+          } catch (e) {
+            box.replaceChildren(el("span", { class: "error small" }, (e as Error).message));
+          }
+        });
+        return b;
+      };
       card.replaceChildren(
-        el("div", { class: "section-head" }, el("div", {}, el("h2", {}, "Played alongside it"), el("div", { class: "small muted" }, `${plural(r.total, "song")} shared 2+ sets with it`)), sorter),
+        el(
+          "div",
+          { class: "section-head" },
+          el("div", {}, el("h2", {}, "Played alongside it"), el("div", { class: "small muted" }, `${plural(r.total, "song")} shared 2+ of the ${plural(r.anchorSets, "indexed set")} with this one`)),
+          sorter,
+        ),
+        r.notice ? el("p", { class: "notice small" }, r.notice) : "",
         r.items.length
           ? el(
               "ol",
               { class: "disc-list" },
-              ...r.items.map((t) =>
-                el(
+              ...r.items.map((t) => {
+                const row = el(
                   "li",
                   { class: "disc-row" },
                   el("span", { class: "rank" }, String(t.rank)),
-                  songArt(t.name, t.image, t.soundcloud),
+                  songArt(t.name, t.image, t.soundcloud, "", t.imageKind),
                   el("div", { class: "disc-main" }, el("a", { class: "disc-title", href: songHash(t.name) }, titleOf(t.name)), el("div", { class: "who small" }, ...joined(artistsOf(t.name).map(artistLink), ", "))),
-                  el("div", { class: "disc-metric small muted" }, `${t.together} of its ${plural(t.everywhere, "set")}`, el("div", {}, "had this song too")),
+                  el(
+                    "div",
+                    { class: "disc-metric small muted", title: `In ${t.together} of this song's ${r.anchorSets} sets (${Math.round(t.share * 100)}%), played by ${plural(t.djs, "DJ")}; in ${plural(t.everywhere, "indexed set")} overall.` },
+                    el("b", {}, `${t.together} of ${r.anchorSets}`),
+                    ` sets · ${plural(t.djs, "DJ")}`,
+                    el("div", {}, setsToggle(t, () => row), ` · in ${t.everywhere} overall`),
+                  ),
                   el("div", { class: "btns", style: "flex-wrap:nowrap" }, likeIcon(t.name), addToPlaylistButton(t.name), songPlayButton(t.name, t.soundcloud)),
-                ),
-              ),
+                );
+                return row;
+              }),
             )
           : el("p", { class: "empty" }, "No song shares two or more sets with it yet."),
         nav,
         el(
           "p",
           { class: "footnote" },
-          sort === "specific"
-            ? "Goes with it: of the sets that play each song, how many also play this one (with a small allowance so a song seen twice doesn't top the list). Songs that belong with this one beat hits that are in every set."
-            : "Most shared sets: how many sets played both, which favours the biggest songs.",
+          sort === "goes"
+            ? "Goes with it: shared sets ÷ √(this song's sets × the other song's sets), discounted when only one or two DJs are behind the pairing. A big, consistent overlap beats a tiny perfect one (4 of 4), and hits that are in every set don't win just for being everywhere."
+            : "Most shared sets: how many indexed sets played both, biggest first. This favours the most played songs.",
         ),
       );
     } catch (e) {
@@ -3225,8 +3476,10 @@ function openOnSite(query: string, kind: Mode, limit?: number, target?: number):
  * Opens a 1001Tracklists page in the popup: a set the app couldn't fetch (the
  * extension saves it), or a DJ's page (the extension collects their set links).
  */
-function openPage(url: string, who = "", limit?: number, target?: number): void {
-  if (armExtension(who, limit || target ? "artist" : "set", limit, target)) window.open(url, POPUP, POPUP_FEATURES);
+function openPage(url: string, who = "", limit?: number, target?: number): boolean {
+  if (!armExtension(who, limit || target ? "artist" : "set", limit, target)) return false;
+  window.open(url, POPUP, POPUP_FEATURES);
+  return true;
 }
 
 /** Tell the extension the next 1001Tracklists tab is ours to read and close. False if it isn't installed. */
@@ -3329,127 +3582,45 @@ function pauseMessage(q: QueueStatus): string {
 function renderStatus(status: Status): void {
   lastStatus = status;
   $("cacheInfo").textContent = `${plural(status.sets, "set")} cached`;
-  renderStrip(status.queue);
+  renderStrip();
   renderCollector(status);
-  renderQueueCard(status.queue);
-  if (status.background) renderBackground(status.background);
 }
 
-/** One line on every page while something is being fetched or is paused. */
-function renderStrip(q: QueueStatus): void {
-  const strip = $("strip");
-  const paused = q.state === "blocked";
-  const active = q.state === "running" || paused || q.waiting.length > 0 || q.older > 0;
-  $("stripRefresh").hidden = !refreshWaiting;
-  strip.hidden = (!active && !refreshWaiting) || !$("queueDrawer").hidden;
-  if (strip.hidden) return;
-  if (!active) {
-    strip.classList.remove("paused");
-    $("stripTitle").textContent = "New sets in";
-    $("stripBar").hidden = true;
-    $("stripMsg").textContent = "";
-    return;
-  }
-  strip.classList.toggle("paused", paused);
-  $("stripTitle").textContent =
-    q.state === "running" ? `Collecting sets · ${q.done} of ${q.total}`
-    : paused ? `Paused · ${plural(q.waiting.length, "set")} waiting`
-    : `${plural(q.older, "older set")} set aside`;
-  $("stripBar").hidden = q.state !== "running";
-  ($("stripBar").firstElementChild as HTMLElement).style.width = `${q.total ? (q.done / q.total) * 100 : 0}%`;
-  $("stripMsg").textContent =
-    q.state === "running" ? `about ${Math.ceil(q.etaSeconds / 60)} min left`
-    : paused ? (q.pauseReason === "site" ? "1001Tracklists asked to slow down" : "")
-    : "older than your window";
+/** The one line under the header: new sets arrived on a page that doesn't redraw itself. */
+function renderStrip(): void {
+  $("strip").hidden = !refreshWaiting;
 }
 
+/** Sets opened by hand, and when: "Open next" passes over them while they're being saved. */
+const openedByHand = new Map<string, number>();
+const OPENED_SKIP_MS = 3 * 60_000;
+/** Check the status every 2 s until then (just after opening a set by hand). */
+let fastPollUntil = 0;
+
+function recentlyOpened(url: string): boolean {
+  const at = openedByHand.get(url);
+  return at !== undefined && Date.now() - at < OPENED_SKIP_MS;
+}
+
+/** Waiting sets, the ones you haven't just opened first. */
+function upNext(waiting: string[]): string[] {
+  return [...waiting.filter((u) => !recentlyOpened(u)), ...waiting.filter(recentlyOpened)];
+}
+
+/** Open a waiting set yourself: the extension saves it and closes the tab; the next press offers another. */
+function openByHand(url: string): void {
+  if (!openPage(url)) return; // first, straight from the click, or the popup is blocked
+  openedByHand.set(url, Date.now());
+  fastPollUntil = Date.now() + 90_000;
+  void post("/api/collect/opened", { url }).catch(() => undefined);
+  if (lastStatus && !$("collectorPop").hidden) drawCollectorPanel(lastStatus);
+}
+
+/** Show every waiting set in the panel, not just the first few. */
 let listOpen = false;
-/** Last list drawn, so polling doesn't redraw (and flicker) when nothing changed. */
-let listShown = "";
-
-/** Put the queue card in the queue drawer and wire its buttons (once, at startup). */
-function mountQueueCard(): void {
-  const mount = maybe("queueMount");
-  if (!mount || maybe("queueCard")) return;
-  const template = $<HTMLTemplateElement>("queueTemplate");
-  mount.append(template.content.cloneNode(true));
-  listShown = "";
-  $("resumeBtn").addEventListener("click", () => void post("/api/resume"));
-  $("clearBtn").addEventListener("click", () => void post("/api/clear-queue"));
-  $("olderBtn").addEventListener("click", () => void post("/api/include-older"));
-  $("retryBtn").addEventListener("click", () => void post("/api/retry-failed"));
-  // Batches are gone: everything found is fetched on its own. These stay hidden.
-  $("moreBtn").hidden = true;
-  $("allBtn").hidden = true;
-}
-
-function renderQueueCard(q: QueueStatus): void {
-  const card = maybe("queueCard");
-  if (!card) return;
-  const paused = q.state === "blocked";
-  const empty = q.state === "idle" && q.waiting.length === 0 && q.older === 0 && q.done === 0 && q.failed === 0;
-  card.hidden = empty;
-  const idle = maybe("queueIdle");
-  if (idle) idle.hidden = !empty;
-  if (empty) return;
-
-  $("qTitle").textContent =
-    q.state === "running" ? `Collecting set ${Math.min(q.done + 1, q.total)} of ${q.total}`
-    : paused ? `Paused · ${plural(q.waiting.length, "set")} waiting`
-    : q.done > 0 ? `Done: ${plural(q.done, "new set")} added`
-    : `${plural(q.older, "older set")} set aside`;
-  $("qEta").textContent = q.state === "running" ? `about ${Math.ceil(q.etaSeconds / 60)} min left` : "";
-  $("qBarWrap").hidden = q.state !== "running";
-  $("qBar").style.width = `${q.total ? (q.done / q.total) * 100 : 100}%`;
-  $("qMsg").textContent = paused ? pauseMessage(q) : q.state === "running" ? "One set every 8 seconds, to stay polite. Pages update as sets arrive." : "";
-  $("qDetails").hidden = !paused || !q.blocked || q.pauseReason === "restart";
-  $("qDetailsText").textContent = q.blocked ?? "";
-  $("resumeBtn").hidden = !paused;
-  // Clearing removes everyone's waiting sets, so only the owner gets the button.
-  $("clearBtn").hidden = !auth.user?.owner || (q.waiting.length === 0 && q.older === 0);
-  $("failedBox").hidden = q.failed === 0;
-  $("failedMsg").textContent = `${plural(q.failed, "set")} couldn't be fetched after a few tries (connection or page problems).`;
-  $("olderBox").hidden = q.older === 0;
-  $("olderMsg").textContent = `${plural(q.older, "set")} older than your window were set aside. Include them, then pick a longer window to see them in reports.`;
-  renderWaiting(q.waiting, paused, q.pauseReason === "site");
-}
-
-/** Sets still to fetch: the next few, then "Show the rest" / "Hide the rest". Open buttons while paused. */
-function renderWaiting(urls: string[], paused: boolean, blockedBySite: boolean): void {
-  const key = `${listOpen}|${paused}|${blockedBySite}|${urls.join("\n")}`;
-  if (key === listShown) return;
-  listShown = key;
-  if (urls.length === 0) {
-    $("qList").replaceChildren();
-    return;
-  }
-  const list = el("ol", { class: "ranked" });
-  urls.forEach((url, i) => {
-    const row = el("li", { class: paused && i === 0 ? "blocked-here" : "" }, el("span", { class: "name small" }, setLabel(url)));
-    if (paused && i === 0) row.append(el("span", { class: "tag" }, blockedBySite ? "stopped here" : "next"));
-    if (paused) {
-      const open = el("button", { type: "button", class: i === 0 ? "act primary" : "act" }, "Open");
-      open.addEventListener("click", () => openPage(url));
-      row.append(open);
-    }
-    if (i >= LIST_PREVIEW && !listOpen) row.hidden = true;
-    list.append(row);
-  });
-  const parts: (Node | string)[] = [
-    el("div", { class: "small muted" }, paused ? "Up next. Open any one yourself: it saves and closes on its own." : "Up next:"),
-    list,
-  ];
-  if (urls.length > LIST_PREVIEW) {
-    const toggle = el("button", { type: "button", class: "act" }, listOpen ? "Hide the rest" : `Show the rest (${urls.length - LIST_PREVIEW})`);
-    toggle.addEventListener("click", () => {
-      listOpen = !listOpen;
-      listShown = "";
-      renderWaiting(urls, paused, blockedBySite);
-    });
-    parts.push(toggle);
-  }
-  $("qList").replaceChildren(...parts);
-}
+/** "Add sets by link", kept across the panel's redraws. */
+let linksDraft = "";
+let linksOpen = false;
 
 // ---- set collection: the header pill and its panel ----
 
@@ -3514,7 +3685,7 @@ function renderCollector(status: Status): void {
   button.title = `Set collection: ${text}`;
   $("queueBadge").hidden = true;
   // Redraw the open panel only when something in it changed (countdowns tick on their own).
-  const key = JSON.stringify([status.collector, q.state, q.pauseReason, q.pausedUntil, q.blockKind, auth.user?.id]);
+  const key = JSON.stringify([status.collector, { ...q, etaSeconds: 0 }, status.background, auth.user?.id]);
   if (!$("collectorPop").hidden && key !== collectorShown) drawCollectorPanel(status);
   collectorShown = key;
 }
@@ -3551,11 +3722,6 @@ function drawCollectorPanel(status: Status): void {
   };
   const close = el("button", { type: "button", class: "chip-x", "aria-label": "Close" }, "✕");
   close.addEventListener("click", () => setCollectorOpen(false));
-  const viewQueue = el("button", { type: "button", class: "act" }, "View queue");
-  viewQueue.addEventListener("click", () => {
-    setCollectorOpen(false);
-    setQueueOpen(true);
-  });
 
   const parts: (Node | string)[] = [el("div", { class: "section-head" }, el("h2", {}, "Set collection"), close)];
   if (q.pauseReason === "site") {
@@ -3569,16 +3735,22 @@ function drawCollectorPanel(status: Status): void {
         el("div", {}, words.text),
         q.pausedUntil ? el("div", { class: "small" }, `They asked us to wait until ${new Date(q.pausedUntil).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}.`) : "",
         el("div", { class: "small muted" }, "Passing a check in your browser doesn't unblock Rabbithole's own requests; Try again checks whether they're allowed again."),
-        el("div", { class: "btns", style: "margin-top:8px" }, externalLink("https://www.1001tracklists.com/", "Open 1001Tracklists", "act-link"), auth.user ? tryAgain : ""),
+        el(
+          "div",
+          { class: "btns", style: "margin-top:8px" },
+          q.waiting.length ? openNextButton(q.waiting) : "",
+          externalLink("https://www.1001tracklists.com/", "Open 1001Tracklists", "act-link"),
+          auth.user ? tryAgain : "",
+        ),
       ),
     );
   }
-  if (!s) {
+  if (!s && !q.waiting.length) {
     parts.push(
       el("p", { class: "small muted" }, "Nothing collecting right now. Open a DJ and use ", el("b", {}, "Collect"), " to fetch their newest sets you don't have yet."),
-      el("div", { class: "btns" }, el("a", { class: "act-link", href: "#/djs" }, "Browse DJs →"), viewQueue),
+      el("div", { class: "btns" }, el("a", { class: "act-link", href: "#/djs" }, "Browse DJs →")),
     );
-  } else {
+  } else if (s) {
     const stateWords: Record<SessionView["state"], string> = {
       queued: "Starting",
       running: "Collecting",
@@ -3617,11 +3789,11 @@ function drawCollectorPanel(status: Status): void {
       if (open && s.state !== "stopping") buttons.push(act("Stop gathering", () => post("/api/collect/stop", { session: s.id })));
       if (!open) buttons.push(el("a", { class: "act-link", href: artistHash(s.label) }, "Collect more →"));
     } else buttons.push(el("span", { class: "small muted" }, el("a", { class: "link", href: "#/account" }, "Sign in"), " to control collecting."));
-    buttons.push(viewQueue);
     parts.push(el("div", { class: "btns" }, ...buttons));
     const others = (status.collector?.sessions ?? []).filter((x) => x.id !== s.id && !["stopped", "completed", "failed"].includes(x.state));
     if (others.length) parts.push(el("div", { class: "others" }, `Also: ${others.map((x) => `${x.label} (${x.collected}/${x.target}, ${x.state})`).join(" · ")}`));
   }
+  parts.push(...queueSection(q, status.background, act));
   if (auth.user && prefs) {
     const auto = el("input", { type: "checkbox", ...(prefs.autoCollect ? { checked: "" } : {}), "aria-label": "Auto-Collect" }) as HTMLInputElement;
     auto.addEventListener("change", async () => {
@@ -3649,6 +3821,88 @@ function drawCollectorPanel(status: Status): void {
   pop.replaceChildren(...parts);
 }
 
+/** Open the next waiting set by hand (one you haven't just opened). */
+function openNextButton(waiting: string[]): HTMLElement {
+  const next = upNext(waiting)[0]!;
+  const b = el("button", { type: "button", class: "act primary", title: setLabel(next) }, `Open next set (${waiting.length} waiting)`);
+  b.addEventListener("click", () => openByHand(next));
+  return b;
+}
+
+/**
+ * Everything waiting to be read, in the same panel: what's up next (each can be opened
+ * by hand), sets that failed or were set aside, adding sets by link, and (for the
+ * owner) background collecting.
+ */
+function queueSection(q: QueueStatus, background: BackgroundStatus | undefined, act: (label: string, run: () => Promise<unknown>, primary?: boolean) => HTMLElement): Node[] {
+  const out: Node[] = [];
+  const paused = q.state === "blocked";
+  if (paused && q.pauseReason !== "site") {
+    out.push(el("div", { class: "warn-box", role: "status" }, el("div", {}, pauseMessage(q)), auth.user ? el("div", { class: "btns", style: "margin-top:8px" }, act("Try again", () => post("/api/resume"), true)) : ""));
+  }
+  const head = el("div", { class: "q-head" }, el("h3", {}, q.waiting.length ? `Up next · ${q.waiting.length} waiting` : "Queue"));
+  if (q.state === "running" && q.total) head.append(el("span", { class: "small muted" }, `${q.done} of ${q.total} read · about ${Math.ceil(q.etaSeconds / 60)} min left`));
+  out.push(head);
+  if (!q.waiting.length) out.push(el("p", { class: "small muted" }, q.done ? `Nothing waiting. ${plural(q.done, "new set")} added recently.` : "Nothing waiting."));
+  else {
+    const ordered = upNext(q.waiting);
+    if (q.pauseReason !== "site") out.push(el("div", { class: "btns" }, openNextButton(q.waiting)));
+    const list = el("ol", { class: "ranked q-list" });
+    ordered.forEach((url, i) => {
+      const opened = recentlyOpened(url);
+      const row = el("li", { class: opened ? "opened" : "" }, el("span", { class: "name small" }, setLabel(url)));
+      if (opened) row.append(el("span", { class: "tag" }, "opened · saving…"));
+      const open = el("button", { type: "button", class: "act" }, opened ? "Open again" : "Open");
+      open.addEventListener("click", () => openByHand(url));
+      row.append(open);
+      if (i >= LIST_PREVIEW && !listOpen) row.hidden = true;
+      list.append(row);
+    });
+    out.push(el("div", { class: "small muted" }, "Open any one yourself: the extension saves it and closes the tab."), list);
+    if (ordered.length > LIST_PREVIEW) {
+      const toggle = el("button", { type: "button", class: "act" }, listOpen ? "Show fewer" : `Show all ${ordered.length}`);
+      toggle.addEventListener("click", () => {
+        listOpen = !listOpen;
+        if (lastStatus) drawCollectorPanel(lastStatus);
+      });
+      out.push(toggle);
+    }
+  }
+  if (q.failed) out.push(el("div", { class: "row older" }, el("span", { class: "small muted" }, `${plural(q.failed, "set")} couldn't be fetched after a few tries.`), act("Retry them", () => post("/api/retry-failed"))));
+  if (q.older) out.push(el("div", { class: "row older" }, el("span", { class: "small muted" }, `${plural(q.older, "older set")} set aside.`), act("Include them", () => post("/api/include-older"))));
+  // Clearing removes everyone's waiting sets, so only the owner gets the button.
+  if (auth.user?.owner && (q.waiting.length || q.older)) out.push(el("div", { class: "btns" }, act("Clear queue", () => post("/api/clear-queue"))));
+
+  const text = el("textarea", { rows: "3", placeholder: "https://www.1001tracklists.com/tracklist/..." }) as HTMLTextAreaElement;
+  text.value = linksDraft;
+  text.addEventListener("input", () => (linksDraft = text.value));
+  const msg = el("span", { class: "muted small" });
+  const add = el("button", { type: "button", class: "act" }, "Add");
+  add.addEventListener("click", async () => {
+    try {
+      const r = await post<{ found: number; queued: number; alreadyCached: number }>("/api/add-links", { text: text.value });
+      linksDraft = "";
+      toast(`${plural(r.found, "link")}: ${r.queued} new, ${r.alreadyCached} already in Rabbithole.`);
+      await poll();
+    } catch (e) {
+      msg.textContent = (e as Error).message;
+    }
+  });
+  const links = el("details", { class: "q-links", ...(linksOpen ? { open: "" } : {}) }, el("summary", { class: "small" }, el("b", {}, "Add sets by link")), text, el("div", { class: "row" }, msg, add));
+  links.addEventListener("toggle", () => (linksOpen = (links as HTMLDetailsElement).open));
+  out.push(links);
+
+  if (auth.user?.owner && background) {
+    const toggle = el("input", { type: "checkbox", ...(background.enabled ? { checked: "" } : {}), "aria-label": "Background collecting" }) as HTMLInputElement;
+    toggle.addEventListener("change", async () => {
+      await post("/api/background", { enabled: toggle.checked });
+      await poll();
+    });
+    out.push(el("div", { class: "settings" }, el("label", { class: "switch" }, toggle, " ", el("b", {}, "Background collecting")), el("span", { class: "small muted" }, backgroundWords(background))));
+  }
+  return out;
+}
+
 // Countdowns (checkpoints) tick every second between status checks.
 setInterval(() => {
   for (const node of document.querySelectorAll<HTMLElement>("[data-until]")) {
@@ -3658,18 +3912,8 @@ setInterval(() => {
   }
 }, 1000);
 
-function setQueueOpen(open: boolean): void {
-  $("queueDrawer").hidden = !open;
-  $("drawerShade").hidden = !open;
-  $("bgCard").hidden = !auth.user?.owner;
-  if (lastStatus) renderStatus(lastStatus);
-}
-
-function renderBackground(b: BackgroundStatus): void {
-  const toggle = maybe<HTMLInputElement>("bgToggle");
-  const status = maybe("bgStatus");
-  if (!toggle || !status) return;
-  toggle.checked = b.enabled;
+/** Background collecting's state in a line. */
+function backgroundWords(b: BackgroundStatus): string {
   const until = b.pausedUntil ? new Date(b.pausedUntil).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" }) : "";
   const text: Record<BackgroundStatus["state"], string> = {
     off: "Off. Turn on to slowly cache new sets from the 1001Tracklists front page while you're not collecting.",
@@ -3679,7 +3923,7 @@ function renderBackground(b: BackgroundStatus): void {
     "daily-limit": `On · reached today's limit of ${b.dailyCap} sets; continues tomorrow`,
     paused: `Paused until ${until}: 1001Tracklists asked Rabbithole to slow down.`,
   };
-  status.textContent = text[b.state];
+  return text[b.state];
 }
 
 async function poll(): Promise<void> {
@@ -3706,7 +3950,7 @@ async function poll(): Promise<void> {
   if (route.page === "home" || route.page === "trending") await render();
   else if (route.page !== "account") {
     refreshWaiting = true;
-    renderStrip(q);
+    renderStrip();
   }
 }
 
@@ -3819,46 +4063,34 @@ $("query").addEventListener("keydown", (event) => {
 $("query").addEventListener("blur", hideSuggest);
 
 window.addEventListener("hashchange", () => {
-  setQueueOpen(false);
   setCollectorOpen(false);
   closeMenu();
   void showRoute();
 });
-$("stripRefresh").addEventListener("click", () => void render());
+$("stripRefresh").addEventListener("click", () => {
+  refreshWaiting = false;
+  renderStrip();
+  void render();
+});
 
-// The queue drawer: from the top bar's Queue button, or "Open queue" in the strip.
-mountQueueCard();
+// The collection panel: everything about collecting, from the header pill.
 $("queueBtn").addEventListener("click", (event) => {
   event.stopPropagation();
   setCollectorOpen($("collectorPop").hidden === true);
 });
 document.addEventListener("click", (event) => {
   const pop = $("collectorPop");
-  if (!pop.hidden && !pop.contains(event.target as Node) && !$("queueBtn").contains(event.target as Node)) setCollectorOpen(false);
+  // The click's path, not its target: buttons in the panel redraw it (Open, Continue...), so
+  // by now the clicked button may no longer be inside it. Only a click elsewhere closes it.
+  const path = event.composedPath();
+  if (!pop.hidden && !path.includes(pop) && !path.includes($("queueBtn"))) setCollectorOpen(false);
 });
-$("stripDetails").addEventListener("click", () => setQueueOpen(true));
-$("queueClose").addEventListener("click", () => setQueueOpen(false));
-$("drawerShade").addEventListener("click", () => setQueueOpen(false));
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
-    setQueueOpen(false);
     setCollectorOpen(false);
     closeMenu();
   }
 });
-$("bgToggle").addEventListener("change", () => void post("/api/background", { enabled: $<HTMLInputElement>("bgToggle").checked }));
-$("addLinksBtn").addEventListener("click", async () => {
-  const text = $<HTMLTextAreaElement>("addLinksText");
-  const msg = $("addLinksMsg");
-  try {
-    const r = await post<{ found: number; queued: number; alreadyCached: number }>("/api/add-links", { text: text.value });
-    msg.textContent = `${plural(r.found, "link")}: ${r.queued} new, ${r.alreadyCached} already in Rabbithole.`;
-    text.value = "";
-  } catch (e) {
-    msg.textContent = (e as Error).message;
-  }
-});
-
 // Give the extension a moment to mark the page before deciding to show setup or update steps.
 setTimeout(showExtensionNotices, 800);
 
@@ -3867,5 +4099,7 @@ void poll().then(() => showRoute());
 (function schedulePoll() {
   const s = lastStatus;
   const busy = s && (s.queue.state === "running" || (s.collector?.sessions ?? []).some((x) => ["running", "checkpoint", "stopping"].includes(x.state)));
-  setTimeout(() => void poll().finally(schedulePoll), busy ? 3000 : 10_000);
+  setTimeout(() => void poll().finally(schedulePoll), Date.now() < fastPollUntil ? 2000 : busy ? 3000 : 10_000);
 })();
+// Back from a 1001Tracklists tab you opened: check straight away.
+window.addEventListener("focus", () => void poll());

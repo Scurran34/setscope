@@ -68,6 +68,8 @@ export interface Credit {
 
 const FEATURING = /\s(?:ft\.?|feat\.?|featuring)\s/i;
 const VS = /\svs\.?\s/i;
+/** "Disturbia X Zombie Nation X Pump It Up": song titles joined with a capital X. */
+const MASHUP_X = /\S\sX\s\S/;
 
 /**
  * Who made this recording, from how the tracklist line is written:
@@ -75,13 +77,15 @@ const VS = /\svs\.?\s/i;
  *   "A ft. B - Title"                  A: main, B: featured (vocalists are written this way too)
  *   "A - Title (C Remix)"              C: remixer (also edits, bootlegs, reworks, VIPs)
  *   "A vs. B - X vs. Y (C Edit)"       A, B: mashup_component (their songs are in it), C: remixer
- *   "A vs. B - Title"                  a collaboration: A, B main (a mashup has "vs." in the title too)
+ *   "A vs. B - X X Y"                  also a mashup (titles joined with "X"): A, B mashup_component
+ *   "A vs. B - Title"                  a collaboration: A, B main (a mashup has "vs." or "X" in the title too)
  * The source doesn't say who was sampled or who sang when it isn't marked "ft.", so
  * those roles are never guessed.
  */
 export function credits(track: Track, oneAct: string[] = []): Credit[] {
   const version = versionOf(track.title);
-  const mashup = version.type === "mashup" || VS.test(version.base);
+  // A mashup: called one, or "vs." in the title, or "A vs. B - X X Y" (titles joined by "X").
+  const mashup = version.type === "mashup" || VS.test(version.base) || (VS.test(track.artist) && MASHUP_X.test(version.base));
   // Names like "Cause & Affect" are one act when 1001Tracklists gives them their own
   // page (passed in as `oneAct`, plus any linked as one name on this line): don't split those.
   const whole = [...new Set([...oneAct, ...Object.keys(track.artistPages ?? {})])].filter((n) => /\s(?:&|x|vs\.?|pres\.?|\/)\s|,\s/i.test(n));

@@ -47,7 +47,13 @@ export interface Tracklist {
   djProfiles?: DjProfile[];
   /** Which parser version read this set; older ones get re-read from their saved HTML. */
   parserVersion?: number;
+  /** What the source calls the set (live set, radio show, podcast); absent when it doesn't say. */
+  kind?: SetKind;
+  /** The recurring show or event linked in the set's title ("Dance Department"). */
+  series?: { key: string; name: string };
 }
+
+export type SetKind = "live" | "radio" | "podcast";
 
 /** A name with a count, used for every "top N" list in the reports. */
 export interface Ranked {

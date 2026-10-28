@@ -78,6 +78,18 @@ interface JobRow {
   session_id: number | null;
 }
 
+/**
+ * Jobs still wanted: on their own, or in a session that hasn't ended. These are listed as
+ * waiting (with their Open buttons), including while a session waits on the site or a checkpoint.
+ */
+/** How long a set opened by hand stays at the back of the line while it's saved. */
+export const OPENED_GRACE_MINUTES = 5;
+
+const STILL_WANTED = `(j.session_id is null or exists (select 1 from collection_sessions cs where cs.id = j.session_id and cs.state not in ('stopped', 'completed', 'failed')))`;
+
+/** Opened by hand in the last few minutes: listed after the rest, so "Open next" moves on. */
+const RECENTLY_OPENED = `coalesce(j.opened_at > now() - interval '${OPENED_GRACE_MINUTES} minutes', false)`;
+
 /** Jobs the worker may take: on their own, or in a session that's collecting right now. */
 const CLAIMABLE = `(j.session_id is null or exists (select 1 from collection_sessions cs where cs.id = j.session_id and cs.state = 'running'))`;
 
@@ -256,14 +268,31 @@ export class PgJobQueue {
   async importPage(html: string, pageUrl: string): Promise<Tracklist> {
     const set = parseTracklist(html, canonicalUrl(html) ?? pageUrl);
     if (set.tracks.length === 0) throw new Error("No tracks found on that page.");
+    const known = await this.catalog.has(set.id);
     await this.catalog.save(set, html);
-    await this.pool.query(
+    const done = await this.pool.query<{ session_id: number | null }>(
       `update collection_jobs set status = 'done', updated_at = now()
-        where kind = 'fetch_set' and status in ('queued', 'blocked', 'held') and target like $1`,
+        where kind = 'fetch_set' and status in ('queued', 'blocked', 'held') and target like $1
+        returning session_id`,
       [`%/tracklist/${set.id}/%`],
     );
+    // Opened by hand, it still counts toward the collection it was waiting in.
+    for (const id of new Set(done.rows.map((r) => r.session_id).filter((x): x is number => x !== null))) {
+      await this.sessions.afterJob(id, known ? "cached" : "saved");
+    }
     if ((await this.count("status in ('queued', 'blocked')")) === 0) await this.unpause();
     return set;
+  }
+
+  /** Someone opened this waiting set by hand: put it at the back of "Open next" for a few minutes. */
+  async markOpened(url: string): Promise<boolean> {
+    const id = url.match(/\/tracklist\/([a-z0-9]+)\//i)?.[1];
+    if (!id) return false;
+    const r = await this.pool.query(
+      `update collection_jobs set opened_at = now() where kind = 'fetch_set' and status in ('queued', 'blocked', 'held') and target like $1`,
+      [`%/tracklist/${id}/%`],
+    );
+    return (r.rowCount ?? 0) > 0;
   }
 
   /** Move held (older) sets into the line. */
@@ -316,14 +345,15 @@ export class PgJobQueue {
       )
     ).rows;
     const n = (status: string) => counts.find((c) => c.status === status)?.n ?? 0;
-    // Sets of a paused or stopped session aren't "waiting": they go only when it continues.
+    // Sets of a stopped or finished session aren't "waiting": they go only if it's resumed.
+    // Ones waiting on the site or a checkpoint are, and each can be opened by hand.
     const waiting = (
       await this.pool.query<{ target: string }>(
-        `select target from collection_jobs j where (status = 'running' or (status in ('queued', 'blocked') and ${CLAIMABLE}))
-          order by (status = 'running') desc, priority desc, performed_on desc nulls last, id limit 300`,
+        `select target from collection_jobs j where (status = 'running' or (status in ('queued', 'blocked') and ${STILL_WANTED}))
+          order by (status = 'running') desc, ${RECENTLY_OPENED} asc, (status = 'blocked') desc, priority desc, performed_on desc nulls last, id limit 300`,
       )
     ).rows.map((r) => r.target);
-    const onHold = (await this.pool.query<{ n: number }>(`select count(*)::int n from collection_jobs j where status in ('queued', 'blocked') and not ${CLAIMABLE}`)).rows[0]!.n;
+    const onHold = (await this.pool.query<{ n: number }>(`select count(*)::int n from collection_jobs j where status in ('queued', 'blocked') and not ${STILL_WANTED}`)).rows[0]!.n;
     const remaining = n("queued") + n("running") + n("blocked") - onHold;
     const status: QueueStatus = {
       state: state.paused_reason ? "blocked" : remaining > 0 ? "running" : "idle",

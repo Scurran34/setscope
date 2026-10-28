@@ -157,7 +157,7 @@ describe.skipIf(!available)("server", () => {
     expect((await postJson("/api/vault", { set: "c1", position: 0, on: true })).status).toBe(401);
     expect(await (await postAs(owner, "/api/gather/stop", { dj: "DJ Alpha" })).json()).toEqual({ stopped: 0 });
     const alongside = await (await fetch(`${base}/api/song/alongside?song=${encodeURIComponent("Nova - Pulse")}`)).json();
-    expect(alongside).toMatchObject({ page: 1, pageSize: 15, sort: "specific", total: 0 }); // one set: nothing shares 2+
+    expect(alongside).toMatchObject({ page: 1, pageSize: 15, sort: "goes", total: 0, anchorSets: 1, notice: expect.stringContaining("only 1 indexed set") }); // one set: nothing shares 2+
     expect((await fetch(`${base}/api/song/alongside?song=nodash`)).status).toBe(400);
     expect(await (await fetch(`${base}/api/discovery?mode=closer&period=all`)).json()).toMatchObject({ mode: "closer", items: [] });
   });

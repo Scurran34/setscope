@@ -74,33 +74,25 @@ come from 1001Tracklists; songs have no cover art, so a plain tile with initials
   **Unreleased Vault**: every saved ID with where it was heard; identified ones come first, showing what the line
   says now and when it changed.
 - Still reachable in context: song pages (`#/artist/<a>/song/<s>`: who plays it, **Played alongside it** with every
-  song that shared 2+ sets, 15 a page, ranked by *Goes with it* (of the sets that play the other song, how many also
-  play this one: shared ÷ (its sets + 3)) or *Most shared sets*, playlists, SoundCloud links and remixes), set pages (`#/set/<id>`), the song/artist/set charts (`#/songs`, `#/artists`, `#/sets`), search results
+  song that shared 2+ of its sets (all indexed sets), 15 a page, ranked by *Goes with it* (shared ÷ √(both songs'
+  sets), discounted when few DJs are behind the pairing) or *Most shared sets*, with the shared sets one click away, playlists, SoundCloud links and remixes), set pages (`#/set/<id>`), the song/artist/set charts (`#/songs`, `#/artists`, `#/sets`), search results
   (`#/find/<text>`), and SoundCloud curator likes (`#/discover/<profile>`).
 
 ### How the discovery rankings work
 
-All three use `src/catalog/discover.ts`, computed in Postgres for the selected DJs and period:
+The full write-up, with every formula and constant, is [docs/RANKINGS.md](docs/RANKINGS.md) (also in the app at
+`#/rankings`). In short:
 
-- **A qualifying appearance** is one indexed set (performed in the period, by at least one selected DJ) that
-  played the track. A track played twice in one set counts once. It counts only if **none of that set's DJs is
-  credited on the recording** in any role (artist, featured artist, remixer, or mashup source), with verified
-  aliases applied. So Chris Lorenzo playing his own track, or a mashup built on it, never counts as a pick,
-  while another DJ playing it does. Unidentified IDs never enter these rankings.
-- **Playing Now**: the sum over qualifying appearances of `0.5 ^ (days since the set / 14)`: a set from today counts
-  1, from two weeks ago 0.5, from a month ago about 0.23. Ties: more sets, then more DJs. Default period: this month.
-- **Most Played**: the number of distinct qualifying sets. Ties: more supporting DJs, then most recently played.
-  Default period: last 3 months.
-- **Deep Cuts**: tracks played by **at least 2 of the selected DJs** (or in **2+ sets** when one DJ is selected) that
-  appear in **no more than 2%** of all indexed sets (at least 3), any DJ, any date. Ranked by supporting DJs, then by
-  the share of the track's indexed appearances that come from the selected DJs, then by how rare it is overall.
-  With fewer than 50 sets indexed in total the page warns that "rare" can't be judged yet. Default period: 12 months.
-- **Intros** and **90 + 5**: tracks in the first (or last) 2 lines of sets with at least 10 tracks listed. A track needs
-  2+ such sets (by **2+ DJs** when several are selected), and at least **20%** of its plays by these DJs must be at
-  that moment, so a hit that happens to open or end one set doesn't count. Ranked by DJs, then sets, then that share.
-  Default period: 12 months. Discover shows the top 5 of each under the main list.
-- **Supporting DJs** counts distinct selected DJs (aliases merged) who played it in a qualifying set; in a B2B set
-  each selected DJ on it counts. The names shown are the ones who played it most.
+- Support is measured three ways and shown separately: **Unique DJs** (breadth: canonical DJs, aliases merged, a
+  DJ who plays it 30 times is one DJ), **Set appearances** (repeat support), and **Recent supporting DJs** (last 90
+  days), plus new supporters and growth when there's enough earlier data. Performance dates only.
+- Each DJ's repeats count with diminishing returns, `min(1 + 0.25·log2(plays), 2)`. Radio/podcast episodes count
+  0.75 toward repeats, at most 8 per recurring show. A back-to-back set is one selection shared by its DJs.
+- **Most Played** (all time): DJs + up to ½ a DJ each for repeats. **Playing Now** (90 days): the same, fading with
+  each DJ's latest play, with a bonus for new supporters. **Deep Cuts**: the selected DJs' support × rarity across all
+  indexed DJs × evidence; 2+ sets, and never tracks played by more than 1% of DJs.
+- A play counts only if none of the set's DJs is credited on the track; unidentified IDs never count; a set indexed
+  twice counts once (`set_duplicates`).
 - Original songs, remixes, edits and mashups are separate tracks (see Track identity), so a remix's support never
   inflates the original's.
 
@@ -447,6 +439,10 @@ src/
     pg-catalog.ts     Catalog on Postgres: saving sets, artists, tracks; history on refresh
     browse.ts         song/artist charts by performance date, set list and set pages, paged in SQL
     discover.ts       Playing Now / Most Played / Deep Cuts, DJ list, profiles, own tracks, ID lines
+    support.ts        breadth, repeat support, momentum: the formulas and the cached play data
+    alongside.ts      Played alongside it (Goes with it / Most shared sets)
+    recommend.ts      Recommended sets
+    artwork.ts        which picture a track gets, and what kind it is
     identity.ts       which tracklist lines are the same recording; versions; IDs
   db/                 database plumbing
     pool.ts           connection (DATABASE_URL)

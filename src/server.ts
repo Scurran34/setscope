@@ -45,9 +45,12 @@ import { join } from "node:path";
 import { analyzeArtist, foundNothing } from "./analysis/artist.ts";
 import { correctArtist, correctSong, searchArtists, searchSongs, songsWithTitle } from "./analysis/catalog.ts";
 import { today } from "./analysis/common.ts";
-import { categoryHints, setsForYou, songsLike } from "./analysis/personal.ts";
+import { categoryHints, songsLike } from "./analysis/personal.ts";
+import { playedAlongside, sharedSets } from "./catalog/alongside.ts";
+import { songSupport } from "./catalog/support.ts";
+import { recommendSets } from "./catalog/recommend.ts";
 import { artistProfile } from "./analysis/profile.ts";
-import { analyzeSong, playedAlongside, type SongReport } from "./analysis/song.ts";
+import { analyzeSong, type SongReport } from "./analysis/song.ts";
 import { trending } from "./analysis/trending.ts";
 import { AccountError, Accounts, SESSION_DAYS, type User } from "./auth/accounts.ts";
 import { RateLimiter } from "./auth/rate-limit.ts";
@@ -71,7 +74,7 @@ import { ScError, ScRateLimited, SoundCloudClient, type ScTrack } from "./soundc
 import { isTrackLink, LinkStore } from "./soundcloud/links.ts";
 import { classify, remixesOf, songCandidates, type Candidate } from "./soundcloud/match.ts";
 import { versionOf } from "./catalog/identity.ts";
-import { discover, djProfile, followedIds, idLines, listDjs, MODES, ownTracks, resolveArtist, setFollow, type DiscoveryMode } from "./catalog/discover.ts";
+import { discover, djProfile, followedIds, idLines, listDjs, MODES, monthlyPlays, ownTracks, playsMost, resolveArtist, setFollow, supporters, type DiscoveryMode } from "./catalog/discover.ts";
 import { Vault } from "./personal/vault.ts";
 import { artistChart, genres, idStats, listSets, PERIODS, setCardsByIds, setDetail, songCards, songChart, type Period, type SongCard } from "./catalog/browse.ts";
 
@@ -279,29 +282,22 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       return sendJson(res, 200, { ...(await withUserData(app, user, report, sets)), image });
     }
     case "GET /api/song/alongside": {
-      // Every song played in the same sets, 15 a page; "specific" (default) or "count" order.
-      const song = songParam(params);
-      const since = sinceMonths(intParam(params, "months", DEFAULT_MONTHS));
-      const sort = params.get("sort") === "count" ? "count" : "specific";
-      let query;
-      try {
-        query = parseSongQuery(song);
-      } catch (error) {
-        throw new BadRequest((error as Error).message);
-      }
-      const all = playedAlongside(await app.catalog.all(), query, since, sort);
-      const page = intParam(params, "page", 1);
-      const size = pageSizeParam(params, 15);
-      const slice = all.slice((page - 1) * size, page * size);
-      const cards = await songCards(app.pool, slice.map((r) => r.name));
-      return sendJson(res, 200, {
-        items: slice.map((r, i) => ({ ...r, rank: (page - 1) * size + i + 1, image: cards.get(r.name)?.image ?? null, soundcloud: cards.get(r.name)?.soundcloud ?? null })),
-        page,
-        pageSize: size,
-        total: all.length,
-        pages: Math.max(1, Math.ceil(all.length / size)),
-        sort,
-      });
+      // Every song played in the same sets (all eligible sets, all time), 15 a page:
+      // "goes" (association strength, the default) or "shared" (raw shared sets).
+      const sort = params.get("sort") === "shared" || params.get("sort") === "count" ? "shared" : "goes";
+      const trackId = await songTrackId(app, songParam(params));
+      return sendJson(res, 200, await playedAlongside(app.pool, trackId, { sort, page: intParam(params, "page", 1), pageSize: pageSizeParam(params, 15), today: today() }));
+    }
+    case "GET /api/song/support": {
+      // Unique DJs, set appearances and recent supporting DJs, over every indexed DJ.
+      return sendJson(res, 200, await songSupport(app.pool, await songTrackId(app, songParam(params)), today()));
+    }
+    case "GET /api/song/shared-sets": {
+      // The sets behind one "played alongside" row.
+      const [a, b] = await Promise.all([songTrackId(app, songParam(params)), songTrackId(app, required(params, "with"))]);
+      const ids = await sharedSets(app.pool, a, b, today());
+      const cards = await setCardsByIds(app.pool, ids);
+      return sendJson(res, 200, ids.map((id) => cards.get(id)).filter(Boolean));
     }
     case "GET /api/artist": {
       const name = required(params, "name");
@@ -401,8 +397,19 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       const mode = discoveryMode(params);
       return sendJson(res, 200, await discover(app.pool, { ...discoveryParams(params, mode), djIds: [id], pageSize: pageSizeParam(params, 15) }));
     }
-    case "GET /api/dj/own":
-      return sendJson(res, 200, await ownTracks(app.pool, await artistParam(app, params), intParam(params, "page", 1), pageSizeParam(params, 15)));
+    case "GET /api/dj/own": {
+      // Their productions, each with 12 months of plays by other DJs for a sparkline.
+      const id = await artistParam(app, params);
+      const own = await ownTracks(app.pool, id, intParam(params, "page", 1), pageSizeParam(params, 15));
+      const months = await monthlyPlays(app.pool, id, own.items.map((t) => t.song), today());
+      return sendJson(res, 200, { ...own, items: own.items.map((t) => ({ ...t, months: months.get(t.song) ?? [] })) });
+    }
+    case "GET /api/dj/people": {
+      // Who plays their tracks most, and whose tracks they play most (with photos).
+      const id = await artistParam(app, params);
+      const [playedBy, plays] = await Promise.all([supporters(app.pool, id), playsMost(app.pool, id)]);
+      return sendJson(res, 200, { playedBy, plays });
+    }
     case "GET /api/dj/ids":
       return sendJson(res, 200, await idLines(app.pool, await artistParam(app, params), intParam(params, "page", 1), pageSizeParam(params, 15), user?.id));
     case "POST /api/gather/stop": {
@@ -497,14 +504,14 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       const mine = await app.userData.get(user.id);
       const liked = new Set(Object.keys(mine.likes));
       const sets = await app.catalog.all();
-      const forYou = setsForYou(sets, liked, since, 8);
-      const cards = await setCardsByIds(app.pool, forYou.map((s) => s.id));
       const likes = Object.values(mine.likes).reverse(); // newest first
+      // Recommended sets: most likely to turn up music you'll care about (catalog/recommend.ts).
+      const likedIds = (await app.pool.query<{ track_id: number }>("select track_id::int from user_likes where user_id = $1", [user.id])).rows.map((r) => r.track_id);
+      const recommended = await recommendSets(app.pool, { likedTrackIds: likedIds, followed: await followedIds(app.pool, user.id), genre: params.get("genre")?.trim() || null, today: today(), limit: 8 });
       return sendJson(res, 200, {
         likes,
         likedSongs: await cardsFor(app, likes),
-        // Sets that play the most of your liked songs, with photos: the page features one at a time.
-        sets: forYou.map((s) => ({ ...(cards.get(s.id) ?? s), liked: s.liked })),
+        sets: recommended,
         songs: songsLike(sets, liked, since),
       });
     }
@@ -695,6 +702,7 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
           externalId: found.track.urn,
           confidence: body.from === "pasted" ? 1 : (match?.confidence ?? 0.2),
           provenance: body.from === "pasted" ? "user" : "search_match",
+          ...(found.track.artwork ? { artwork: found.track.artwork } : {}),
         }),
       );
       return sendJson(res, 200, { links: await app.links.forSong(song, { id: u.id, owner: await app.accounts.isOwner(u.id) }), track: found.track, match: match?.kind ?? null });
@@ -819,6 +827,13 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
       if (session.requestedBy !== u.id && !(await app.accounts.isOwner(u.id))) throw new NotAllowed("That's someone else's collecting session.", 403);
       const view = route.endsWith("stop") ? await app.queue.stopSession(session.id) : await app.queue.resumeSession(session.id);
       return sendJson(res, 200, view);
+    }
+    case "POST /api/collect/opened": {
+      // "Open next set": remember it was opened, so the next press offers another one.
+      requireOwnHeader(req);
+      const body = (await readJson(req)) as { url?: unknown };
+      if (typeof body.url !== "string" || !isFetchAllowed(body.url)) throw new BadRequest("Expected { url } of a 1001Tracklists set");
+      return sendJson(res, 200, { marked: await app.queue.markOpened(body.url) });
     }
     case "POST /api/collect/known": {
       // Which of these set links are already indexed or waiting: lets the extension keep
@@ -992,7 +1007,7 @@ async function cardsFor(app: App, names: string[]): Promise<SongCard[]> {
     const card = cards.get(name);
     if (card) return card;
     const t = trackFromName(name);
-    return { name, artist: t.artist, title: t.title, genre: null, image: null, soundcloud: null };
+    return { name, artist: t.artist, title: t.title, genre: null, image: null, imageKind: null, soundcloud: null };
   });
 }
 
@@ -1027,13 +1042,24 @@ function discoveryMode(params: URLSearchParams): DiscoveryMode {
 
 /** Period, genre, page and today for a discovery query; each mode has its own default period. */
 function discoveryParams(params: URLSearchParams, mode: DiscoveryMode): { mode: DiscoveryMode; period: Period; genre?: string; page: number; today: string } {
-  const fallback: Record<DiscoveryMode, Period> = { now: "month", most: "3months", deep: "year", intro: "year", closer: "year" };
+  const fallback: Record<DiscoveryMode, Period> = { now: "3months", most: "all", deep: "year", intro: "year", closer: "year" };
   const period = (params.get("period") || fallback[mode]) as Period;
   if (!PERIODS.includes(period)) throw new BadRequest(`"period" must be one of ${PERIODS.join(", ")}`);
   const out: { mode: DiscoveryMode; period: Period; genre?: string; page: number; today: string } = { mode, period, page: intParam(params, "page", 1), today: today() };
   const genre = params.get("genre")?.trim();
   if (genre) out.genre = genre;
   return out;
+}
+
+/** The catalog track for a song name ("Artist - Title"); 404 when it isn't indexed. */
+async function songTrackId(app: App, song: string): Promise<number> {
+  if (!song.includes(" - ")) throw new BadRequest(`Songs look like "Artist - Title" (got "${song}")`);
+  try {
+    return await findTrackId(app.pool, song);
+  } catch (error) {
+    if (error instanceof UserDataError) throw new NotAllowed(error.message, 404);
+    throw error;
+  }
 }
 
 /** The artist named by ?name= (an alias gives the artist it belongs to). */
@@ -1111,7 +1137,7 @@ async function matchOnSoundCloud(app: App, req: IncomingMessage, user: User | un
     app.noMatch.set(trackId, Date.now() + 24 * 60 * 60_000);
     return undefined;
   }
-  await app.links.saveAutoMatch(trackId, { url: best.track.permalink, externalId: best.track.urn, confidence: best.confidence });
+  await app.links.saveAutoMatch(trackId, { url: best.track.permalink, externalId: best.track.urn, confidence: best.confidence, ...(best.track.artwork ? { artwork: best.track.artwork } : {}) });
   return { url: best.track.permalink, externalId: best.track.urn, confidence: best.confidence, preview: best.track.access === "preview" };
 }
 
@@ -1302,6 +1328,8 @@ if (import.meta.main) {
   }
   const recredited = await catalog.rebuildCreditsIfOutdated();
   if (recredited) console.log(`Re-derived artist credits for ${recredited} tracks with the current rules.`);
+  const duplicates = await catalog.markDuplicatesIfOutdated();
+  if (duplicates) console.log(`Found ${duplicates} sets indexed twice (counted once from now on).`);
   const reparsed = await catalog.reparseOutdated();
   if (reparsed) console.log(`Re-read ${reparsed} sets with the newer parser.`);
 

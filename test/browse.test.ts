@@ -32,7 +32,7 @@ describe("chart windows and trends", () => {
   });
 
   it("credits breadth over one hit, and features at half", () => {
-    const plays = (sets: [number, boolean][], songs: number[]) => ({ sets: new Map(sets), songs: new Map(songs.map((n, i) => [i, n])) });
+    const plays = (sets: [number, boolean][], songs: number[]) => ({ sets: new Map(sets.map(([id, featured]) => [id, featured ? 0.5 : 1])), songs: new Map(songs.map((n, i) => [i, n])) });
     const tenSets = Array.from({ length: 10 }, (_, i): [number, boolean] => [i, false]);
     expect(creditScore(plays(tenSets, [10]))).toBe(5); // one song in every set: halved
     expect(creditScore(plays(tenSets, [2, 2, 2, 2, 2]))).toBe(9); // five songs, 2 sets each
